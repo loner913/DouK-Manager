@@ -6,6 +6,7 @@ import os
 import shutil
 import sqlite3
 import uuid
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -28,7 +29,9 @@ def sha256_file(path: Path) -> str:
 
 def sqlite_quick_check(path: Path) -> str:
     try:
-        with sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True) as connection:
+        with closing(
+            sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+        ) as connection:
             row = connection.execute("PRAGMA quick_check").fetchone()
     except sqlite3.Error as exc:
         raise BackupError(f"数据库一致性检查失败：{path}：{exc}") from exc
@@ -41,8 +44,10 @@ def sqlite_quick_check(path: Path) -> str:
 def sqlite_backup(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
-        with sqlite3.connect(f"file:{source.as_posix()}?mode=ro", uri=True) as src:
-            with sqlite3.connect(destination) as dst:
+        with closing(
+            sqlite3.connect(f"file:{source.as_posix()}?mode=ro", uri=True)
+        ) as src:
+            with closing(sqlite3.connect(destination)) as dst:
                 src.backup(dst)
         sqlite_quick_check(destination)
     except sqlite3.Error as exc:
@@ -163,4 +168,3 @@ def _safe_category(category: str) -> str:
     if not cleaned:
         raise BackupError("备份类别无效。")
     return cleaned
-

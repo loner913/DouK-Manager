@@ -4,6 +4,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from douk_manager.core.backup import BackupService, sha256_file
@@ -19,7 +20,7 @@ class BackupTests(unittest.TestCase):
             self.assertTrue((snapshot / "Volume" / "settings_master.json").is_file())
             self.assertTrue((snapshot / "Volume" / "settings.json").is_file())
             backup_db = snapshot / "Volume" / "DouK-Downloader.db"
-            with sqlite3.connect(backup_db) as connection:
+            with closing(sqlite3.connect(backup_db)) as connection:
                 self.assertEqual(connection.execute("PRAGMA quick_check").fetchone()[0], "ok")
                 self.assertEqual(connection.execute("SELECT value FROM records").fetchone()[0], "safe")
             manifest = json.loads((snapshot / "manifest.json").read_text(encoding="utf-8"))
@@ -31,4 +32,3 @@ class BackupTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

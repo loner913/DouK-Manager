@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 from douk_manager.config import AppConfig, ManagedPaths
@@ -41,9 +42,10 @@ def make_test_paths(base: Path, account_count: int = 8) -> ManagedPaths:
     (volume / "settings.json").write_text(
         json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    with sqlite3.connect(volume / "DouK-Downloader.db") as connection:
+    with closing(sqlite3.connect(volume / "DouK-Downloader.db")) as connection:
         connection.execute("CREATE TABLE records (id INTEGER PRIMARY KEY, value TEXT)")
         connection.execute("INSERT INTO records(value) VALUES ('safe')")
+        connection.commit()
     config = AppConfig(
         engine_exe=str(engine_exe),
         video_root=str(video),
@@ -53,4 +55,3 @@ def make_test_paths(base: Path, account_count: int = 8) -> ManagedPaths:
     paths = ManagedPaths.from_config(config, manager_root)
     paths.ensure_manager_directories()
     return paths
-
