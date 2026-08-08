@@ -1,0 +1,51 @@
+# Python / build output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+build/
+dist/
+*.spec.bak
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# DouK runtime data: never commit live data or backups
+/runtime/
+/Data/
+/Backups/
+/Logs/
+/Tasks/
+/Updates/
+/Engine/
+/_internal/
+**/Volume/
+
+# Critical/private data patterns
+DouK-Downloader.db*
+settings.json
+settings_master.json
+settings_master.json.*
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+*.xlsx
+*.xls
+*.log
+*.bak
+*.cookie
+*cookie*.json
+*Cookie*.json
+账号页面截图/
+
+# Generated packages
+DouK-Manager-Source-*.zip
+DouK-Manager_Windows_X64_*.zip
+
