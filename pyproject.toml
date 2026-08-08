@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "douk-manager"
+version = "0.1.0"
+description = "DouK 全流程一体化管理器"
+requires-python = ">=3.12"
+dependencies = [
+  "PySide6>=6.8,<7",
+  "openpyxl>=3.1,<4",
+  "Pillow>=11,<13",
+]
+
+[project.scripts]
+douk-manager = "douk_manager.app:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+douk_manager = ["py.typed"]
+
