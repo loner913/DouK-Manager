@@ -32,6 +32,8 @@ class ManagerController:
         self.logger, self.log_path = setup_logging(self.paths.logs)
         self.startup_backup: Path | None = None
         self.read_only_reason = ""
+        self._last_collector_running = False
+        self._last_engine_running = False
         self._build_services()
 
     def _build_services(self) -> None:
@@ -42,10 +44,18 @@ class ManagerController:
         self.screenshots = ScreenshotService()
         self.indexer = IndexService()
 
-    def health(self) -> dict[str, Any]:
+    def health(self, *, check_processes: bool = False) -> dict[str, Any]:
         result: dict[str, Any] = self.paths.health()
-        result["collector_running"] = self.collector.health()
-        result["engine_running"] = self.engine.external_running()
+        if check_processes:
+            self._last_collector_running = self.collector.health()
+            self._last_engine_running = self.engine.external_running()
+        else:
+            if self.collector.process is not None:
+                self._last_collector_running = self.collector.running
+            if self.engine.current is not None:
+                self._last_engine_running = self.engine.current.running
+        result["collector_running"] = self._last_collector_running
+        result["engine_running"] = self._last_engine_running
         result["startup_backup"] = str(self.startup_backup or "")
         result["read_only_reason"] = self.read_only_reason
         if self.paths.master_settings.is_file():
@@ -80,7 +90,8 @@ class ManagerController:
         ):
             self.read_only_reason = "下载引擎或唯一正式 Volume 尚未完整识别。"
             return self.read_only_reason
-        if self.engine.external_running():
+        self._last_engine_running = self.engine.external_running()
+        if self._last_engine_running:
             self.read_only_reason = "检测到下载引擎正在运行，未执行启动前备份。"
             return self.read_only_reason
         try:
@@ -111,6 +122,8 @@ class ManagerController:
             raise ControllerError("下载引擎正在运行，禁止切换正式路径或重建服务。")
         if self.collector.running:
             self.collector.stop()
+        self._last_collector_running = False
+        self._last_engine_running = False
         self.config = update_config(self.config, values)
         new_paths = ManagedPaths.from_config(self.config, self.root)
         new_paths.ensure_manager_directories()
@@ -193,6 +206,7 @@ class ManagerController:
     def start_current_download(self) -> EngineRun:
         self.require_safe_write()
         result = self.engine.start()
+        self._last_engine_running = True
         self.logger.info("下载引擎已启动：PID=%s", result.process.pid)
         return result
 
@@ -210,11 +224,13 @@ class ManagerController:
     def start_collector(self) -> bool:
         self.require_safe_write()
         self.collector.start()
+        self._last_collector_running = True
         self.logger.info("账号采集服务已启动")
         return True
 
     def stop_collector(self) -> None:
         self.collector.stop()
+        self._last_collector_running = False
         self.logger.info("账号采集服务已停止")
 
     def migrate_collector(self) -> MigrationResult:

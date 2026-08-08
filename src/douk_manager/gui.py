@@ -61,7 +61,7 @@ class MainWindow(QMainWindow):
         self.refresh_all()
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self._poll_processes)
-        self.poll_timer.start(1500)
+        self.poll_timer.start(500)
 
     def _build_ui(self) -> None:
         tabs = QTabWidget()
@@ -113,7 +113,7 @@ class MainWindow(QMainWindow):
 
         buttons = QHBoxLayout()
         for text, callback in (
-            ("刷新状态", self.refresh_all),
+            ("刷新状态", self._refresh_status),
             ("立即创建永久备份", self._manual_backup),
             ("打开备份目录", lambda: self._open_path(self.controller.paths.backups)),
             ("打开任务目录", lambda: self._open_path(self.controller.paths.tasks)),
@@ -412,8 +412,11 @@ class MainWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
             self.refresh_all()
 
-    def refresh_all(self) -> None:
-        health = self.controller.health()
+    def _refresh_status(self, _checked: bool = False) -> None:
+        self.refresh_all(check_processes=True)
+
+    def refresh_all(self, *, check_processes: bool = False) -> None:
+        health = self.controller.health(check_processes=check_processes)
         for key, label in self.status_labels.items():
             value = bool(health.get(key, False))
             if key.endswith("_running"):
@@ -596,7 +599,6 @@ class MainWindow(QMainWindow):
 
     def _poll_processes(self) -> None:
         if not self.queue_active or self.queue_current is None:
-            self.refresh_all()
             return
         if self.queue_current.running:
             return
