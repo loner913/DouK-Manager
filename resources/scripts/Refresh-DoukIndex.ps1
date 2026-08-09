@@ -45,12 +45,14 @@ function Test-PathUnderRoot {
 $BrokenReportFilePrefix  = 'Broken-Shortcut-Report'
 $RunLogFilePrefix        = 'Refresh-DoukIndex-RunLog'
 $ManagedTag              = '[DoukIndex]'
+$ManagedBase64Tag        = '[DoukIndexB64]'
 $SkipEmptySourceFolders               = $true
 $RemoveShortcutsForEmptySourceFolders = $true
 
 $srcFull = Get-NormalizedFullPath -Path $SourceRoot
 $idxFull = Get-NormalizedFullPath -Path $IndexRoot
 $logRoot = Join-Path $idxFull 'Logs'
+$fallbackLauncherRoot = Join-Path $idxFull '.DouKLaunchers'
 
 $runTimestamp = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss-fff'
 $reportPath = Join-Path $logRoot ("{0}_{1}.txt" -f $BrokenReportFilePrefix, $runTimestamp)
@@ -78,6 +80,7 @@ if (-not (Test-Path -LiteralPath $logRoot -PathType Container)) {
 
 $script:shell = New-Object -ComObject WScript.Shell
 $script:explorerPath = Join-Path $env:WINDIR 'explorer.exe'
+$script:powerShellPath = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
 
 function Get-ShortcutDisplayName {
     param([string]$FolderName)
@@ -110,6 +113,22 @@ function Get-ManagedTargetPath {
 
     if (-not $Shortcut.Description) {
         return $null
+    }
+
+    $base64Prefix = $ManagedBase64Tag + ' '
+    if ($Shortcut.Description.StartsWith($base64Prefix)) {
+        try {
+            $encodedTarget = $Shortcut.Description.Substring($base64Prefix.Length).Trim()
+            if ([string]::IsNullOrWhiteSpace($encodedTarget)) {
+                return $null
+            }
+
+            $targetBytes = [Convert]::FromBase64String($encodedTarget)
+            $decodedTarget = [Text.Encoding]::Unicode.GetString($targetBytes)
+            return Get-NormalizedFullPath -Path $decodedTarget
+        } catch {
+            return $null
+        }
     }
 
     $prefix = $ManagedTag + ' '
@@ -196,6 +215,63 @@ function Get-FallbackShortcutBaseName {
     return 'DouK_Account'
 }
 
+function Get-EncodedTargetValue {
+    param([Parameter(Mandatory)][string]$TargetPath)
+
+    return [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($TargetPath))
+}
+
+function Get-FallbackLauncherPath {
+    param([Parameter(Mandatory)][string]$ShortcutPath)
+
+    $shortcutBaseName = [System.IO.Path]::GetFileNameWithoutExtension($ShortcutPath)
+    return Join-Path $fallbackLauncherRoot ($shortcutBaseName + '.ps1')
+}
+
+function Get-FallbackLauncherContent {
+    param([Parameter(Mandatory)][string]$TargetPath)
+
+    $encodedTarget = Get-EncodedTargetValue -TargetPath $TargetPath
+    return @(
+        "`$encodedTarget = '$encodedTarget'"
+        '$targetPath = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($encodedTarget))'
+        'if (Test-Path -LiteralPath $targetPath -PathType Container) {'
+        '    Invoke-Item -LiteralPath $targetPath'
+        '}'
+    ) -join "`r`n"
+}
+
+function Get-EncodedShortcutArguments {
+    param([Parameter(Mandatory)][string]$LauncherPath)
+
+    return "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$LauncherPath`""
+}
+
+function Get-SafeFallbackShortcutPath {
+    param(
+        [Parameter(Mandatory)][string]$FolderPath,
+        [Parameter(Mandatory)][string]$BaseName
+    )
+
+    $canonicalPath = Join-Path $FolderPath ($BaseName + '.lnk')
+    if (-not (Test-Path -LiteralPath $canonicalPath -PathType Leaf)) {
+        return $canonicalPath
+    }
+
+    try {
+        $existingShortcut = $script:shell.CreateShortcut($canonicalPath)
+        $description = [string]$existingShortcut.Description
+        if ($description.StartsWith($ManagedTag + ' ') -or
+            $description.StartsWith($ManagedBase64Tag + ' ')) {
+            # This is an earlier manager-generated fallback and may be repaired in place.
+            return $canonicalPath
+        }
+    } catch {
+    }
+
+    return Get-UniqueShortcutPath -FolderPath $FolderPath -BaseName ($BaseName + '_Encoded')
+}
+
 function Test-ManagedShortcutIsCurrent {
     param(
         [Parameter(Mandatory)][string]$ShortcutPath,
@@ -213,6 +289,27 @@ function Test-ManagedShortcutIsCurrent {
         if (-not $managedTarget -or
             -not $managedTarget.Equals($ExpectedTargetPath, [System.StringComparison]::OrdinalIgnoreCase)) {
             return $false
+        }
+
+        if ([string]$shortcut.Description -and
+            ([string]$shortcut.Description).StartsWith($ManagedBase64Tag + ' ')) {
+            $launcherPath = Get-FallbackLauncherPath -ShortcutPath $ShortcutPath
+            if (-not (Test-Path -LiteralPath $launcherPath -PathType Leaf)) {
+                return $false
+            }
+
+            $expectedLauncherContent = Get-FallbackLauncherContent -TargetPath $ExpectedTargetPath
+            $actualLauncherContent = [System.IO.File]::ReadAllText($launcherPath, [Text.Encoding]::ASCII)
+            if (-not $actualLauncherContent.Equals($expectedLauncherContent, [System.StringComparison]::Ordinal)) {
+                return $false
+            }
+
+            $expectedEncodedArguments = Get-EncodedShortcutArguments -LauncherPath $launcherPath
+            return (
+                $shortcut.TargetPath -and
+                $shortcut.TargetPath.Equals($script:powerShellPath, [System.StringComparison]::OrdinalIgnoreCase) -and
+                ([string]$shortcut.Arguments).Equals($expectedEncodedArguments, [System.StringComparison]::Ordinal)
+            )
         }
 
         # The original index script used a folder directly as TargetPath. Keep those
@@ -249,6 +346,94 @@ function Save-ManagedShortcut {
     if (-not (Test-Path -LiteralPath $ShortcutPath -PathType Leaf)) {
         throw "Shortcut file was not created: $ShortcutPath"
     }
+}
+
+function Save-EncodedManagedShortcut {
+    param(
+        [Parameter(Mandatory)][string]$ShortcutPath,
+        [Parameter(Mandatory)][string]$TargetPath
+    )
+
+    $encodedTarget = Get-EncodedTargetValue -TargetPath $TargetPath
+    $launcherPath = Get-FallbackLauncherPath -ShortcutPath $ShortcutPath
+    $launcherContent = Get-FallbackLauncherContent -TargetPath $TargetPath
+
+    if (-not (Test-Path -LiteralPath $fallbackLauncherRoot -PathType Container)) {
+        New-Item -ItemType Directory -Path $fallbackLauncherRoot | Out-Null
+        try {
+            $launcherDirectory = Get-Item -LiteralPath $fallbackLauncherRoot -ErrorAction Stop
+            $launcherDirectory.Attributes = $launcherDirectory.Attributes -bor [System.IO.FileAttributes]::Hidden
+        } catch {
+        }
+    }
+
+    [System.IO.File]::WriteAllText($launcherPath, $launcherContent, [Text.Encoding]::ASCII)
+    if (-not (Test-Path -LiteralPath $launcherPath -PathType Leaf)) {
+        throw "Fallback launcher file was not created: $launcherPath"
+    }
+
+    $encodedArguments = Get-EncodedShortcutArguments -LauncherPath $launcherPath
+
+    $shortcut = $script:shell.CreateShortcut($ShortcutPath)
+    $shortcut.TargetPath = $script:powerShellPath
+    $shortcut.Arguments = $encodedArguments
+    $shortcut.WorkingDirectory = $idxFull
+    $shortcut.Description = "$ManagedBase64Tag $encodedTarget"
+    $shortcut.Save()
+
+    if (-not (Test-Path -LiteralPath $ShortcutPath -PathType Leaf)) {
+        throw "Encoded shortcut file was not created: $ShortcutPath"
+    }
+
+    $savedShortcut = $script:shell.CreateShortcut($ShortcutPath)
+    $savedTarget = Get-ManagedTargetPath -Shortcut $savedShortcut
+
+    if (-not $savedTarget -or
+        -not $savedTarget.Equals($TargetPath, [System.StringComparison]::OrdinalIgnoreCase) -or
+        -not ([string]$savedShortcut.TargetPath).Equals($script:powerShellPath, [System.StringComparison]::OrdinalIgnoreCase) -or
+        -not ([string]$savedShortcut.Arguments).Equals($encodedArguments, [System.StringComparison]::Ordinal) -or
+        -not ([System.IO.File]::ReadAllText($launcherPath, [Text.Encoding]::ASCII)).Equals($launcherContent, [System.StringComparison]::Ordinal)) {
+        throw "Encoded shortcut verification failed: $ShortcutPath"
+    }
+}
+
+function Remove-ObsoleteFallbackCopies {
+    param(
+        [Parameter(Mandatory)][string]$FolderPath,
+        [Parameter(Mandatory)][string]$BaseName,
+        [Parameter(Mandatory)][string]$KeepPath
+    )
+
+    $removedPaths = @()
+    $escapedBaseName = [Regex]::Escape($BaseName)
+    $duplicatePattern = '^' + $escapedBaseName + ' \([2-9][0-9]*\)\.lnk$'
+    $fullKeepPath = Get-NormalizedFullPath -Path $KeepPath
+
+    Get-ChildItem -LiteralPath $FolderPath -Filter ($BaseName + ' *.lnk') -File -ErrorAction SilentlyContinue | ForEach-Object {
+        if ($_.Name -notmatch $duplicatePattern) {
+            return
+        }
+
+        $fullCandidatePath = Get-NormalizedFullPath -Path $_.FullName
+        if ($fullCandidatePath.Equals($fullKeepPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return
+        }
+
+        try {
+            # These numbered names are created only after this manager has already
+            # generated the canonical A####_Account shortcut. Removal happens only
+            # after that canonical shortcut was saved and verified successfully.
+            $obsoleteLauncherPath = Get-FallbackLauncherPath -ShortcutPath $_.FullName
+            Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop
+            if (Test-Path -LiteralPath $obsoleteLauncherPath -PathType Leaf) {
+                Remove-Item -LiteralPath $obsoleteLauncherPath -Force -ErrorAction SilentlyContinue
+            }
+            $removedPaths += $_.FullName
+        } catch {
+        }
+    }
+
+    return @($removedPaths)
 }
 
 function Remove-ManagedIndexShortcutSafely {
@@ -325,6 +510,7 @@ $removedEmptyShortcuts = @()
 $brokenItems = @()
 $shortcutFailures = @()
 $fallbackShortcutNames = @()
+$removedFallbackCopies = @()
 
 foreach ($folder in $sourceFolders) {
     $targetPath = Get-NormalizedFullPath -Path $folder.FullName
@@ -363,11 +549,17 @@ foreach ($folder in $sourceFolders) {
     } catch {
         $primaryError = $_.Exception.Message
         $fallbackBaseName = Get-FallbackShortcutBaseName -FolderName $folder.Name
-        $fallbackShortcutPath = Get-UniqueShortcutPath -FolderPath $idxFull -BaseName $fallbackBaseName
+        $fallbackShortcutPath = Get-SafeFallbackShortcutPath -FolderPath $idxFull -BaseName $fallbackBaseName
 
         try {
-            Save-ManagedShortcut -ShortcutPath $fallbackShortcutPath -TargetPath $targetPath
+            Save-EncodedManagedShortcut -ShortcutPath $fallbackShortcutPath -TargetPath $targetPath
             $managedShortcutMap[$targetPath] = $fallbackShortcutPath
+            $removedFallbackCopies += @(
+                Remove-ObsoleteFallbackCopies `
+                    -FolderPath $idxFull `
+                    -BaseName $fallbackBaseName `
+                    -KeepPath $fallbackShortcutPath
+            )
             $fallbackShortcutNames += [PSCustomObject]@{
                 FolderName   = $folder.Name
                 ShortcutPath = $fallbackShortcutPath
@@ -514,6 +706,7 @@ $runLogLines = @(
     "Updated: $updated"
     "Unchanged: $unchanged"
     "Fallback shortcut names: $($fallbackShortcutNames.Count)"
+    "Removed obsolete fallback copies: $($removedFallbackCopies.Count)"
     "Shortcut failures: $($shortcutFailures.Count)"
     "Skipped empty folders: $($skippedEmptyFolders.Count)"
     "Removed shortcuts for empty folders: $($removedEmptyShortcuts.Count)"
@@ -605,6 +798,7 @@ Write-Host "Matched account folders: $($sourceFolders.Count)"
 Write-Host "Ignored non-account folders: $ignoredSourceFolderCount"
 Write-Host "Unchanged shortcuts: $unchanged"
 Write-Host "Fallback shortcut names: $($fallbackShortcutNames.Count)"
+Write-Host "Removed obsolete fallback copies: $($removedFallbackCopies.Count)"
 Write-Host "Shortcut failures: $($shortcutFailures.Count)"
 Write-Host "Skipped empty folders: $($skippedEmptyFolders.Count)"
 Write-Host "Removed shortcuts for empty folders: $($removedEmptyShortcuts.Count)"
