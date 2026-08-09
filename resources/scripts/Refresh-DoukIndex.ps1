@@ -84,6 +84,15 @@ function Get-ShortcutDisplayName {
     return $FolderName
 }
 
+function Test-CanonicalAccountFolderName {
+    param([string]$FolderName)
+
+    # 只索引下载器生成的规范账号目录，例如：
+    # UID7636384641621132337_A1331iis40768958144_发布作品
+    # Data、Download 等业务目录即使非空也必须永久跳过。
+    return ($FolderName -match '^UID\d+_A[1-9]\d*(?=[^0-9]|$)')
+}
+
 function Test-SourceFolderShouldBeIndexed {
     param([string]$FolderPath)
 
@@ -188,7 +197,9 @@ function Remove-ManagedIndexShortcutSafely {
 }
 
 $managedShortcutMap = Get-ManagedShortcutMap -FolderPath $idxFull
-$sourceFolders = Get-ChildItem -LiteralPath $srcFull -Directory -ErrorAction SilentlyContinue | Sort-Object Name
+$sourceFolders = Get-ChildItem -LiteralPath $srcFull -Directory -ErrorAction SilentlyContinue |
+    Where-Object { Test-CanonicalAccountFolderName -FolderName $_.Name } |
+    Sort-Object Name
 
 $created = 0
 $updated = 0
