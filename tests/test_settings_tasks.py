@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from douk_manager.core.backup import BackupService
-from douk_manager.core.json_store import read_json
+from douk_manager.core.json_store import read_json, write_json_atomic
 from douk_manager.core.settings_tasks import EarliestRule, SettingsTaskService
 from tests.helpers import make_test_paths
 
@@ -73,6 +73,51 @@ class SettingsTaskTests(unittest.TestCase):
             self.assertEqual(readable.task_path.name, "A1331_全流程测试.json")
             self.assertEqual(invalid.task_path.name, "测试_名称.json")
             self.assertEqual(reserved.task_path.name, "Task_CON.json")
+
+    def test_old_task_activation_uses_latest_master_identity_and_disables_new_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_test_paths(Path(directory), 3)
+            service = SettingsTaskService(paths, BackupService(paths))
+            generated = service.create_task(
+                "A1,A3",
+                task_earliest=EarliestRule.from_text("30"),
+                task_name="reusable",
+            )
+
+            master = read_json(paths.master_settings)
+            master["cookie"] = "latest cookie"
+            master["accounts_urls"][0]["mark"] = "A1 corrected mark"
+            master["accounts_urls"][0]["url"] = "https://www.douyin.com/user/corrected"
+            master["accounts_urls"][1]["mark"] = "A2 latest mark"
+            new_account = dict(master["accounts_urls"][2])
+            new_account.update(
+                {
+                    "mark": "A4 newly collected",
+                    "url": "https://www.douyin.com/user/new-account",
+                    "enable": True,
+                    "earliest": "latest-master-value",
+                }
+            )
+            master["accounts_urls"].append(new_account)
+            write_json_atomic(paths.master_settings, master)
+
+            service.activate_existing_task(generated.task_path)
+            active = read_json(paths.active_settings)
+            accounts = active["accounts_urls"]
+            self.assertEqual(active["cookie"], "latest cookie")
+            self.assertEqual(accounts[0]["mark"], "A1 corrected mark")
+            self.assertEqual(
+                accounts[0]["url"], "https://www.douyin.com/user/corrected"
+            )
+            self.assertEqual(accounts[1]["mark"], "A2 latest mark")
+            self.assertEqual(
+                [account["enable"] for account in accounts],
+                [True, False, True, False],
+            )
+            self.assertEqual(accounts[0]["earliest"], 30)
+            self.assertEqual(accounts[2]["earliest"], 30)
+            self.assertEqual(accounts[3]["earliest"], "latest-master-value")
+            self.assertEqual(active["run_command"], "5 1 1 Q")
 
 
 if __name__ == "__main__":

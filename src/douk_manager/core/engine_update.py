@@ -78,13 +78,14 @@ class EngineUpdateService:
 
         critical_before = self._critical_hashes()
         old_main_sha256 = sha256_file(self.paths.engine_exe)
-        backup_path = self.backup.create_snapshot(
+        backup_path = self.backup.create_full_snapshot(
             "BeforeEngineUpdate",
             {
                 "archive": str(preview.archive),
                 "archive_sha256": preview.archive_sha256,
                 "old_main_sha256": old_main_sha256,
             },
+            keep_latest=2,
         )
 
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")

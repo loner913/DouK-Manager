@@ -144,7 +144,7 @@ class SettingsTaskService:
             backup_path: Path | None = None
             active_path: Path | None = None
             if activate or (persist_master_earliest and task_earliest.change):
-                backup_path = self.backup.create_snapshot(
+                backup_path = self.backup.create_critical_snapshot(
                     "BeforeChange",
                     {
                         "operation": "create_task",
@@ -152,6 +152,7 @@ class SettingsTaskService:
                         "persist_master_earliest": persist_master_earliest,
                         "activate": activate,
                     },
+                    keep_latest=20,
                 )
             try:
                 if persist_master_earliest and task_earliest.change:
@@ -173,16 +174,42 @@ class SettingsTaskService:
 
     def activate_existing_task(self, task_path: Path) -> Path:
         with critical_section(self.paths.lock_file):
-            task = read_json(task_path)
-            accounts = self._accounts(task, task_path.name)
-            if task.get("run_command") != "5 1 1 Q":
-                task["run_command"] = "5 1 1 Q"
-            enabled = sum(bool(account.get("enable", True)) for account in accounts)
+            stored_task = read_json(task_path)
+            stored_accounts = self._accounts(stored_task, task_path.name)
+            latest_master = self.load_master()
+            latest_accounts = self._accounts(latest_master, "settings_master.json")
+
+            # A task file is a reusable selection/earliest template, not another
+            # account master.  Always rebuild it on top of the latest official
+            # master so renamed marks, corrected URLs and newly collected accounts
+            # cannot be reverted by an old task JSON.
+            task = copy.deepcopy(latest_master)
+            active_accounts = self._accounts(task, "待激活 settings.json")
+            for position, active_account in enumerate(active_accounts):
+                if position >= len(stored_accounts):
+                    active_account["enable"] = False
+                    continue
+                stored_account = stored_accounts[position]
+                active_account["enable"] = bool(stored_account.get("enable", True))
+                if "earliest" in stored_account:
+                    active_account["earliest"] = copy.deepcopy(
+                        stored_account["earliest"]
+                    )
+
+            task["run_command"] = "5 1 1 Q"
+            enabled = sum(bool(account.get("enable", True)) for account in active_accounts)
             if enabled < 1:
                 raise SettingsTaskError("任务没有启用任何账号。")
-            snapshot = self.backup.create_snapshot(
+            snapshot = self.backup.create_critical_snapshot(
                 "BeforeChange",
-                {"operation": "activate_task", "task": str(task_path)},
+                {
+                    "operation": "activate_task",
+                    "task": str(task_path),
+                    "stored_accounts": len(stored_accounts),
+                    "latest_master_accounts": len(latest_accounts),
+                    "account_identity_source": "latest_settings_master",
+                },
+                keep_latest=20,
             )
             try:
                 write_json_atomic(self.paths.active_settings, task)

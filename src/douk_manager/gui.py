@@ -105,7 +105,7 @@ class MainWindow(QMainWindow):
         title = QLabel("DouK 全流程一体化管理器")
         title.setObjectName("title")
         subtitle = QLabel(
-            "统一管理账号采集、任务配置、5-1-1 下载、截图归档、快捷方式索引和永久备份。"
+            "统一管理账号采集、任务配置、5-1-1 下载、截图归档、快捷方式索引和分级备份。"
         )
         subtitle.setWordWrap(True)
         layout.addWidget(title)
@@ -138,7 +138,7 @@ class MainWindow(QMainWindow):
         buttons = QHBoxLayout()
         for text, callback in (
             ("刷新状态", self._refresh_status),
-            ("立即创建永久备份", self._manual_backup),
+            ("手动完整备份 Volume（大文件）", self._manual_backup),
             ("打开备份目录", lambda: self._open_path(self.controller.paths.backups)),
             ("打开任务目录", lambda: self._open_path(self.controller.paths.tasks)),
             ("打开日志目录", lambda: self._open_path(self.controller.paths.logs)),
@@ -357,7 +357,9 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         warning = QLabel(
-            "正式 Volume 始终由 main.exe 所在目录推导，不能单独选择另一份数据库或主档。保存路径后会立即尝试创建启动前永久备份。"
+            "正式 Volume 始终由 main.exe 所在目录推导，不能单独选择另一份数据库或主档。"
+            "自动备份只保存 settings_master.json、settings.json 和 DouK-Downloader.db，并按类别限制保留数量；"
+            "只有手动完整备份和下载引擎更新前才复制整个 Volume。"
         )
         warning.setWordWrap(True)
         layout.addWidget(warning)
@@ -638,7 +640,7 @@ class MainWindow(QMainWindow):
             self.task_output.append(f"任务文件：{result.task_path}")
             self.task_output.append(f"账号范围：{result.preview.compact}")
             if result.backup_path:
-                self.task_output.append(f"永久备份：{result.backup_path}")
+                self.task_output.append(f"修改前关键文件备份：{result.backup_path}")
             if activate:
                 self.task_output.append(f"已激活：{self.controller.paths.active_settings}")
             if start:
@@ -812,9 +814,20 @@ class MainWindow(QMainWindow):
         self._start_next_queue_item()
 
     def _manual_backup(self) -> None:
+        answer = QMessageBox.question(
+            self,
+            "确认完整备份 Volume",
+            "此操作会复制整个正式 Volume，可能占用数 GB 空间。\n\n"
+            "日常自动备份已经保存 3 个关键文件，无需频繁执行完整备份。\n\n"
+            "仍要继续吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
         result = self._run(self.controller.backup_now, self.overview_output)
         if result:
-            self.overview_output.append(f"永久备份完成：{result}")
+            self.overview_output.append(f"完整 Volume 备份完成：{result}")
 
     def _migrate_collector(self) -> None:
         result = self._run(self.controller.migrate_collector, self.collector_output)

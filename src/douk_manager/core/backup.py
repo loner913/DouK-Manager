@@ -56,6 +56,12 @@ def sqlite_backup(source: Path, destination: Path) -> None:
 
 
 class BackupService:
+    CRITICAL_FILENAMES = (
+        "settings_master.json",
+        "settings.json",
+        "DouK-Downloader.db",
+    )
+
     def __init__(self, paths: ManagedPaths) -> None:
         self.paths = paths
 
@@ -84,10 +90,56 @@ class BackupService:
             "database_quick_check": "ok",
         }
 
-    def create_snapshot(
-        self, category: str, metadata: dict[str, Any] | None = None
+    def create_critical_snapshot(
+        self,
+        category: str,
+        metadata: dict[str, Any] | None = None,
+        *,
+        keep_latest: int | None = None,
+    ) -> Path:
+        """Back up only the unique settings and database files.
+
+        This is the safe default for frequent automatic checkpoints.  It
+        deliberately excludes Cache, Data, logs and nested settings_backups
+        from the downloader Volume.
+        """
+
+        return self._create_snapshot(
+            category,
+            metadata,
+            scope="critical",
+            keep_latest=keep_latest,
+        )
+
+    def create_full_snapshot(
+        self,
+        category: str,
+        metadata: dict[str, Any] | None = None,
+        *,
+        keep_latest: int | None = None,
+    ) -> Path:
+        """Create an explicitly requested complete Volume snapshot."""
+
+        return self._create_snapshot(
+            category,
+            metadata,
+            scope="full",
+            keep_latest=keep_latest,
+        )
+
+    def _create_snapshot(
+        self,
+        category: str,
+        metadata: dict[str, Any] | None,
+        *,
+        scope: str,
+        keep_latest: int | None,
     ) -> Path:
         state = self.validate_live_data()
+        if scope not in {"critical", "full"}:
+            raise BackupError(f"备份范围无效：{scope}")
+        if keep_latest is not None and keep_latest < 1:
+            raise BackupError("自动备份保留数量必须至少为 1。")
         category_name = _safe_category(category)
         category_root = self.paths.backups / category_name
         category_root.mkdir(parents=True, exist_ok=True)
@@ -99,7 +151,12 @@ class BackupService:
         try:
             volume_target = temp / "Volume"
             volume_target.mkdir(parents=True)
-            for source in sorted(self.paths.volume.rglob("*")):
+            sources = (
+                sorted(self.paths.volume.rglob("*"))
+                if scope == "full"
+                else [self.paths.volume / name for name in self.CRITICAL_FILENAMES]
+            )
+            for source in sources:
                 relative = source.relative_to(self.paths.volume)
                 target = volume_target / relative
                 if source.is_dir():
@@ -121,8 +178,9 @@ class BackupService:
                     }
                 )
             manifest = {
-                "schema": 1,
+                "schema": 2,
                 "category": category_name,
+                "scope": scope,
                 "created_at": datetime.now().isoformat(timespec="seconds"),
                 "source_volume": str(self.paths.volume),
                 "source_engine": str(self.paths.engine_exe),
@@ -139,12 +197,45 @@ class BackupService:
             if parsed != manifest:
                 raise BackupError("备份清单复读校验失败。")
             os.replace(temp, final)
+            if keep_latest is not None:
+                self._prune_completed_snapshots(
+                    category_root,
+                    keep_latest=keep_latest,
+                    preserve=final,
+                )
             return final
         except Exception as exc:
             shutil.rmtree(temp, ignore_errors=True)
             if isinstance(exc, BackupError):
                 raise
             raise BackupError(f"创建永久备份失败：{exc}") from exc
+
+    @staticmethod
+    def _prune_completed_snapshots(
+        category_root: Path,
+        *,
+        keep_latest: int,
+        preserve: Path,
+    ) -> None:
+        """Prune only completed timestamp snapshots in one known category."""
+
+        snapshots = sorted(
+            (
+                path
+                for path in category_root.iterdir()
+                if path.is_dir()
+                and not path.name.startswith(".")
+                and (path / "manifest.json").is_file()
+            ),
+            key=lambda path: path.name,
+            reverse=True,
+        )
+        keep = {path.resolve() for path in snapshots[:keep_latest]}
+        keep.add(preserve.resolve())
+        for snapshot in snapshots:
+            if snapshot.resolve() in keep:
+                continue
+            shutil.rmtree(snapshot)
 
     def restore_named_files(self, snapshot: Path, filenames: tuple[str, ...]) -> None:
         volume_source = snapshot / "Volume"

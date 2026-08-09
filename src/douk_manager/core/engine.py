@@ -127,7 +127,7 @@ class EngineService:
             raise EngineError("下载引擎已经在运行。")
         with critical_section(self.paths.lock_file):
             self.validate_ready()
-            snapshot = self.backup.create_snapshot(
+            snapshot = self.backup.create_critical_snapshot(
                 "BeforeDownload",
                 {
                     "batch_accounts": self.config.batch_accounts,
@@ -135,6 +135,7 @@ class EngineService:
                     "run_command": "5 1 1 Q",
                     "pause_after_exit": pause_after_exit,
                 },
+                keep_latest=5,
             )
         env = os.environ.copy()
         env["DOUK_ACCOUNT_BATCH_SIZE"] = str(self.config.batch_accounts)

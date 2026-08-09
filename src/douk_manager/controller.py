@@ -102,12 +102,14 @@ class ManagerController:
             return self.read_only_reason
         try:
             with critical_section(self.paths.lock_file, timeout=5.0):
-                self.startup_backup = self.backup.create_snapshot(
-                    "Startup", {"operation": "application_start"}
+                self.startup_backup = self.backup.create_critical_snapshot(
+                    "Startup",
+                    {"operation": "application_start"},
+                    keep_latest=3,
                 )
             self.read_only_reason = ""
-            self.logger.info("启动前永久备份完成：%s", self.startup_backup)
-            return f"启动前备份完成：{self.startup_backup}"
+            self.logger.info("启动前关键文件备份完成：%s", self.startup_backup)
+            return f"启动前关键文件备份完成：{self.startup_backup}"
         except Exception as exc:
             self.read_only_reason = f"启动前备份失败：{exc}"
             self.logger.exception("启动前备份失败")
@@ -229,8 +231,10 @@ class ManagerController:
     def backup_now(self, category: str = "Manual") -> Path:
         self.require_safe_write()
         with critical_section(self.paths.lock_file):
-            result = self.backup.create_snapshot(category, {"operation": "manual"})
-        self.logger.info("手动永久备份完成：%s", result)
+            result = self.backup.create_full_snapshot(
+                category, {"operation": "manual_full_volume"}
+            )
+        self.logger.info("手动完整 Volume 备份完成：%s", result)
         return result
 
     def preview_engine_update(self, archive: Path) -> EnginePackagePreview:
