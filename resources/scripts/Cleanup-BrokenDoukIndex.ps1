@@ -1,8 +1,12 @@
-param(
+﻿param(
     [Parameter(Mandatory = $true)][string]$SourceRoot,
     [Parameter(Mandatory = $true)][string]$IndexRoot,
     [switch]$OpenIndexFolderAfterRun
 )
+
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[Console]::OutputEncoding = $utf8NoBom
+$OutputEncoding = $utf8NoBom
 
 $ManagedTag              = '[DoukIndex]'
 $CleanupReportFilePrefix = 'Cleanup-Broken-Shortcut-Report'
@@ -58,6 +62,26 @@ if (Test-PathUnderRoot -Path $srcFull -Root $idxFull) {
 
 $shell = New-Object -ComObject WScript.Shell
 
+function Get-ManagedTargetPath {
+    param($Shortcut)
+
+    if (-not $Shortcut.Description) {
+        return $null
+    }
+
+    $prefix = $ManagedTag + ' '
+    if (-not $Shortcut.Description.StartsWith($prefix)) {
+        return $null
+    }
+
+    $storedTarget = $Shortcut.Description.Substring($prefix.Length).Trim()
+    if ([string]::IsNullOrWhiteSpace($storedTarget)) {
+        return $null
+    }
+
+    return Get-NormalizedFullPath -Path $storedTarget
+}
+
 function Get-BrokenManagedShortcuts {
     param([string]$FolderPath)
 
@@ -67,17 +91,16 @@ function Get-BrokenManagedShortcuts {
         try {
             $sc = $shell.CreateShortcut($_.FullName)
 
-            if ($sc.Description -and $sc.Description.StartsWith($ManagedTag + ' ') -and $sc.TargetPath) {
-                $fullTarget = Get-NormalizedFullPath -Path $sc.TargetPath
+            $fullTarget = Get-ManagedTargetPath -Shortcut $sc
 
-                if ((Test-PathUnderRoot -Path $fullTarget -Root $srcFull) -and
-                    -not (Test-Path -LiteralPath $fullTarget -PathType Container)) {
+            if ($fullTarget -and
+                (Test-PathUnderRoot -Path $fullTarget -Root $srcFull) -and
+                -not (Test-Path -LiteralPath $fullTarget -PathType Container)) {
 
-                    $items += [PSCustomObject]@{
-                        ShortcutPath = $_.FullName
-                        ShortcutName = $_.Name
-                        TargetPath   = $fullTarget
-                    }
+                $items += [PSCustomObject]@{
+                    ShortcutPath = $_.FullName
+                    ShortcutName = $_.Name
+                    TargetPath   = $fullTarget
                 }
             }
         } catch {
@@ -102,10 +125,10 @@ foreach ($item in $brokenBefore) {
             throw "Refusing to delete non-shortcut file: $shortcutPath"
         }
         $verifyShortcut = $shell.CreateShortcut($shortcutPath)
-        if (-not ($verifyShortcut.Description -and $verifyShortcut.Description.StartsWith($ManagedTag + ' '))) {
+        $verifiedTarget = Get-ManagedTargetPath -Shortcut $verifyShortcut
+        if (-not $verifiedTarget) {
             throw "Refusing to delete unmanaged shortcut: $shortcutPath"
         }
-        $verifiedTarget = Get-NormalizedFullPath -Path $verifyShortcut.TargetPath
         if (-not $verifiedTarget.Equals($item.TargetPath, [System.StringComparison]::OrdinalIgnoreCase)) {
             throw "Shortcut target changed during cleanup: $shortcutPath"
         }

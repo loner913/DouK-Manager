@@ -6,6 +6,10 @@
     [switch]$PromptDeleteBrokenShortcuts
 )
 
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[Console]::OutputEncoding = $utf8NoBom
+$OutputEncoding = $utf8NoBom
+
 function Get-NormalizedFullPath {
     param([Parameter(Mandatory)][string]$Path)
 
@@ -73,6 +77,7 @@ if (-not (Test-Path -LiteralPath $logRoot -PathType Container)) {
 }
 
 $script:shell = New-Object -ComObject WScript.Shell
+$script:explorerPath = Join-Path $env:WINDIR 'explorer.exe'
 
 function Get-ShortcutDisplayName {
     param([string]$FolderName)
@@ -100,6 +105,26 @@ function Test-SourceFolderShouldBeIndexed {
     }
 }
 
+function Get-ManagedTargetPath {
+    param($Shortcut)
+
+    if (-not $Shortcut.Description) {
+        return $null
+    }
+
+    $prefix = $ManagedTag + ' '
+    if (-not $Shortcut.Description.StartsWith($prefix)) {
+        return $null
+    }
+
+    $storedTarget = $Shortcut.Description.Substring($prefix.Length).Trim()
+    if ([string]::IsNullOrWhiteSpace($storedTarget)) {
+        return $null
+    }
+
+    return Get-NormalizedFullPath -Path $storedTarget
+}
+
 function Get-ManagedShortcutMap {
     param([string]$FolderPath)
 
@@ -109,12 +134,10 @@ function Get-ManagedShortcutMap {
         try {
             $sc = $script:shell.CreateShortcut($_.FullName)
 
-            if ($sc.Description -and $sc.Description.StartsWith($ManagedTag + ' ') -and $sc.TargetPath) {
-                $fullTarget = Get-NormalizedFullPath -Path $sc.TargetPath
+            $fullTarget = Get-ManagedTargetPath -Shortcut $sc
 
-                if (Test-PathUnderRoot -Path $fullTarget -Root $srcFull) {
-                    $map[$fullTarget] = $_.FullName
-                }
+            if ($fullTarget -and (Test-PathUnderRoot -Path $fullTarget -Root $srcFull)) {
+                $map[$fullTarget] = $_.FullName
             }
         } catch {
         }
@@ -129,11 +152,34 @@ function Get-UniqueShortcutPath {
         [string]$BaseName
     )
 
-    $candidate = Join-Path $FolderPath ($BaseName + '.lnk')
+    $safeBaseName = $BaseName
+    foreach ($invalidCharacter in [System.IO.Path]::GetInvalidFileNameChars()) {
+        $safeBaseName = $safeBaseName.Replace([string]$invalidCharacter, '_')
+    }
+    $safeBaseName = $safeBaseName.Trim().TrimEnd('.')
+    if ([string]::IsNullOrWhiteSpace($safeBaseName)) {
+        $safeBaseName = 'DouK'
+    }
+
+    $maxBaseLength = [Math]::Min(120, 235 - $FolderPath.Length - 5)
+    if ($maxBaseLength -lt 16) {
+        throw "Index path is too long for shortcut creation: $FolderPath"
+    }
+    if ($safeBaseName.Length -gt $maxBaseLength) {
+        $safeBaseName = $safeBaseName.Substring(0, $maxBaseLength).Trim().TrimEnd('.')
+    }
+
+    $candidate = Join-Path $FolderPath ($safeBaseName + '.lnk')
     $index = 2
 
     while (Test-Path -LiteralPath $candidate) {
-        $candidate = Join-Path $FolderPath ("{0} ({1}).lnk" -f $BaseName, $index)
+        $suffix = " ($index)"
+        $availableBaseLength = $maxBaseLength - $suffix.Length
+        $numberedBaseName = $safeBaseName
+        if ($numberedBaseName.Length -gt $availableBaseLength) {
+            $numberedBaseName = $numberedBaseName.Substring(0, $availableBaseLength).Trim().TrimEnd('.')
+        }
+        $candidate = Join-Path $FolderPath ($numberedBaseName + $suffix + '.lnk')
         $index++
     }
 
@@ -170,11 +216,11 @@ function Remove-ManagedIndexShortcutSafely {
 
     $sc = $script:shell.CreateShortcut($fullShortcutPath)
 
-    if (-not ($sc.Description -and $sc.Description.StartsWith($ManagedTag + ' ') -and $sc.TargetPath)) {
+    $actualTargetPath = Get-ManagedTargetPath -Shortcut $sc
+
+    if (-not $actualTargetPath) {
         throw "Refusing to delete unmanaged shortcut: $fullShortcutPath"
     }
-
-    $actualTargetPath = Get-NormalizedFullPath -Path $sc.TargetPath
 
     if (-not $actualTargetPath.Equals($fullExpectedTargetPath, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "Shortcut target mismatch. Expected: $fullExpectedTargetPath ; Actual: $actualTargetPath"
@@ -211,6 +257,7 @@ $skippedEmptyFolders = @()
 $skippedTargetSet = @{}
 $removedEmptyShortcuts = @()
 $brokenItems = @()
+$shortcutFailures = @()
 
 foreach ($folder in $sourceFolders) {
     $targetPath = Get-NormalizedFullPath -Path $folder.FullName
@@ -224,21 +271,40 @@ foreach ($folder in $sourceFolders) {
         continue
     }
 
-    if ($managedShortcutMap.ContainsKey($targetPath)) {
+    $shortcutAlreadyExists = $managedShortcutMap.ContainsKey($targetPath)
+    if ($shortcutAlreadyExists) {
         $shortcutPath = $managedShortcutMap[$targetPath]
-        $updated++
     } else {
         $displayName = Get-ShortcutDisplayName -FolderName $folder.Name
         $shortcutPath = Get-UniqueShortcutPath -FolderPath $idxFull -BaseName $displayName
-        $managedShortcutMap[$targetPath] = $shortcutPath
-        $created++
     }
 
-    $shortcut = $script:shell.CreateShortcut($shortcutPath)
-    $shortcut.TargetPath = $targetPath
-    $shortcut.WorkingDirectory = $targetPath
-    $shortcut.Description = "$ManagedTag $targetPath"
-    $shortcut.Save()
+    try {
+        $shortcut = $script:shell.CreateShortcut($shortcutPath)
+        $shortcut.TargetPath = $script:explorerPath
+        $shortcut.Arguments = '"' + $targetPath + '"'
+        $shortcut.WorkingDirectory = $srcFull
+        $shortcut.Description = "$ManagedTag $targetPath"
+        $shortcut.Save()
+
+        if (-not (Test-Path -LiteralPath $shortcutPath -PathType Leaf)) {
+            throw "Shortcut file was not created: $shortcutPath"
+        }
+
+        $managedShortcutMap[$targetPath] = $shortcutPath
+        if ($shortcutAlreadyExists) {
+            $updated++
+        } else {
+            $created++
+        }
+    } catch {
+        $shortcutFailures += [PSCustomObject]@{
+            FolderName   = $folder.Name
+            TargetPath   = $targetPath
+            ShortcutPath = $shortcutPath
+            ErrorMessage = $_.Exception.Message
+        }
+    }
 }
 
 if ($RemoveShortcutsForEmptySourceFolders -and $skippedTargetSet.Count -gt 0) {
@@ -246,16 +312,14 @@ if ($RemoveShortcutsForEmptySourceFolders -and $skippedTargetSet.Count -gt 0) {
         try {
             $sc = $script:shell.CreateShortcut($_.FullName)
 
-            if ($sc.Description -and $sc.Description.StartsWith($ManagedTag + ' ') -and $sc.TargetPath) {
-                $fullTarget = Get-NormalizedFullPath -Path $sc.TargetPath
+            $fullTarget = Get-ManagedTargetPath -Shortcut $sc
 
-                if ($skippedTargetSet.ContainsKey($fullTarget)) {
-                    Remove-ManagedIndexShortcutSafely -ShortcutPath $_.FullName -ExpectedTargetPath $fullTarget
+            if ($fullTarget -and $skippedTargetSet.ContainsKey($fullTarget)) {
+                Remove-ManagedIndexShortcutSafely -ShortcutPath $_.FullName -ExpectedTargetPath $fullTarget
 
-                    $removedEmptyShortcuts += [PSCustomObject]@{
-                        ShortcutName = $_.Name
-                        TargetPath   = $fullTarget
-                    }
+                $removedEmptyShortcuts += [PSCustomObject]@{
+                    ShortcutName = $_.Name
+                    TargetPath   = $fullTarget
                 }
             }
         } catch {
@@ -267,18 +331,17 @@ Get-ChildItem -LiteralPath $idxFull -Filter *.lnk -File -ErrorAction SilentlyCon
     try {
         $sc = $script:shell.CreateShortcut($_.FullName)
 
-        if ($sc.Description -and $sc.Description.StartsWith($ManagedTag + ' ') -and $sc.TargetPath) {
-            $fullTarget = Get-NormalizedFullPath -Path $sc.TargetPath
+        $fullTarget = Get-ManagedTargetPath -Shortcut $sc
 
-            if ((Test-PathUnderRoot -Path $fullTarget -Root $srcFull) -and
-                -not (Test-Path -LiteralPath $fullTarget -PathType Container)) {
+        if ($fullTarget -and
+            (Test-PathUnderRoot -Path $fullTarget -Root $srcFull) -and
+            -not (Test-Path -LiteralPath $fullTarget -PathType Container)) {
 
-                $brokenItems += [PSCustomObject]@{
-                    ShortcutName = $_.Name
-                    ShortcutPath = $_.FullName
-                    TargetPath   = $fullTarget
-                    Action       = 'Pending'
-                }
+            $brokenItems += [PSCustomObject]@{
+                ShortcutName = $_.Name
+                ShortcutPath = $_.FullName
+                TargetPath   = $fullTarget
+                Action       = 'Pending'
             }
         }
     } catch {
@@ -368,6 +431,7 @@ $runLogLines = @(
     "Ignored non-account folders: $ignoredSourceFolderCount"
     "Created: $created"
     "Updated: $updated"
+    "Shortcut failures: $($shortcutFailures.Count)"
     "Skipped empty folders: $($skippedEmptyFolders.Count)"
     "Removed shortcuts for empty folders: $($removedEmptyShortcuts.Count)"
     "Detected broken shortcuts: $brokenDetectedCount"
@@ -387,6 +451,22 @@ if ($skippedEmptyFolders.Count -eq 0) {
     foreach ($item in $skippedEmptyFolders | Sort-Object FolderName) {
         $runLogLines += "Folder: $($item.FolderName)"
         $runLogLines += "Target: $($item.TargetPath)"
+        $runLogLines += ""
+    }
+}
+
+if ($shortcutFailures.Count -eq 0) {
+    $runLogLines += "Shortcut failures: none"
+    $runLogLines += ""
+} else {
+    $runLogLines += "Shortcut failures:"
+    $runLogLines += ""
+
+    foreach ($item in $shortcutFailures | Sort-Object FolderName) {
+        $runLogLines += "Folder: $($item.FolderName)"
+        $runLogLines += "Target: $($item.TargetPath)"
+        $runLogLines += "Shortcut: $($item.ShortcutPath)"
+        $runLogLines += "Error: $($item.ErrorMessage)"
         $runLogLines += ""
     }
 }
@@ -426,6 +506,7 @@ Write-Host "Done. Created $created, updated $updated shortcuts." -ForegroundColo
 Write-Host "Scanned source folders: $($sourceFolderCandidates.Count)"
 Write-Host "Matched account folders: $($sourceFolders.Count)"
 Write-Host "Ignored non-account folders: $ignoredSourceFolderCount"
+Write-Host "Shortcut failures: $($shortcutFailures.Count)"
 Write-Host "Skipped empty folders: $($skippedEmptyFolders.Count)"
 Write-Host "Removed shortcuts for empty folders: $($removedEmptyShortcuts.Count)"
 Write-Host "Detected broken shortcuts: $brokenDetectedCount"
