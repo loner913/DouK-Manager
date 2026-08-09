@@ -21,9 +21,11 @@ class IndexScriptTests(unittest.TestCase):
 
     def test_refresh_has_no_account_name_fallback_or_launcher_files(self) -> None:
         self.assertIn("function Save-ManagedShortcut", self.script)
-        self.assertIn("$shortcut.TargetPath = $script:explorerPath", self.script)
-        self.assertIn("$shortcut.Arguments = '\"' + $TargetPath + '\"'", self.script)
+        self.assertIn("$shortcut.TargetPath = $TargetPath", self.script)
+        self.assertIn("$shortcut.Arguments = ''", self.script)
+        self.assertIn("$directTarget = Get-NormalizedFullPath", self.script)
         self.assertIn("^UID[0-9]+_A[1-9][0-9]*([^0-9]|$)", self.script)
+        self.assertNotIn("$shortcut.TargetPath = $script:explorerPath", self.script)
         self.assertNotIn("ManagedBase64Tag", self.script)
         self.assertNotIn("DouKLaunchers", self.script)
         self.assertNotIn("Get-FallbackShortcutBaseName", self.script)

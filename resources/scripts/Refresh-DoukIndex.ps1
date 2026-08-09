@@ -77,7 +77,6 @@ if (-not (Test-Path -LiteralPath $logRoot -PathType Container)) {
 }
 
 $script:shell = New-Object -ComObject WScript.Shell
-$script:explorerPath = Join-Path $env:WINDIR 'explorer.exe'
 
 function Get-ShortcutDisplayName {
     param([string]$FolderName)
@@ -107,6 +106,19 @@ function Test-SourceFolderShouldBeIndexed {
 
 function Get-ManagedTargetPath {
     param($Shortcut)
+
+    # Prefer the real shortcut target used by the original index tool.  This
+    # also recognizes legacy direct-to-folder shortcuts that have no managed
+    # description at all.
+    if ($Shortcut.TargetPath) {
+        try {
+            $directTarget = Get-NormalizedFullPath -Path ([string]$Shortcut.TargetPath)
+            if (Test-PathUnderRoot -Path $directTarget -Root $srcFull) {
+                return $directTarget
+            }
+        } catch {
+        }
+    }
 
     if (-not $Shortcut.Description) {
         return $null
@@ -205,18 +217,9 @@ function Test-ManagedShortcutIsCurrent {
             return $false
         }
 
-        # The original index script used a folder directly as TargetPath. Keep those
-        # already-working legacy shortcuts instead of rewriting them through WScript.
-        if ($shortcut.TargetPath -and
-            $shortcut.TargetPath.Equals($ExpectedTargetPath, [System.StringComparison]::OrdinalIgnoreCase)) {
-            return $true
-        }
-
-        $expectedArguments = '"' + $ExpectedTargetPath + '"'
         return (
             $shortcut.TargetPath -and
-            $shortcut.TargetPath.Equals($script:explorerPath, [System.StringComparison]::OrdinalIgnoreCase) -and
-            ([string]$shortcut.Arguments).Equals($expectedArguments, [System.StringComparison]::Ordinal)
+            $shortcut.TargetPath.Equals($ExpectedTargetPath, [System.StringComparison]::OrdinalIgnoreCase)
         )
     } catch {
         return $false
@@ -230,9 +233,12 @@ function Save-ManagedShortcut {
     )
 
     $shortcut = $script:shell.CreateShortcut($ShortcutPath)
-    $shortcut.TargetPath = $script:explorerPath
-    $shortcut.Arguments = '"' + $TargetPath + '"'
-    $shortcut.WorkingDirectory = $srcFull
+    # Use the same simple and reliable form as the original tool: the .lnk
+    # points directly to the account folder.  No explorer wrapper, encoded
+    # launcher, fallback name or command-line arguments are involved.
+    $shortcut.TargetPath = $TargetPath
+    $shortcut.Arguments = ''
+    $shortcut.WorkingDirectory = $TargetPath
     $shortcut.Description = "$ManagedTag $TargetPath"
     $shortcut.Save()
 

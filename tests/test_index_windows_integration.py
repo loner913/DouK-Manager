@@ -120,8 +120,8 @@ class WindowsIndexIntegrationTests(unittest.TestCase):
 
                 properties = self._shortcut_properties(shortcut)
                 self.assertEqual(properties["Description"], f"[DoukIndex] {target}")
-                self.assertTrue(properties["TargetPath"].lower().endswith("explorer.exe"))
-                self.assertEqual(properties["Arguments"], f'"{target}"')
+                self.assertEqual(Path(properties["TargetPath"]), target)
+                self.assertEqual(properties["Arguments"], "")
 
             second = self._run_refresh(source, index)
             self.assertEqual(second["Created"], "0")
