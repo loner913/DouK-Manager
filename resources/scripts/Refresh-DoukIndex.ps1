@@ -2,7 +2,6 @@
     [Parameter(Mandatory = $true)][string]$SourceRoot,
     [Parameter(Mandatory = $true)][string]$IndexRoot,
     [switch]$OpenIndexFolderAfterRun,
-    [switch]$GenerateBrokenReport,
     [switch]$PromptDeleteBrokenShortcuts
 )
 
@@ -42,7 +41,6 @@ function Test-PathUnderRoot {
     )
 }
 
-$BrokenReportFilePrefix  = 'Broken-Shortcut-Report'
 $RunLogFilePrefix        = 'Refresh-DoukIndex-RunLog'
 $ManagedTag              = '[DoukIndex]'
 $SkipEmptySourceFolders               = $true
@@ -53,7 +51,6 @@ $idxFull = Get-NormalizedFullPath -Path $IndexRoot
 $logRoot = Join-Path $idxFull 'Logs'
 
 $runTimestamp = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss-fff'
-$reportPath = Join-Path $logRoot ("{0}_{1}.txt" -f $BrokenReportFilePrefix, $runTimestamp)
 $runLogPath = Join-Path $logRoot ("{0}_{1}.txt" -f $RunLogFilePrefix, $runTimestamp)
 
 if (-not (Test-Path -LiteralPath $srcFull -PathType Container)) {
@@ -446,36 +443,6 @@ $brokenDeletedCount = @($brokenItems | Where-Object { $_.Action -eq 'Deleted' })
 $brokenKeptCount = @($brokenItems | Where-Object { $_.Action -eq 'Kept' -or $_.Action -eq 'DeleteFailed' }).Count
 $brokenDetectedCount = $brokenItems.Count
 
-if ($GenerateBrokenReport) {
-    $reportLines = @(
-        "Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-        "Source: $srcFull"
-        "Index: $idxFull"
-        "Detected broken shortcuts: $brokenDetectedCount"
-        "Deleted broken shortcuts: $brokenDeletedCount"
-        "Kept broken shortcuts: $brokenKeptCount"
-        ""
-    )
-
-    if ($brokenItems.Count -eq 0) {
-        $reportLines += "No broken shortcuts found."
-    } else {
-        $reportLines += "Broken shortcuts:"
-        $reportLines += ""
-
-        foreach ($item in $brokenItems | Sort-Object ShortcutName) {
-            $reportLines += "Shortcut: $($item.ShortcutName)"
-            $reportLines += "Target: $($item.TargetPath)"
-            $reportLines += "Action: $($item.Action)"
-            $reportLines += ""
-        }
-    }
-
-    Set-Content -LiteralPath $reportPath -Value $reportLines -Encoding UTF8
-}
-
-$brokenReportSummary = if ($GenerateBrokenReport) { $reportPath } else { 'Disabled' }
-
 $runLogLines = @(
     "Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
     "Source: $srcFull"
@@ -493,7 +460,6 @@ $runLogLines = @(
     "Detected broken shortcuts: $brokenDetectedCount"
     "Deleted broken shortcuts: $brokenDeletedCount"
     "Kept broken shortcuts: $brokenKeptCount"
-    "Broken report: $brokenReportSummary"
     ""
 )
 
@@ -572,10 +538,6 @@ Write-Host "Kept broken shortcuts: $brokenKeptCount"
 Write-Host "Source: $srcFull"
 Write-Host "Index: $idxFull"
 Write-Host "Logs: $logRoot"
-
-if ($GenerateBrokenReport) {
-    Write-Host "Broken report: $reportPath"
-}
 
 Write-Host "RunLog: $runLogPath"
 

@@ -45,3 +45,12 @@ class IndexScriptTests(unittest.TestCase):
         self.assertEqual(positions, sorted(positions))
         self.assertNotIn("explorer.exe", self.script)
         self.assertNotIn(".Arguments =", self.script)
+
+    def test_refresh_uses_one_complete_run_log_instead_of_duplicate_broken_report(self) -> None:
+        self.assertIn("$RunLogFilePrefix        = 'Refresh-DoukIndex-RunLog'", self.script)
+        self.assertIn('"Detected broken shortcuts: $brokenDetectedCount"', self.script)
+        self.assertIn('"Shortcut: $($item.ShortcutName)"', self.script)
+        self.assertIn('"Target: $($item.TargetPath)"', self.script)
+        self.assertIn('"Action: $($item.Action)"', self.script)
+        self.assertNotIn("Broken-Shortcut-Report", self.script)
+        self.assertNotIn("GenerateBrokenReport", self.script)

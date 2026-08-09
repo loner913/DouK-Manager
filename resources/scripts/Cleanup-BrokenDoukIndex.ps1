@@ -41,8 +41,6 @@ function Test-PathUnderRoot {
 
 $srcFull = Get-NormalizedFullPath -Path $SourceRoot
 $idxFull = Get-NormalizedFullPath -Path $IndexRoot
-$runTimestamp = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'
-$reportPath = Join-Path $idxFull ("{0}_{1}.txt" -f $CleanupReportFilePrefix, $runTimestamp)
 
 if (-not (Test-Path -LiteralPath $srcFull -PathType Container)) {
     throw "Source folder not found: $srcFull"
@@ -59,6 +57,14 @@ if (Test-PathUnderRoot -Path $idxFull -Root $srcFull) {
 if (Test-PathUnderRoot -Path $srcFull -Root $idxFull) {
     throw "Source folder cannot be the index folder or inside index folder: $srcFull"
 }
+
+$logRoot = Join-Path $idxFull 'Logs'
+if (-not (Test-Path -LiteralPath $logRoot -PathType Container)) {
+    New-Item -ItemType Directory -Path $logRoot -Force | Out-Null
+}
+
+$runTimestamp = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss-fff'
+$reportPath = Join-Path $logRoot ("{0}_{1}.txt" -f $CleanupReportFilePrefix, $runTimestamp)
 
 $shell = New-Object -ComObject WScript.Shell
 
@@ -203,6 +209,7 @@ Set-Content -LiteralPath $reportPath -Value $reportLines -Encoding UTF8
 Write-Host "Done. Deleted $($deletedItems.Count) broken shortcuts." -ForegroundColor Green
 Write-Host "Delete failed: $($failedDeleteItems.Count)"
 Write-Host "Remaining broken: $($remainingBrokenItems.Count)"
+Write-Host "Logs: $logRoot"
 Write-Host "Report: $reportPath"
 
 if ($OpenIndexFolderAfterRun) {

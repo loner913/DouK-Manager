@@ -61,7 +61,6 @@ class WindowsIndexIntegrationTests(unittest.TestCase):
                 str(source),
                 "-IndexRoot",
                 str(index),
-                "-GenerateBrokenReport",
             ],
             check=False,
             capture_output=True,

@@ -61,7 +61,6 @@ class IndexService:
         index: Path,
         *,
         open_folder: bool = False,
-        generate_broken_report: bool = True,
         prompt_delete_broken: bool = False,
     ) -> IndexResult:
         if os.name != "nt":
@@ -81,8 +80,6 @@ class IndexService:
         ]
         if open_folder:
             command.append("-OpenIndexFolderAfterRun")
-        if generate_broken_report:
-            command.append("-GenerateBrokenReport")
         if prompt_delete_broken:
             command.append("-PromptDeleteBrokenShortcuts")
         completed = subprocess.run(

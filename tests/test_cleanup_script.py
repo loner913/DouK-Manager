@@ -45,6 +45,18 @@ class CleanupScriptTests(unittest.TestCase):
             with self.subTest(step=step):
                 self.assertIn(step, self.self_test)
 
+    def test_cleanup_report_is_written_inside_index_logs_folder(self) -> None:
+        self.assertIn("$logRoot = Join-Path $idxFull 'Logs'", self.cleanup)
+        self.assertIn(
+            '$reportPath = Join-Path $logRoot ("{0}_{1}.txt" -f $CleanupReportFilePrefix, $runTimestamp)',
+            self.cleanup,
+        )
+        self.assertIn("Get-Date -Format 'yyyy-MM-dd_HH-mm-ss-fff'", self.cleanup)
+        self.assertNotIn(
+            '$reportPath = Join-Path $idxFull ("{0}_{1}.txt" -f $CleanupReportFilePrefix, $runTimestamp)',
+            self.cleanup,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
