@@ -243,12 +243,17 @@ class ManagerController:
         )
         return result
 
-    def start_collector(self) -> bool:
+    def start_collector(self) -> Path:
         self.require_safe_write()
         self.collector.start()
         self._last_collector_running = True
-        self.logger.info("账号采集服务已启动")
-        return True
+        log_path = self.collector.last_log_path or self.paths.logs
+        self.logger.info(
+            "账号采集服务已启动并通过健康检查：http://127.0.0.1:%s/health；日志=%s",
+            self.config.collector_port,
+            log_path,
+        )
+        return log_path
 
     def stop_collector(self) -> None:
         self.collector.stop()

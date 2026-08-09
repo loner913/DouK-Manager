@@ -684,7 +684,11 @@ class MainWindow(QMainWindow):
     def _start_collector(self) -> None:
         result = self._run(self.controller.start_collector, self.collector_output)
         if result:
-            self.collector_output.append("账号采集服务已启动。")
+            self.collector_output.append(
+                "账号采集服务已启动，并已通过 "
+                f"http://127.0.0.1:{self.controller.config.collector_port}/health 验证。"
+            )
+            self.collector_output.append(f"采集服务日志：{result}")
 
     def _stop_collector(self) -> None:
         self.controller.stop_collector()

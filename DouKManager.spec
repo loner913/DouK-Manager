@@ -10,6 +10,7 @@ datas = [
 ]
 binaries = []
 hiddenimports = []
+hiddenimports += ["douk_manager.vendor.collector_server"]
 
 for package in ("openpyxl", "PIL"):
     package_datas, package_binaries, package_hidden = collect_all(package)

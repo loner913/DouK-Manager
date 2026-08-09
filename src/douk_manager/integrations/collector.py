@@ -5,6 +5,7 @@ import hashlib
 import shutil
 import subprocess
 import sys
+import time
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
@@ -33,11 +34,14 @@ class MigrationResult:
 
 
 class CollectorService:
+    STARTUP_TIMEOUT_SECONDS = 15.0
+
     def __init__(self, config: AppConfig, paths: ManagedPaths) -> None:
         self.config = config
         self.paths = paths
         self.process: subprocess.Popen | None = None
         self._log_handle = None
+        self.last_log_path: Path | None = None
 
     @property
     def running(self) -> bool:
@@ -54,8 +58,15 @@ class CollectorService:
             return False
 
     def start(self) -> None:
-        if self.running or self.health():
+        if self.running:
             raise CollectorServiceError("账号采集服务已经在运行。")
+        if self.process is not None:
+            self.process = None
+            self._close_log_handle()
+        if self.health():
+            raise CollectorServiceError(
+                f"端口 {self.config.collector_port} 已有采集服务在运行，无需重复启动。"
+            )
         if not self.paths.master_settings.is_file():
             raise CollectorServiceError(f"唯一正式主档不存在：{self.paths.master_settings}")
         if not self.paths.collector_excel.is_file():
@@ -74,6 +85,7 @@ class CollectorService:
                 "DOUK_COLLECTOR_PORT": str(self.config.collector_port),
                 "DOUK_COLLECTOR_TOKEN": self.config.collector_token,
                 "DOUK_GLOBAL_LOCK_PATH": str(self.paths.lock_file),
+                "PYTHONUNBUFFERED": "1",
             }
         )
         if getattr(sys, "frozen", False):
@@ -85,6 +97,7 @@ class CollectorService:
                 part for part in (str(project_root() / "src"), existing) if part
             )
         log_path = self.paths.logs / f"Collector_{datetime.now():%Y-%m-%d_%H-%M-%S}.log"
+        self.last_log_path = log_path
         self._log_handle = log_path.open("a", encoding="utf-8")
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         try:
@@ -97,9 +110,40 @@ class CollectorService:
                 creationflags=creationflags,
             )
         except OSError as exc:
-            self._log_handle.close()
-            self._log_handle = None
+            self._close_log_handle()
             raise CollectorServiceError(f"无法启动账号采集服务：{exc}") from exc
+        self._wait_until_ready(log_path)
+
+    def _wait_until_ready(self, log_path: Path) -> None:
+        """Only report success after the HTTP service is genuinely reachable."""
+        deadline = time.monotonic() + self.STARTUP_TIMEOUT_SECONDS
+        while True:
+            process = self.process
+            if process is None:
+                raise CollectorServiceError("账号采集服务进程状态丢失，启动已取消。")
+            exit_code = process.poll()
+            if exit_code is not None:
+                self.process = None
+                self._close_log_handle()
+                details = _read_log_tail(log_path)
+                raise CollectorServiceError(
+                    "账号采集服务未能启动"
+                    f"（进程退出码 {exit_code}）。\n"
+                    f"日志：{log_path}\n"
+                    f"{details or '日志中没有输出。'}"
+                )
+            if self.health(timeout=0.35):
+                return
+            if time.monotonic() >= deadline:
+                self.stop()
+                details = _read_log_tail(log_path)
+                raise CollectorServiceError(
+                    "账号采集服务进程已创建，但在 15 秒内没有成功监听 "
+                    f"127.0.0.1:{self.config.collector_port}，已自动停止。\n"
+                    f"日志：{log_path}\n"
+                    f"{details or '日志中没有输出。'}"
+                )
+            time.sleep(0.15)
 
     def stop(self) -> None:
         if self.process is not None and self.process.poll() is None:
@@ -110,9 +154,15 @@ class CollectorService:
                 self.process.kill()
                 self.process.wait(timeout=3)
         self.process = None
+        self._close_log_handle()
+
+    def _close_log_handle(self) -> None:
         if self._log_handle is not None:
-            self._log_handle.close()
-            self._log_handle = None
+            try:
+                self._log_handle.flush()
+            finally:
+                self._log_handle.close()
+                self._log_handle = None
 
     def migrate_old_data(self, old_screenshot_dir: Path) -> MigrationResult:
         old_root = old_screenshot_dir.parent
@@ -177,6 +227,15 @@ def _sha256(path: Path) -> str:
         while chunk := handle.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _read_log_tail(path: Path, max_lines: int = 30, max_chars: int = 6000) -> str:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    tail = "\n".join(text.splitlines()[-max_lines:])
+    return tail[-max_chars:]
 
 
 def _copy_verified_exclusive(source: Path, target: Path) -> None:
