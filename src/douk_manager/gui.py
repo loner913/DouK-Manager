@@ -353,13 +353,30 @@ class MainWindow(QMainWindow):
         form.addRow("默认索引清理", self.setting_cleanup)
         layout.addWidget(task_box)
         note = QLabel(
-            "注意：当前20260626版下载引擎仍固定使用50/150；界面数值将在兼容补丁版引擎中生效。"
+            "兼容版下载引擎会读取这里的批次和暂停数值；旧版仍按自身内置值运行。"
         )
         note.setWordWrap(True)
         layout.addWidget(note)
         save = QPushButton("保存设置并重新验证正式数据")
         save.clicked.connect(self._save_settings)
         layout.addWidget(save)
+
+        update_box = QGroupBox("下载引擎安全更新（永久保留唯一正式 Volume）")
+        update_grid = QGridLayout(update_box)
+        self.engine_update_zip = QLineEdit()
+        self.engine_update_zip.setPlaceholderText("选择 GitHub Actions 生成的 Windows X64 ZIP")
+        update_grid.addWidget(QLabel("新下载引擎 ZIP"), 0, 0)
+        update_grid.addWidget(self.engine_update_zip, 0, 1)
+        browse_update = QPushButton("选择")
+        browse_update.clicked.connect(self._browse_engine_update)
+        update_grid.addWidget(browse_update, 0, 2)
+        preview_update = QPushButton("只读预检更新包")
+        preview_update.clicked.connect(self._preview_engine_update)
+        apply_update = QPushButton("备份并安全安装")
+        apply_update.clicked.connect(self._apply_engine_update)
+        update_grid.addWidget(preview_update, 1, 1)
+        update_grid.addWidget(apply_update, 1, 2)
+        layout.addWidget(update_box)
         self.settings_output = QTextEdit()
         self.settings_output.setReadOnly(True)
         layout.addWidget(self.settings_output, 1)
@@ -736,6 +753,78 @@ class MainWindow(QMainWindow):
         )
         if selected:
             self.engine_edit.setText(selected)
+
+    def _browse_engine_update(self) -> None:
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择下载引擎 ZIP",
+            self.engine_update_zip.text(),
+            "ZIP 压缩包 (*.zip)",
+        )
+        if selected:
+            self.engine_update_zip.setText(selected)
+
+    def _preview_engine_update(self) -> None:
+        archive = Path(self.engine_update_zip.text().strip())
+        result = self._run(
+            lambda: self.controller.preview_engine_update(archive), self.settings_output
+        )
+        if result:
+            packaged_volume = "有（安装时会丢弃，绝不覆盖正式 Volume）" if result.contains_packaged_volume else "无"
+            self.settings_output.setPlainText(
+                "\n".join(
+                    (
+                        "更新包只读预检通过。",
+                        f"ZIP：{result.archive}",
+                        f"SHA-256：{result.archive_sha256}",
+                        f"包内根目录：{result.package_prefix}",
+                        f"文件数：{result.file_count}",
+                        f"解压大小：{result.uncompressed_bytes / 1024 / 1024:.1f} MB",
+                        f"main.exe：{result.main_exe_bytes / 1024 / 1024:.1f} MB",
+                        f"包内 Volume：{packaged_volume}",
+                        "当前正式 Volume 尚未修改。",
+                    )
+                )
+            )
+
+    def _apply_engine_update(self) -> None:
+        archive = Path(self.engine_update_zip.text().strip())
+        preview = self._run(
+            lambda: self.controller.preview_engine_update(archive), self.settings_output
+        )
+        if not preview:
+            return
+        answer = QMessageBox.question(
+            self,
+            "确认安全更新下载引擎",
+            "管理器将先永久备份完整正式 Volume，再替换 main.exe 和 _internal 程序文件。\n\n"
+            "settings_master.json、settings.json 和 DouK-Downloader.db 将通过移动保留，"
+            "更新前后进行 SHA-256 与数据库一致性校验。\n\n"
+            "旧引擎程序会永久保存在 Updates\\EngineRollback。\n\n确认继续？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        result = self._run(
+            lambda: self.controller.apply_engine_update(archive), self.settings_output
+        )
+        if result:
+            self.settings_output.setPlainText(
+                "\n".join(
+                    (
+                        "下载引擎安全更新完成。",
+                        f"更新前永久备份：{result.backup_path}",
+                        f"旧引擎回退目录：{result.rollback_path}",
+                        f"旧 main.exe：{result.old_main_sha256}",
+                        f"新 main.exe：{result.new_main_sha256}",
+                        "settings_master.json：哈希一致",
+                        "settings.json：哈希一致",
+                        "DouK-Downloader.db：哈希一致且 quick_check=ok",
+                        "现在可以通过下载队列启动兼容版下载引擎。",
+                    )
+                )
+            )
 
     def _browse_dir(self, edit: QLineEdit) -> None:
         selected = QFileDialog.getExistingDirectory(self, "选择文件夹", edit.text())

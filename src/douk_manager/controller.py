@@ -8,6 +8,11 @@ from typing import Any
 from douk_manager.config import AppConfig, ManagedPaths, application_root, update_config
 from douk_manager.core.backup import BackupService
 from douk_manager.core.engine import EngineRun, EngineService
+from douk_manager.core.engine_update import (
+    EnginePackagePreview,
+    EngineUpdateResult,
+    EngineUpdateService,
+)
 from douk_manager.core.json_store import read_json
 from douk_manager.core.locks import critical_section
 from douk_manager.core.settings_tasks import EarliestRule, GeneratedTask, SettingsTaskService
@@ -40,6 +45,7 @@ class ManagerController:
         self.backup = BackupService(self.paths)
         self.tasks = SettingsTaskService(self.paths, self.backup)
         self.engine = EngineService(self.paths, self.config, self.backup)
+        self.engine_updates = EngineUpdateService(self.paths, self.backup)
         self.collector = CollectorService(self.config, self.paths)
         self.screenshots = ScreenshotService()
         self.indexer = IndexService()
@@ -219,6 +225,22 @@ class ManagerController:
         with critical_section(self.paths.lock_file):
             result = self.backup.create_snapshot(category, {"operation": "manual"})
         self.logger.info("手动永久备份完成：%s", result)
+        return result
+
+    def preview_engine_update(self, archive: Path) -> EnginePackagePreview:
+        return self.engine_updates.preview(archive)
+
+    def apply_engine_update(self, archive: Path) -> EngineUpdateResult:
+        self.require_safe_write()
+        if self.engine.external_running():
+            raise ControllerError("下载引擎正在运行，禁止更新。")
+        result = self.engine_updates.apply(archive)
+        self.logger.info(
+            "下载引擎安全更新完成：ZIP=%s；备份=%s；旧引擎=%s",
+            result.archive,
+            result.backup_path,
+            result.rollback_path,
+        )
         return result
 
     def start_collector(self) -> bool:
