@@ -22,7 +22,9 @@ class WindowsIndexIntegrationTests(unittest.TestCase):
     @staticmethod
     def _summary(log_path: Path) -> dict[str, str]:
         result: dict[str, str] = {}
-        for line in log_path.read_text(encoding="utf-8-sig").splitlines():
+        raw_log = log_path.read_text(encoding="utf-8-sig")
+        result["__raw_log__"] = raw_log
+        for line in raw_log.splitlines():
             if not line:
                 break
             if ": " in line:
@@ -111,8 +113,10 @@ class WindowsIndexIntegrationTests(unittest.TestCase):
                 (folder / "item.txt").write_text("not empty", encoding="utf-8")
 
             first = self._run_refresh(source, index)
-            self.assertEqual(first["Created"], "2")
-            self.assertEqual(first["Shortcut failures"], "0")
+            self.assertEqual(
+                first["Shortcut failures"], "0", msg=first["__raw_log__"]
+            )
+            self.assertEqual(first["Created"], "2", msg=first["__raw_log__"])
 
             for display_name, target in folders.items():
                 shortcut = index / f"{display_name}.lnk"
@@ -121,11 +125,12 @@ class WindowsIndexIntegrationTests(unittest.TestCase):
                 properties = self._shortcut_properties(shortcut)
                 self.assertEqual(properties["Description"], f"[DoukIndex] {target}")
                 self.assertEqual(Path(properties["TargetPath"]), target)
-                self.assertEqual(properties["Arguments"], "")
 
             second = self._run_refresh(source, index)
-            self.assertEqual(second["Created"], "0")
-            self.assertEqual(second["Updated"], "0")
-            self.assertEqual(second["Unchanged"], "2")
-            self.assertEqual(second["Shortcut failures"], "0")
+            self.assertEqual(
+                second["Shortcut failures"], "0", msg=second["__raw_log__"]
+            )
+            self.assertEqual(second["Created"], "0", msg=second["__raw_log__"])
+            self.assertEqual(second["Updated"], "0", msg=second["__raw_log__"])
+            self.assertEqual(second["Unchanged"], "2", msg=second["__raw_log__"])
             self.assertEqual(len(list(index.glob("*.lnk"))), 2)

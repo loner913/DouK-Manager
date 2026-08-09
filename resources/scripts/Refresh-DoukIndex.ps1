@@ -233,11 +233,8 @@ function Save-ManagedShortcut {
     )
 
     $shortcut = $script:shell.CreateShortcut($ShortcutPath)
-    # Use the same simple and reliable form as the original tool: the .lnk
-    # points directly to the account folder.  No explorer wrapper, encoded
-    # launcher, fallback name or command-line arguments are involved.
+    # Keep these assignments identical to the proven original index script.
     $shortcut.TargetPath = $TargetPath
-    $shortcut.Arguments = ''
     $shortcut.WorkingDirectory = $TargetPath
     $shortcut.Description = "$ManagedTag $TargetPath"
     $shortcut.Save()
