@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from douk_manager.controller import ManagerController
+from douk_manager.core.engine import assess_process_exit
 from douk_manager.core.settings_tasks import EarliestRule
 
 
@@ -211,7 +212,9 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         label = QLabel(
-            "选择一个或多个任务顺序运行。任何时候只启动一个 main.exe，共用唯一 DouK-Downloader.db。"
+            "选择一个或多个任务顺序运行。任何时候只启动一个 main.exe，共用唯一 "
+            "DouK-Downloader.db。自动模式使用 run_command = 5 1 1 Q，下载器会直接进入"
+            "抖音批量账号下载，不显示蓝色菜单，这是原程序的正常自动执行方式。"
         )
         label.setWordWrap(True)
         layout.addWidget(label)
@@ -582,7 +585,10 @@ class MainWindow(QMainWindow):
             )
             if messages:
                 self.queue_output.append("；".join(messages))
-            self.queue_output.append("队列全部完成。")
+            self.queue_output.append(
+                "队列执行结束（仅表示所选下载器进程均已正常退出，"
+                "不代表每个账号均下载成功）。"
+            )
             self.queue_active = False
             self.queue_current = None
             return
@@ -603,19 +609,24 @@ class MainWindow(QMainWindow):
         if self.queue_current.running:
             return
         code = self.queue_current.process.returncode
-        self.queue_output.append(f"下载进程已退出，退出码={code}")
+        assessment = assess_process_exit(code)
+        self.queue_output.append(assessment.headline)
+        self.queue_output.append(assessment.detail)
         self.controller.logger.info(
-            "下载进程已退出：PID=%s；退出码=%s",
+            "下载进程已退出：PID=%s；退出码=%s；状态=%s",
             self.queue_current.process.pid,
             code,
+            assessment.log_status,
         )
         try:
             with self.queue_current.task_log.open("a", encoding="utf-8") as handle:
                 handle.write(f"Exited: code={code}\n")
+                handle.write(f"Process status: {assessment.log_status}\n")
+                if assessment.normal_exit:
+                    handle.write("Download result: unverified\n")
         except OSError:
             self.controller.logger.exception("写入下载任务退出日志失败")
-        if code != 0:
-            self.queue_output.append("退出码异常，队列已停止；剩余任务没有启动。")
+        if not assessment.normal_exit:
             self.queue_pending.clear()
             self.queue_active = False
             self.queue_current = None

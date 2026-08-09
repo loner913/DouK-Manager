@@ -27,6 +27,45 @@ class EngineRun:
         return self.process.poll() is None
 
 
+@dataclass(frozen=True)
+class EngineExitAssessment:
+    """Describe process completion without claiming that downloads succeeded."""
+
+    exit_code: int | None
+    normal_exit: bool
+    headline: str
+    detail: str
+    log_status: str
+
+
+def assess_process_exit(exit_code: int | None) -> EngineExitAssessment:
+    """Translate an engine exit code into an honest, user-facing result.
+
+    DouK-Downloader can finish with exit code 0 even when an individual
+    account request fails (for example, an HTTP 403 handled by the engine).
+    Exit code 0 therefore confirms only that the process ended normally.
+    """
+
+    if exit_code == 0:
+        return EngineExitAssessment(
+            exit_code=exit_code,
+            normal_exit=True,
+            headline="下载进程已正常结束，退出码=0。",
+            detail=(
+                "这只表示下载器进程正常退出；不代表所有账号均获取或下载成功，"
+                "请结合下载器窗口及原生日志确认结果。"
+            ),
+            log_status="normal_exit_download_result_unverified",
+        )
+    return EngineExitAssessment(
+        exit_code=exit_code,
+        normal_exit=False,
+        headline=f"下载进程异常结束，退出码={exit_code}。",
+        detail="队列已停止；剩余任务不会启动，请先检查下载器窗口和日志。",
+        log_status="abnormal_exit",
+    )
+
+
 class EngineService:
     def __init__(
         self, paths: ManagedPaths, config: AppConfig, backup: BackupService
