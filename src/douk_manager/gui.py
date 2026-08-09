@@ -150,11 +150,16 @@ class MainWindow(QMainWindow):
         self.task_persist_master = QCheckBox(
             "将所选账号 earliest 同步写回 settings_master.json（主档 enable 永远不改）"
         )
+        self.task_pause_console = QCheckBox(
+            "下载结束后保留黑框，查看统计后按任意键关闭"
+        )
+        self.task_pause_console.setChecked(True)
         form.addRow("账号表达式", self.task_expression)
         form.addRow("任务名称", self.task_name)
         form.addRow("earliest 处理", self.task_earliest_mode)
         form.addRow("earliest 值", self.task_earliest_value)
         form.addRow("主档持久化", self.task_persist_master)
+        form.addRow("结果查看", self.task_pause_console)
         layout.addWidget(form_box)
         buttons = QHBoxLayout()
         for text, callback in (
@@ -212,9 +217,10 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         label = QLabel(
-            "选择一个或多个任务顺序运行。任何时候只启动一个 main.exe，共用唯一 "
-            "DouK-Downloader.db。自动模式使用 run_command = 5 1 1 Q，下载器会直接进入"
-            "抖音批量账号下载，不显示蓝色菜单，这是原程序的正常自动执行方式。"
+            "这里列出的是可反复使用的任务模板，不是历史记录。请勾选模板；激活或运行时，"
+            "管理器会先备份，再将它复制为下载器唯一读取的正式 settings.json。任何时候只"
+            "启动一个 main.exe，共用唯一 DouK-Downloader.db。自动模式使用 "
+            "run_command = 5 1 1 Q，会直接进入抖音批量账号下载。"
         )
         label.setWordWrap(True)
         layout.addWidget(label)
@@ -227,20 +233,29 @@ class MainWindow(QMainWindow):
         self.queue_index_mode = self._post_combo(self.controller.config.index_post_mode)
         self.queue_cleanup = QCheckBox("索引刷新后清理失效快捷方式")
         self.queue_cleanup.setChecked(self.controller.config.cleanup_after_index)
+        self.queue_pause_console = QCheckBox(
+            "下载结束后保留黑框，查看统计后按任意键关闭（手动检查推荐）"
+        )
+        self.queue_pause_console.setChecked(True)
         form.addRow("截图归档", self.queue_screenshot_mode)
         form.addRow("索引刷新", self.queue_index_mode)
         form.addRow("索引清理", self.queue_cleanup)
+        form.addRow("结果查看", self.queue_pause_console)
         layout.addWidget(options)
         buttons = QHBoxLayout()
         refresh = QPushButton("刷新任务列表")
         refresh.clicked.connect(self.refresh_tasks)
-        activate = QPushButton("仅激活所选任务")
+        activate = QPushButton("将勾选任务设为正式 settings.json")
         activate.clicked.connect(self._activate_selected_task)
-        run_current = QPushButton("启动当前正式 settings.json")
+        run_current = QPushButton("运行当前正式 settings.json")
         run_current.clicked.connect(self._start_current)
-        run_queue = QPushButton("按顺序运行所选任务")
+        run_queue = QPushButton("按顺序运行勾选任务")
         run_queue.clicked.connect(self._start_queue)
-        for button in (refresh, activate, run_current, run_queue):
+        native_logs = QPushButton("打开下载器原生日志")
+        native_logs.clicked.connect(
+            lambda: self._open_path(self.controller.paths.volume / "log")
+        )
+        for button in (refresh, activate, run_current, run_queue, native_logs):
             buttons.addWidget(button)
         buttons.addStretch()
         layout.addLayout(buttons)
@@ -464,14 +479,23 @@ class MainWindow(QMainWindow):
         self.refresh_tasks()
 
     def refresh_tasks(self) -> None:
-        selected_names = {item.text() for item in self.task_list.selectedItems()}
+        checked_paths = {
+            item.data(Qt.UserRole)
+            for index in range(self.task_list.count())
+            if (item := self.task_list.item(index)).checkState() == Qt.Checked
+        }
         self.task_list.clear()
         for path in self.controller.list_tasks():
             item = QListWidgetItem(path.name)
             item.setData(Qt.UserRole, str(path))
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.Checked if str(path) in checked_paths else Qt.Unchecked
+            )
+            item.setToolTip(
+                "勾选后可复制为正式 settings.json，或加入顺序下载队列。"
+            )
             self.task_list.addItem(item)
-            if path.name in selected_names:
-                item.setSelected(True)
 
     def _preview_task(self) -> None:
         preview = self._run(
@@ -514,8 +538,16 @@ class MainWindow(QMainWindow):
             if activate:
                 self.task_output.append(f"已激活：{self.controller.paths.active_settings}")
             if start:
-                run = self._run(self.controller.start_current_download, self.task_output)
+                run = self._run(
+                    lambda: self.controller.start_current_download(
+                        self.task_pause_console.isChecked()
+                    ),
+                    self.task_output,
+                )
                 if run:
+                    self.queue_active = True
+                    self.queue_current = run
+                    self.queue_pending = []
                     self.task_output.append(f"下载引擎已启动，PID={run.process.pid}")
 
     def _create_task_template(self) -> None:
@@ -545,16 +577,25 @@ class MainWindow(QMainWindow):
             self.refresh_tasks()
 
     def _selected_task_paths(self) -> list[Path]:
-        return [Path(item.data(Qt.UserRole)) for item in self.task_list.selectedItems()]
+        return [
+            Path(item.data(Qt.UserRole))
+            for index in range(self.task_list.count())
+            if (item := self.task_list.item(index)).checkState() == Qt.Checked
+        ]
 
     def _activate_selected_task(self) -> None:
         paths = self._selected_task_paths()
         if len(paths) != 1:
-            QMessageBox.information(self, "请选择一个任务", "仅激活时必须且只能选择一个任务。")
+            QMessageBox.information(
+                self, "请勾选一个任务", "设为正式 settings.json 时必须且只能勾选一个任务。"
+            )
             return
         result = self._run(lambda: self.controller.activate_task(paths[0]), self.queue_output)
         if result:
-            self.queue_output.append(f"已激活：{paths[0].name}")
+            self.queue_output.append(
+                f"已将模板 {paths[0].name} 复制为正式 settings.json。"
+            )
+            self.queue_output.append("任务模板仍永久保留，以后可以再次勾选复用。")
 
     def _apply_queue_options(self) -> bool:
         values = {
@@ -573,7 +614,12 @@ class MainWindow(QMainWindow):
             return
         if not self._apply_queue_options():
             return
-        run = self._run(self.controller.start_current_download, self.queue_output)
+        run = self._run(
+            lambda: self.controller.start_current_download(
+                self.queue_pause_console.isChecked()
+            ),
+            self.queue_output,
+        )
         if run:
             self.queue_active = True
             self.queue_current = run
@@ -586,7 +632,9 @@ class MainWindow(QMainWindow):
             return
         paths = self._selected_task_paths()
         if not paths:
-            QMessageBox.information(self, "未选择任务", "请在任务列表中选择一个或多个任务。")
+            QMessageBox.information(
+                self, "未勾选任务", "请在任务列表中勾选一个或多个任务。"
+            )
             return
         if not self._apply_queue_options():
             return
@@ -610,7 +658,12 @@ class MainWindow(QMainWindow):
             self.queue_current = None
             return
         path = self.queue_pending.pop(0)
-        run = self._run(lambda: self.controller.activate_and_start(path), self.queue_output)
+        run = self._run(
+            lambda: self.controller.activate_and_start(
+                path, self.queue_pause_console.isChecked()
+            ),
+            self.queue_output,
+        )
         if run is None:
             self.queue_active = False
             self.queue_pending.clear()

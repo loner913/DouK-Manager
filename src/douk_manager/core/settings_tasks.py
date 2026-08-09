@@ -221,8 +221,26 @@ class SettingsTaskService:
 
 
 def _safe_task_name(name: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._")
-    return cleaned[:120] or "DouK_Task"
+    """Return a Windows-safe filename while preserving readable Unicode names."""
+
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", str(name))
+    cleaned = re.sub(r"\s+", "_", cleaned).strip(" ._")
+    cleaned = cleaned.rstrip(" .")[:120].rstrip(" .")
+    if not cleaned:
+        return "DouK_Task"
+
+    # Windows reserves these names even when they have a file extension.
+    reserved = {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{number}" for number in range(1, 10)),
+        *(f"LPT{number}" for number in range(1, 10)),
+    }
+    if cleaned.split(".", 1)[0].upper() in reserved:
+        cleaned = f"Task_{cleaned}"
+    return cleaned
 
 
 def _unique_task_path(directory: Path, stem: str) -> Path:

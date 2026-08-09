@@ -209,16 +209,22 @@ class ManagerController:
         self.logger.info("任务已激活：%s", path)
         return result
 
-    def start_current_download(self) -> EngineRun:
+    def start_current_download(self, pause_after_exit: bool = False) -> EngineRun:
         self.require_safe_write()
-        result = self.engine.start()
+        result = self.engine.start(pause_after_exit=pause_after_exit)
         self._last_engine_running = True
-        self.logger.info("下载引擎已启动：PID=%s", result.process.pid)
+        self.logger.info(
+            "下载引擎已启动：PID=%s；结束后保留窗口=%s",
+            result.process.pid,
+            pause_after_exit,
+        )
         return result
 
-    def activate_and_start(self, task_path: Path) -> EngineRun:
+    def activate_and_start(
+        self, task_path: Path, pause_after_exit: bool = False
+    ) -> EngineRun:
         self.activate_task(task_path)
-        return self.start_current_download()
+        return self.start_current_download(pause_after_exit)
 
     def backup_now(self, category: str = "Manual") -> Path:
         self.require_safe_write()

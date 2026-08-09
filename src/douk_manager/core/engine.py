@@ -21,6 +21,7 @@ class EngineRun:
     process: subprocess.Popen
     started_at: datetime
     task_log: Path
+    pause_after_exit: bool = False
 
     @property
     def running(self) -> bool:
@@ -121,7 +122,7 @@ class EngineService:
         ):
             raise EngineError("正式 settings.json 没有启用且 URL 有效的账号。")
 
-    def start(self) -> EngineRun:
+    def start(self, *, pause_after_exit: bool = False) -> EngineRun:
         if self.external_running():
             raise EngineError("下载引擎已经在运行。")
         with critical_section(self.paths.lock_file):
@@ -132,6 +133,7 @@ class EngineService:
                     "batch_accounts": self.config.batch_accounts,
                     "rest_seconds": self.config.rest_seconds,
                     "run_command": "5 1 1 Q",
+                    "pause_after_exit": pause_after_exit,
                 },
             )
         env = os.environ.copy()
@@ -139,11 +141,19 @@ class EngineService:
         env["DOUK_ACCOUNT_REST_SECONDS"] = str(self.config.rest_seconds)
         env["DOUK_MANAGER_BACKUP"] = str(snapshot)
         creationflags = 0
+        command = [str(self.paths.engine_exe)]
         if os.name == "nt":
             creationflags = subprocess.CREATE_NEW_CONSOLE
+            if pause_after_exit:
+                command = [
+                    "cmd.exe",
+                    "/d",
+                    "/c",
+                    str(self._write_pause_wrapper()),
+                ]
         try:
             process = subprocess.Popen(
-                [str(self.paths.engine_exe)],
+                command,
                 cwd=str(self.paths.engine_root),
                 env=env,
                 creationflags=creationflags,
@@ -159,11 +169,39 @@ class EngineService:
                     "run_command: 5 1 1 Q",
                     f"Batch accounts: {self.config.batch_accounts}",
                     f"Rest seconds: {self.config.rest_seconds}",
+                    f"Pause after exit: {pause_after_exit}",
                     f"Backup: {snapshot}",
                     "",
                 )
             ),
             encoding="utf-8",
         )
-        self.current = EngineRun(process, datetime.now(), task_log)
+        self.current = EngineRun(process, datetime.now(), task_log, pause_after_exit)
         return self.current
+
+    def _write_pause_wrapper(self) -> Path:
+        """Create a small ASCII-only launcher that keeps the native console open."""
+
+        wrapper_dir = self.paths.data / "RunWrappers"
+        wrapper_dir.mkdir(parents=True, exist_ok=True)
+        wrapper_path = wrapper_dir / "run_downloader_and_pause.cmd"
+        engine_path = str(self.paths.engine_exe).replace("%", "%%")
+        content = "\r\n".join(
+            (
+                "@echo off",
+                f'call "{engine_path}"',
+                'set "DOUK_ENGINE_EXIT=%ERRORLEVEL%"',
+                "echo.",
+                "echo ============================================================",
+                "echo DouK-Downloader finished. Exit code: %DOUK_ENGINE_EXIT%",
+                "echo Review the download, skip and failure statistics above.",
+                "echo Press any key to close this window...",
+                "pause >nul",
+                "exit /b %DOUK_ENGINE_EXIT%",
+                "",
+            )
+        )
+        temporary = wrapper_path.with_suffix(".tmp")
+        temporary.write_text(content, encoding="ascii", newline="")
+        os.replace(temporary, wrapper_path)
+        return wrapper_path

@@ -63,6 +63,17 @@ class SettingsTaskTests(unittest.TestCase):
             self.assertTrue(read_json(first.task_path)["accounts_urls"][0]["enable"])
             self.assertFalse(read_json(first.task_path)["accounts_urls"][1]["enable"])
 
+    def test_chinese_task_name_is_preserved_and_windows_characters_are_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_test_paths(Path(directory), 8)
+            service = SettingsTaskService(paths, BackupService(paths))
+            readable = service.create_task("A1", task_name="A1331_全流程测试")
+            invalid = service.create_task("A2", task_name='测试<>:"/\\|?*名称')
+            reserved = service.create_task("A3", task_name="CON")
+            self.assertEqual(readable.task_path.name, "A1331_全流程测试.json")
+            self.assertEqual(invalid.task_path.name, "测试_名称.json")
+            self.assertEqual(reserved.task_path.name, "Task_CON.json")
+
 
 if __name__ == "__main__":
     unittest.main()
