@@ -226,6 +226,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(label)
         self.task_list = QListWidget()
         self.task_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.task_list.itemChanged.connect(self._task_check_changed)
         layout.addWidget(self.task_list, 1)
         options = QGroupBox("本次队列后续动作")
         form = QFormLayout(options)
@@ -484,18 +485,36 @@ class MainWindow(QMainWindow):
             for index in range(self.task_list.count())
             if (item := self.task_list.item(index)).checkState() == Qt.Checked
         }
-        self.task_list.clear()
-        for path in self.controller.list_tasks():
-            item = QListWidgetItem(path.name)
-            item.setData(Qt.UserRole, str(path))
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(
-                Qt.Checked if str(path) in checked_paths else Qt.Unchecked
-            )
-            item.setToolTip(
-                "勾选后可复制为正式 settings.json，或加入顺序下载队列。"
-            )
-            self.task_list.addItem(item)
+        signals_were_blocked = self.task_list.blockSignals(True)
+        try:
+            self.task_list.clear()
+            for path in self.controller.list_tasks():
+                checked = str(path) in checked_paths
+                state_text = "【已勾选】" if checked else "【未勾选】"
+                item = QListWidgetItem(f"{state_text} {path.name}")
+                item.setData(Qt.UserRole, str(path))
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+                item.setToolTip(
+                    "勾选后可复制为正式 settings.json，或加入顺序下载队列。"
+                )
+                self.task_list.addItem(item)
+        finally:
+            self.task_list.blockSignals(signals_were_blocked)
+
+    def _task_check_changed(self, item: QListWidgetItem) -> None:
+        path_text = item.data(Qt.UserRole)
+        if not path_text:
+            return
+        state_text = "【已勾选】" if item.checkState() == Qt.Checked else "【未勾选】"
+        desired = f"{state_text} {Path(path_text).name}"
+        if item.text() == desired:
+            return
+        signals_were_blocked = self.task_list.blockSignals(True)
+        try:
+            item.setText(desired)
+        finally:
+            self.task_list.blockSignals(signals_were_blocked)
 
     def _preview_task(self) -> None:
         preview = self._run(
@@ -914,6 +933,9 @@ class MainWindow(QMainWindow):
             QLineEdit, QSpinBox, QComboBox, QListWidget, QTextEdit {
                 background: white; border: 1px solid #cbd5e1; border-radius: 5px; padding: 5px;
             }
+            QListWidget::indicator { width: 17px; height: 17px; border: 1px solid #64748b;
+                                     border-radius: 3px; background: white; }
+            QListWidget::indicator:checked { background: #2563eb; border-color: #1d4ed8; }
             QTabWidget::pane { border: 1px solid #cbd5e1; background: #f8fafc; }
             QTabBar::tab { padding: 9px 15px; background: #e2e8f0; }
             QTabBar::tab:selected { background: white; color: #1d4ed8; font-weight: 600; }
