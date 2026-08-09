@@ -346,6 +346,12 @@ class MainWindow(QMainWindow):
         self.cleanup_index_button = QPushButton("立即清理失效快捷方式")
         self.cleanup_index_button.clicked.connect(self._cleanup_index)
         buttons.addWidget(self.cleanup_index_button)
+        self.cleanup_test_button = QPushButton("安全自检清理功能")
+        self.cleanup_test_button.setToolTip(
+            "仅在 Windows 临时目录测试清理规则，不读取或修改正式视频目录和索引目录。"
+        )
+        self.cleanup_test_button.clicked.connect(self._cleanup_index_self_test)
+        buttons.addWidget(self.cleanup_test_button)
         buttons.addStretch()
         layout.addLayout(buttons)
         self.post_output = QTextEdit()
@@ -492,6 +498,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(started_message)
         self.refresh_index_button.setEnabled(False)
         self.cleanup_index_button.setEnabled(False)
+        self.cleanup_test_button.setEnabled(False)
 
         thread = QThread(self)
         worker = ActionWorker(action)
@@ -529,6 +536,7 @@ class MainWindow(QMainWindow):
         finally:
             self.refresh_index_button.setEnabled(True)
             self.cleanup_index_button.setEnabled(True)
+            self.cleanup_test_button.setEnabled(True)
             self.background_thread = None
             self.background_worker = None
             self.background_output = None
@@ -911,6 +919,22 @@ class MainWindow(QMainWindow):
         self._run_index_background(
             self.controller.cleanup_index,
             started_message="正在后台清理失效快捷方式，界面可以继续使用……",
+            success=show_result,
+        )
+
+    def _cleanup_index_self_test(self) -> None:
+        def show_result(result: object) -> None:
+            if result is not None:
+                self.post_output.setPlainText(
+                    "清理功能隔离自检通过。正式视频目录和索引目录均未参与测试。\n"
+                    + result.output
+                )
+
+        self._run_index_background(
+            self.controller.cleanup_index_self_test,
+            started_message=(
+                "正在 Windows 临时目录测试清理功能；不会读取或修改正式目录……"
+            ),
             success=show_result,
         )
 

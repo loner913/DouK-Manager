@@ -103,3 +103,39 @@ class IndexService:
             "Cleanup-BrokenDoukIndex.ps1", source, index, open_folder
         )
 
+    def cleanup_self_test(self) -> IndexResult:
+        """Exercise the production cleanup script in an isolated temp folder."""
+
+        if os.name != "nt":
+            raise IndexError("失效快捷方式清理自检仅支持 Windows。")
+        script = resource_path(
+            "resources/scripts/Test-CleanupBrokenDoukIndex.ps1"
+        )
+        if not script.is_file():
+            raise IndexError(f"清理自检脚本缺失：{script}")
+        completed = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(script),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            timeout=120,
+        )
+        output = "\n".join(
+            part for part in (completed.stdout, completed.stderr) if part
+        )
+        if completed.returncode != 0:
+            raise IndexError(
+                f"失效快捷方式清理自检失败（{completed.returncode}）：\n{output}"
+            )
+        return IndexResult(completed.returncode, output)

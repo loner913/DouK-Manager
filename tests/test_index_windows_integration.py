@@ -30,12 +30,8 @@ def _desktop_shell_test_enabled() -> bool:
 )
 class WindowsIndexIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.script = (
-            Path(__file__).parents[1]
-            / "resources"
-            / "scripts"
-            / "Refresh-DoukIndex.ps1"
-        )
+        self.scripts = Path(__file__).parents[1] / "resources" / "scripts"
+        self.script = self.scripts / "Refresh-DoukIndex.ps1"
 
     @staticmethod
     def _summary(log_path: Path) -> dict[str, str]:
@@ -152,3 +148,29 @@ class WindowsIndexIntegrationTests(unittest.TestCase):
             self.assertEqual(second["Updated"], "0", msg=second["__raw_log__"])
             self.assertEqual(second["Unchanged"], "2", msg=second["__raw_log__"])
             self.assertEqual(len(list(index.glob("*.lnk"))), 2)
+
+    def test_cleanup_self_test_deletes_only_broken_managed_shortcut(self) -> None:
+        completed = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(self.scripts / "Test-CleanupBrokenDoukIndex.ps1"),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+        )
+        self.assertIn("DouK cleanup self-test PASSED.", completed.stdout)

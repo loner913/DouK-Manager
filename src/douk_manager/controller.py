@@ -297,6 +297,11 @@ class ManagerController:
         self.logger.info("失效快捷方式清理完成")
         return result
 
+    def cleanup_index_self_test(self) -> IndexResult:
+        result = self.indexer.cleanup_self_test()
+        self.logger.info("失效快捷方式清理隔离自检通过")
+        return result
+
     def run_post_actions(self, timing: str) -> list[str]:
         messages: list[str] = []
         if self.config.screenshot_post_mode == timing:
