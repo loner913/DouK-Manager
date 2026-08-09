@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory = $true)][string]$SourceRoot,
     [Parameter(Mandatory = $true)][string]$IndexRoot,
     [switch]$OpenIndexFolderAfterRun,
@@ -189,18 +189,20 @@ function Remove-ManagedIndexShortcutSafely {
 
 $managedShortcutMap = Get-ManagedShortcutMap -FolderPath $idxFull
 
-# 只索引下载器生成的规范账号目录，例如：
-# UID7636384641621132337_A1331iis40768958144_发布作品
-# Data、Download 等业务目录即使非空也必须永久跳过。
-# 直接在管道中匹配，兼容 Windows PowerShell 5.1。
-$sourceFolderCandidates = @(
-    Get-ChildItem -LiteralPath $srcFull -Directory -ErrorAction SilentlyContinue
-)
-$sourceFolders = @(
-    $sourceFolderCandidates |
-        Where-Object { ([string]$_.Name) -match '^UID[0-9]+_A[1-9][0-9]*([^0-9]|$)' } |
-        Sort-Object Name
-)
+# Index only canonical downloader account folders.
+# Keep the implementation deliberately simple for Windows PowerShell 5.1.
+$sourceFolderCandidates = @(Get-ChildItem -LiteralPath $srcFull -Directory -ErrorAction SilentlyContinue)
+$sourceFolders = @()
+
+foreach ($sourceFolderCandidate in $sourceFolderCandidates) {
+    $candidateName = [string]$sourceFolderCandidate.Name
+
+    if ($candidateName -match '^UID[0-9]+_A[1-9][0-9]*([^0-9]|$)') {
+        $sourceFolders += $sourceFolderCandidate
+    }
+}
+
+$sourceFolders = @($sourceFolders | Sort-Object -Property Name)
 $ignoredSourceFolderCount = $sourceFolderCandidates.Count - $sourceFolders.Count
 
 $created = 0
