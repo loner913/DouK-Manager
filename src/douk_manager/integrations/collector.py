@@ -86,6 +86,8 @@ class CollectorService:
                 "DOUK_COLLECTOR_TOKEN": self.config.collector_token,
                 "DOUK_GLOBAL_LOCK_PATH": str(self.paths.lock_file),
                 "PYTHONUNBUFFERED": "1",
+                "PYTHONIOENCODING": "utf-8",
+                "PYTHONUTF8": "1",
             }
         )
         if getattr(sys, "frozen", False):

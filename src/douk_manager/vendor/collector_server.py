@@ -2452,10 +2452,28 @@ def validate_files_only() -> StrictState:
         workbook.close()
 
 
+def safe_console_print(message: str) -> None:
+    """Diagnostic output must never abort an HTTP response on Windows consoles."""
+    try:
+        print(message)
+    except UnicodeEncodeError:
+        # A frozen/windowless child may inherit the Windows GBK console encoding.
+        # Preserve the diagnostic in escaped form instead of crashing the request
+        # thread before its JSON response reaches the userscript.
+        escaped = message.encode("ascii", errors="backslashreplace").decode("ascii")
+        try:
+            print(escaped)
+        except Exception:
+            pass
+    except Exception:
+        # Logging is secondary; the API response and data-safety path are primary.
+        pass
+
+
 def format_error_for_console(error: CollectorError) -> None:
-    print(f"[BLOCKED] {error.code}: {error.message}")
+    safe_console_print(f"[BLOCKED] {error.code}: {error.message}")
     if error.details:
-        print(json.dumps(error.details, ensure_ascii=False, indent=2))
+        safe_console_print(json.dumps(error.details, ensure_ascii=False, indent=2))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -2466,7 +2484,9 @@ class Handler(BaseHTTPRequestHandler):
         # Douyin tabs cannot flood the BAT window.
         if getattr(self, "_suppress_log", False):
             return
-        print(f"[{self.log_date_time_string()}] {self.client_address[0]} {fmt % args}")
+        safe_console_print(
+            f"[{self.log_date_time_string()}] {self.client_address[0]} {fmt % args}"
+        )
 
     def _cors_headers(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "https://www.douyin.com")

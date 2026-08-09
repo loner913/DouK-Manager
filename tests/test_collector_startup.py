@@ -52,10 +52,13 @@ class CollectorStartupTests(unittest.TestCase):
             with patch(
                 "douk_manager.integrations.collector.subprocess.Popen",
                 return_value=process,
-            ), patch("douk_manager.integrations.collector.time.sleep"):
+            ) as popen, patch("douk_manager.integrations.collector.time.sleep"):
                 service.start()
             self.assertTrue(service.running)
             self.assertIsNotNone(service.last_log_path)
+            child_env = popen.call_args.kwargs["env"]
+            self.assertEqual(child_env["PYTHONIOENCODING"], "utf-8")
+            self.assertEqual(child_env["PYTHONUTF8"], "1")
             service.stop()
 
     def test_early_process_exit_includes_log_and_exit_code(self) -> None:
