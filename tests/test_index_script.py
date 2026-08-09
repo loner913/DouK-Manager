@@ -32,3 +32,16 @@ class IndexScriptTests(unittest.TestCase):
         self.assertNotIn("DouKLaunchers", self.script)
         self.assertNotIn("Get-FallbackShortcutBaseName", self.script)
         self.assertNotIn("_Account", self.script)
+
+    def test_shortcut_creation_keeps_proven_original_direct_folder_form(self) -> None:
+        expected_lines = (
+            "$shortcut = $script:shell.CreateShortcut($ShortcutPath)",
+            "$shortcut.TargetPath = $TargetPath",
+            "$shortcut.WorkingDirectory = $TargetPath",
+            '$shortcut.Description = "$ManagedTag $TargetPath"',
+            "$shortcut.Save()",
+        )
+        positions = [self.script.index(line) for line in expected_lines]
+        self.assertEqual(positions, sorted(positions))
+        self.assertNotIn("explorer.exe", self.script)
+        self.assertNotIn(".Arguments =", self.script)
