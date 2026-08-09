@@ -84,15 +84,6 @@ function Get-ShortcutDisplayName {
     return $FolderName
 }
 
-function Test-CanonicalAccountFolderName {
-    param([string]$FolderName)
-
-    # 只索引下载器生成的规范账号目录，例如：
-    # UID7636384641621132337_A1331iis40768958144_发布作品
-    # Data、Download 等业务目录即使非空也必须永久跳过。
-    return ($FolderName -match '^UID\d+_A[1-9]\d*(?=[^0-9]|$)')
-}
-
 function Test-SourceFolderShouldBeIndexed {
     param([string]$FolderPath)
 
@@ -197,9 +188,20 @@ function Remove-ManagedIndexShortcutSafely {
 }
 
 $managedShortcutMap = Get-ManagedShortcutMap -FolderPath $idxFull
-$sourceFolders = Get-ChildItem -LiteralPath $srcFull -Directory -ErrorAction SilentlyContinue |
-    Where-Object { Test-CanonicalAccountFolderName -FolderName $_.Name } |
-    Sort-Object Name
+
+# 只索引下载器生成的规范账号目录，例如：
+# UID7636384641621132337_A1331iis40768958144_发布作品
+# Data、Download 等业务目录即使非空也必须永久跳过。
+# 直接在管道中匹配，兼容 Windows PowerShell 5.1。
+$sourceFolderCandidates = @(
+    Get-ChildItem -LiteralPath $srcFull -Directory -ErrorAction SilentlyContinue
+)
+$sourceFolders = @(
+    $sourceFolderCandidates |
+        Where-Object { ([string]$_.Name) -match '^UID[0-9]+_A[1-9][0-9]*([^0-9]|$)' } |
+        Sort-Object Name
+)
+$ignoredSourceFolderCount = $sourceFolderCandidates.Count - $sourceFolders.Count
 
 $created = 0
 $updated = 0
@@ -359,6 +361,9 @@ $runLogLines = @(
     "Source: $srcFull"
     "Index: $idxFull"
     "Log folder: $logRoot"
+    "Scanned source folders: $($sourceFolderCandidates.Count)"
+    "Matched account folders: $($sourceFolders.Count)"
+    "Ignored non-account folders: $ignoredSourceFolderCount"
     "Created: $created"
     "Updated: $updated"
     "Skipped empty folders: $($skippedEmptyFolders.Count)"
@@ -416,6 +421,9 @@ Set-Content -LiteralPath $runLogPath -Value $runLogLines -Encoding UTF8
 
 Write-Host ""
 Write-Host "Done. Created $created, updated $updated shortcuts." -ForegroundColor Green
+Write-Host "Scanned source folders: $($sourceFolderCandidates.Count)"
+Write-Host "Matched account folders: $($sourceFolders.Count)"
+Write-Host "Ignored non-account folders: $ignoredSourceFolderCount"
 Write-Host "Skipped empty folders: $($skippedEmptyFolders.Count)"
 Write-Host "Removed shortcuts for empty folders: $($removedEmptyShortcuts.Count)"
 Write-Host "Detected broken shortcuts: $brokenDetectedCount"
