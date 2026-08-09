@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 from typing import Callable, TypeVar
 
-from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtCore import QObject, QThread, Qt, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -45,6 +45,25 @@ POST_MODES = (
 )
 
 
+class ActionWorker(QObject):
+    done = Signal()
+
+    def __init__(self, action: Callable[[], object]) -> None:
+        super().__init__()
+        self.action = action
+        self.result: object | None = None
+        self.error: Exception | None = None
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.result = self.action()
+        except Exception as exc:  # The main thread presents and logs the error.
+            self.error = exc
+        finally:
+            self.done.emit()
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -52,6 +71,10 @@ class MainWindow(QMainWindow):
         self.queue_pending: list[Path] = []
         self.queue_active = False
         self.queue_current = None
+        self.background_thread: QThread | None = None
+        self.background_worker: ActionWorker | None = None
+        self.background_output: QTextEdit | None = None
+        self.background_success: Callable[[object], None] | None = None
         self.setWindowTitle("DouK全流程一体化管理器")
         self.resize(1260, 820)
         self.setMinimumSize(1080, 700)
@@ -313,12 +336,16 @@ class MainWindow(QMainWindow):
         for text, callback in (
             ("预览截图归档", self._preview_screenshots),
             ("立即安全归档截图", self._organize_screenshots),
-            ("立即刷新索引", self._refresh_index),
-            ("立即清理失效快捷方式", self._cleanup_index),
         ):
             button = QPushButton(text)
             button.clicked.connect(callback)
             buttons.addWidget(button)
+        self.refresh_index_button = QPushButton("立即刷新索引")
+        self.refresh_index_button.clicked.connect(self._refresh_index)
+        buttons.addWidget(self.refresh_index_button)
+        self.cleanup_index_button = QPushButton("立即清理失效快捷方式")
+        self.cleanup_index_button.clicked.connect(self._cleanup_index)
+        buttons.addWidget(self.cleanup_index_button)
         buttons.addStretch()
         layout.addLayout(buttons)
         self.post_output = QTextEdit()
@@ -446,6 +473,64 @@ class MainWindow(QMainWindow):
             return None
         finally:
             QApplication.restoreOverrideCursor()
+            self.refresh_all()
+
+    def _run_index_background(
+        self,
+        action: Callable[[], object],
+        *,
+        started_message: str,
+        success: Callable[[object], None],
+    ) -> None:
+        if self.background_thread is not None and self.background_thread.isRunning():
+            self.post_output.append("已有索引任务正在运行，请等待完成。")
+            return
+
+        self.post_output.setPlainText(started_message)
+        self.statusBar().showMessage(started_message)
+        self.refresh_index_button.setEnabled(False)
+        self.cleanup_index_button.setEnabled(False)
+
+        thread = QThread(self)
+        worker = ActionWorker(action)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.done.connect(thread.quit)
+        thread.finished.connect(self._finish_index_background)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+        self.background_thread = thread
+        self.background_worker = worker
+        self.background_output = self.post_output
+        self.background_success = success
+        thread.start()
+
+    @Slot()
+    def _finish_index_background(self) -> None:
+        worker = self.background_worker
+        try:
+            if worker is None:
+                return
+            if worker.error is not None:
+                message = str(worker.error)
+                self.controller.logger.exception(
+                    "后台索引操作失败：%s", message, exc_info=worker.error
+                )
+                if self.background_output is not None:
+                    self.background_output.append("【失败】" + message)
+                self.statusBar().showMessage("操作失败")
+                QMessageBox.critical(self, "操作失败", message)
+            elif self.background_success is not None:
+                self.background_success(worker.result)
+                self.statusBar().showMessage("操作完成")
+        finally:
+            self.refresh_index_button.setEnabled(True)
+            self.cleanup_index_button.setEnabled(True)
+            self.background_thread = None
+            self.background_worker = None
+            self.background_output = None
+            self.background_success = None
             self.refresh_all()
 
     def _refresh_status(self, _checked: bool = False) -> None:
@@ -795,14 +880,26 @@ class MainWindow(QMainWindow):
             self.post_output.append(f"完成：安全归档 {result.moved} 张。")
 
     def _refresh_index(self) -> None:
-        result = self._run(self.controller.refresh_index, self.post_output)
-        if result:
-            self.post_output.append("索引刷新完成。\n" + result.output)
+        def show_result(result: object) -> None:
+            if result is not None:
+                self.post_output.setPlainText("索引刷新完成。\n" + result.output)
+
+        self._run_index_background(
+            self.controller.refresh_index,
+            started_message="正在后台刷新索引，界面可以继续使用……",
+            success=show_result,
+        )
 
     def _cleanup_index(self) -> None:
-        result = self._run(self.controller.cleanup_index, self.post_output)
-        if result:
-            self.post_output.append("失效快捷方式清理完成。\n" + result.output)
+        def show_result(result: object) -> None:
+            if result is not None:
+                self.post_output.setPlainText("失效快捷方式清理完成。\n" + result.output)
+
+        self._run_index_background(
+            self.controller.cleanup_index,
+            started_message="正在后台清理失效快捷方式，界面可以继续使用……",
+            success=show_result,
+        )
 
     def _save_settings(self) -> None:
         values = {
@@ -913,6 +1010,10 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        if self.background_thread is not None and self.background_thread.isRunning():
+            QMessageBox.information(self, "索引任务运行中", "请等待索引任务完成后再关闭管理器。")
+            event.ignore()
+            return
         try:
             self.controller.stop_collector()
         finally:

@@ -186,6 +186,71 @@ function Get-UniqueShortcutPath {
     return $candidate
 }
 
+function Get-FallbackShortcutBaseName {
+    param([string]$FolderName)
+
+    if ($FolderName -match '^UID[0-9]+_(A[1-9][0-9]*)') {
+        return ($matches[1] + '_Account')
+    }
+
+    return 'DouK_Account'
+}
+
+function Test-ManagedShortcutIsCurrent {
+    param(
+        [Parameter(Mandatory)][string]$ShortcutPath,
+        [Parameter(Mandatory)][string]$ExpectedTargetPath
+    )
+
+    if (-not (Test-Path -LiteralPath $ShortcutPath -PathType Leaf)) {
+        return $false
+    }
+
+    try {
+        $shortcut = $script:shell.CreateShortcut($ShortcutPath)
+        $managedTarget = Get-ManagedTargetPath -Shortcut $shortcut
+
+        if (-not $managedTarget -or
+            -not $managedTarget.Equals($ExpectedTargetPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $false
+        }
+
+        # The original index script used a folder directly as TargetPath. Keep those
+        # already-working legacy shortcuts instead of rewriting them through WScript.
+        if ($shortcut.TargetPath -and
+            $shortcut.TargetPath.Equals($ExpectedTargetPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+
+        $expectedArguments = '"' + $ExpectedTargetPath + '"'
+        return (
+            $shortcut.TargetPath -and
+            $shortcut.TargetPath.Equals($script:explorerPath, [System.StringComparison]::OrdinalIgnoreCase) -and
+            ([string]$shortcut.Arguments).Equals($expectedArguments, [System.StringComparison]::Ordinal)
+        )
+    } catch {
+        return $false
+    }
+}
+
+function Save-ManagedShortcut {
+    param(
+        [Parameter(Mandatory)][string]$ShortcutPath,
+        [Parameter(Mandatory)][string]$TargetPath
+    )
+
+    $shortcut = $script:shell.CreateShortcut($ShortcutPath)
+    $shortcut.TargetPath = $script:explorerPath
+    $shortcut.Arguments = '"' + $TargetPath + '"'
+    $shortcut.WorkingDirectory = $srcFull
+    $shortcut.Description = "$ManagedTag $TargetPath"
+    $shortcut.Save()
+
+    if (-not (Test-Path -LiteralPath $ShortcutPath -PathType Leaf)) {
+        throw "Shortcut file was not created: $ShortcutPath"
+    }
+}
+
 function Remove-ManagedIndexShortcutSafely {
     param(
         [Parameter(Mandatory)][string]$ShortcutPath,
@@ -253,11 +318,13 @@ $ignoredSourceFolderCount = $sourceFolderCandidates.Count - $sourceFolders.Count
 
 $created = 0
 $updated = 0
+$unchanged = 0
 $skippedEmptyFolders = @()
 $skippedTargetSet = @{}
 $removedEmptyShortcuts = @()
 $brokenItems = @()
 $shortcutFailures = @()
+$fallbackShortcutNames = @()
 
 foreach ($folder in $sourceFolders) {
     $targetPath = Get-NormalizedFullPath -Path $folder.FullName
@@ -274,22 +341,18 @@ foreach ($folder in $sourceFolders) {
     $shortcutAlreadyExists = $managedShortcutMap.ContainsKey($targetPath)
     if ($shortcutAlreadyExists) {
         $shortcutPath = $managedShortcutMap[$targetPath]
+
+        if (Test-ManagedShortcutIsCurrent -ShortcutPath $shortcutPath -ExpectedTargetPath $targetPath) {
+            $unchanged++
+            continue
+        }
     } else {
         $displayName = Get-ShortcutDisplayName -FolderName $folder.Name
         $shortcutPath = Get-UniqueShortcutPath -FolderPath $idxFull -BaseName $displayName
     }
 
     try {
-        $shortcut = $script:shell.CreateShortcut($shortcutPath)
-        $shortcut.TargetPath = $script:explorerPath
-        $shortcut.Arguments = '"' + $targetPath + '"'
-        $shortcut.WorkingDirectory = $srcFull
-        $shortcut.Description = "$ManagedTag $targetPath"
-        $shortcut.Save()
-
-        if (-not (Test-Path -LiteralPath $shortcutPath -PathType Leaf)) {
-            throw "Shortcut file was not created: $shortcutPath"
-        }
+        Save-ManagedShortcut -ShortcutPath $shortcutPath -TargetPath $targetPath
 
         $managedShortcutMap[$targetPath] = $shortcutPath
         if ($shortcutAlreadyExists) {
@@ -298,11 +361,29 @@ foreach ($folder in $sourceFolders) {
             $created++
         }
     } catch {
-        $shortcutFailures += [PSCustomObject]@{
-            FolderName   = $folder.Name
-            TargetPath   = $targetPath
-            ShortcutPath = $shortcutPath
-            ErrorMessage = $_.Exception.Message
+        $primaryError = $_.Exception.Message
+        $fallbackBaseName = Get-FallbackShortcutBaseName -FolderName $folder.Name
+        $fallbackShortcutPath = Get-UniqueShortcutPath -FolderPath $idxFull -BaseName $fallbackBaseName
+
+        try {
+            Save-ManagedShortcut -ShortcutPath $fallbackShortcutPath -TargetPath $targetPath
+            $managedShortcutMap[$targetPath] = $fallbackShortcutPath
+            $fallbackShortcutNames += [PSCustomObject]@{
+                FolderName   = $folder.Name
+                ShortcutPath = $fallbackShortcutPath
+            }
+            if ($shortcutAlreadyExists) {
+                $updated++
+            } else {
+                $created++
+            }
+        } catch {
+            $shortcutFailures += [PSCustomObject]@{
+                FolderName   = $folder.Name
+                TargetPath   = $targetPath
+                ShortcutPath = $shortcutPath
+                ErrorMessage = "$primaryError ; fallback failed: $($_.Exception.Message)"
+            }
         }
     }
 }
@@ -431,6 +512,8 @@ $runLogLines = @(
     "Ignored non-account folders: $ignoredSourceFolderCount"
     "Created: $created"
     "Updated: $updated"
+    "Unchanged: $unchanged"
+    "Fallback shortcut names: $($fallbackShortcutNames.Count)"
     "Shortcut failures: $($shortcutFailures.Count)"
     "Skipped empty folders: $($skippedEmptyFolders.Count)"
     "Removed shortcuts for empty folders: $($removedEmptyShortcuts.Count)"
@@ -471,6 +554,20 @@ if ($shortcutFailures.Count -eq 0) {
     }
 }
 
+if ($fallbackShortcutNames.Count -eq 0) {
+    $runLogLines += "Fallback shortcut names: none"
+    $runLogLines += ""
+} else {
+    $runLogLines += "Fallback shortcut names:"
+    $runLogLines += ""
+
+    foreach ($item in $fallbackShortcutNames | Sort-Object FolderName) {
+        $runLogLines += "Folder: $($item.FolderName)"
+        $runLogLines += "Shortcut: $($item.ShortcutPath)"
+        $runLogLines += ""
+    }
+}
+
 if ($removedEmptyShortcuts.Count -eq 0) {
     $runLogLines += "Removed shortcuts for empty folders: none"
     $runLogLines += ""
@@ -506,6 +603,8 @@ Write-Host "Done. Created $created, updated $updated shortcuts." -ForegroundColo
 Write-Host "Scanned source folders: $($sourceFolderCandidates.Count)"
 Write-Host "Matched account folders: $($sourceFolders.Count)"
 Write-Host "Ignored non-account folders: $ignoredSourceFolderCount"
+Write-Host "Unchanged shortcuts: $unchanged"
+Write-Host "Fallback shortcut names: $($fallbackShortcutNames.Count)"
 Write-Host "Shortcut failures: $($shortcutFailures.Count)"
 Write-Host "Skipped empty folders: $($skippedEmptyFolders.Count)"
 Write-Host "Removed shortcuts for empty folders: $($removedEmptyShortcuts.Count)"
