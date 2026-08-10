@@ -16,6 +16,7 @@ from douk_manager.core.engine_update import (
 from douk_manager.core.json_store import read_json
 from douk_manager.core.locks import critical_section
 from douk_manager.core.settings_tasks import EarliestRule, GeneratedTask, SettingsTaskService
+from douk_manager.core.task_order import TaskOrderService
 from douk_manager.integrations.collector import CollectorService, MigrationResult
 from douk_manager.integrations.indexer import IndexResult, IndexService
 from douk_manager.integrations.screenshots import ScreenshotPreview, ScreenshotResult, ScreenshotService
@@ -44,6 +45,7 @@ class ManagerController:
     def _build_services(self) -> None:
         self.backup = BackupService(self.paths)
         self.tasks = SettingsTaskService(self.paths, self.backup)
+        self.task_order = TaskOrderService(self.paths)
         self.engine = EngineService(self.paths, self.config, self.backup)
         self.engine_updates = EngineUpdateService(self.paths, self.backup)
         self.collector = CollectorService(self.config, self.paths)
@@ -202,8 +204,20 @@ class ManagerController:
         return result
 
     def list_tasks(self) -> tuple[Path, ...]:
-        self.paths.tasks.mkdir(parents=True, exist_ok=True)
-        return tuple(sorted(self.paths.tasks.glob("*.json")))
+        result = self.task_order.list_tasks()
+        if self.task_order.last_warning:
+            self.logger.warning(self.task_order.last_warning)
+        return result
+
+    def save_task_order(self, ordered_paths: list[Path]) -> tuple[Path, ...]:
+        result = self.task_order.save_manual_order(ordered_paths)
+        self.logger.info("任务队列顺序已保存：%s", [path.name for path in result])
+        return result
+
+    def restore_task_order(self) -> tuple[Path, ...]:
+        result = self.task_order.restore_natural_order()
+        self.logger.info("任务队列已恢复按 A 编号排序")
+        return result
 
     def activate_task(self, path: Path) -> Path:
         self.require_safe_write()

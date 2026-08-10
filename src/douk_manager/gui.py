@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
 from douk_manager.controller import ManagerController
 from douk_manager.core.engine import assess_process_exit
 from douk_manager.core.settings_tasks import EarliestRule
+from douk_manager.core.task_order import move_to_index
 
 
 T = TypeVar("T")
@@ -62,6 +63,21 @@ class ActionWorker(QObject):
             self.error = exc
         finally:
             self.done.emit()
+
+
+class ReorderableTaskList(QListWidget):
+    orderChanged = Signal()
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        before = tuple(
+            self.item(index).data(Qt.UserRole) for index in range(self.count())
+        )
+        super().dropEvent(event)
+        after = tuple(
+            self.item(index).data(Qt.UserRole) for index in range(self.count())
+        )
+        if event.isAccepted() and after != before:
+            self.orderChanged.emit()
 
 
 class MainWindow(QMainWindow):
@@ -247,10 +263,42 @@ class MainWindow(QMainWindow):
         )
         label.setWordWrap(True)
         layout.addWidget(label)
-        self.task_list = QListWidget()
-        self.task_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        task_row = QHBoxLayout()
+        self.task_list = ReorderableTaskList()
+        self.task_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.task_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.task_list.setDragEnabled(True)
+        self.task_list.setAcceptDrops(True)
+        self.task_list.setDropIndicatorShown(True)
+        self.task_list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.task_list.setDragDropOverwriteMode(False)
+        self.task_list.setToolTip(
+            "勾选决定是否参加队列；高亮一项后可在右侧精确移动，也可直接拖拽。"
+        )
         self.task_list.itemChanged.connect(self._task_check_changed)
-        layout.addWidget(self.task_list, 1)
+        self.task_list.orderChanged.connect(self._task_order_dragged)
+        task_row.addWidget(self.task_list, 1)
+
+        order_box = QGroupBox("调整队列顺序")
+        order_box.setMinimumWidth(220)
+        order_layout = QVBoxLayout(order_box)
+        order_help = QLabel("先高亮一个任务，再选择位置；勾选状态不受影响。")
+        order_help.setWordWrap(True)
+        order_layout.addWidget(order_help)
+        self.queue_move_target = QComboBox()
+        order_layout.addWidget(self.queue_move_target)
+        move_button = QPushButton("移动高亮任务")
+        move_button.clicked.connect(self._move_highlighted_task)
+        order_layout.addWidget(move_button)
+        restore_button = QPushButton("恢复按 A 编号排序")
+        restore_button.clicked.connect(self._restore_task_order)
+        order_layout.addWidget(restore_button)
+        order_note = QLabel("拖拽、精确移动和顺序执行共用同一顺序，重启后保留。")
+        order_note.setWordWrap(True)
+        order_layout.addWidget(order_note)
+        order_layout.addStretch()
+        task_row.addWidget(order_box)
+        layout.addLayout(task_row, 1)
         options = QGroupBox("本次队列后续动作")
         form = QFormLayout(options)
         self.queue_screenshot_mode = self._post_combo(self.controller.config.screenshot_post_mode)
@@ -580,6 +628,9 @@ class MainWindow(QMainWindow):
             for index in range(self.task_list.count())
             if (item := self.task_list.item(index)).checkState() == Qt.Checked
         }
+        current_item = self.task_list.currentItem()
+        current_path = current_item.data(Qt.UserRole) if current_item else None
+        restored_current: QListWidgetItem | None = None
         signals_were_blocked = self.task_list.blockSignals(True)
         try:
             self.task_list.clear()
@@ -588,14 +639,118 @@ class MainWindow(QMainWindow):
                 state_text = "【已勾选】" if checked else "【未勾选】"
                 item = QListWidgetItem(f"{state_text} {path.name}")
                 item.setData(Qt.UserRole, str(path))
-                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setFlags(
+                    item.flags()
+                    | Qt.ItemIsUserCheckable
+                    | Qt.ItemIsDragEnabled
+                    | Qt.ItemIsDropEnabled
+                )
                 item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
                 item.setToolTip(
-                    "勾选后可复制为正式 settings.json，或加入顺序下载队列。"
+                    "勾选后可复制为正式 settings.json，或加入顺序下载队列；"
+                    "拖拽只调整执行顺序。"
                 )
                 self.task_list.addItem(item)
+                if str(path) == current_path:
+                    restored_current = item
+            if restored_current is not None:
+                self.task_list.setCurrentItem(restored_current)
         finally:
             self.task_list.blockSignals(signals_were_blocked)
+        self._update_move_targets(self.task_list.count())
+
+    def _update_move_targets(self, count: int) -> None:
+        signals_were_blocked = self.queue_move_target.blockSignals(True)
+        try:
+            self.queue_move_target.clear()
+            self.queue_move_target.addItem("移到最前", "first")
+            self.queue_move_target.addItem("上移一位", "up")
+            self.queue_move_target.addItem("下移一位", "down")
+            self.queue_move_target.addItem("移到最后", "last")
+            for position in range(1, count + 1):
+                self.queue_move_target.addItem(
+                    f"移到第 {position} 位", f"position:{position - 1}"
+                )
+        finally:
+            self.queue_move_target.blockSignals(signals_were_blocked)
+
+    def _task_paths_in_list(self) -> list[Path]:
+        return [
+            Path(self.task_list.item(index).data(Qt.UserRole))
+            for index in range(self.task_list.count())
+        ]
+
+    def _task_order_dragged(self) -> None:
+        if self.queue_active:
+            QMessageBox.information(
+                self,
+                "队列运行中",
+                "当前队列已经锁定执行顺序；请等待结束后再调整下一次的顺序。",
+            )
+            self.refresh_tasks()
+            return
+        result = self._run(
+            lambda: self.controller.save_task_order(self._task_paths_in_list()),
+            self.queue_output,
+        )
+        if result is not None:
+            self.queue_output.append("拖拽顺序已保存，下一次启动仍会保留。")
+
+    def _move_highlighted_task(self) -> None:
+        if self.queue_active:
+            QMessageBox.information(
+                self,
+                "队列运行中",
+                "当前队列已经锁定执行顺序；请等待结束后再调整下一次的顺序。",
+            )
+            return
+        source = self.task_list.currentRow()
+        if source < 0:
+            QMessageBox.information(self, "未高亮任务", "请先单击高亮一个要移动的任务。")
+            return
+        action = str(self.queue_move_target.currentData() or "")
+        count = self.task_list.count()
+        if action == "first":
+            target = 0
+        elif action == "up":
+            target = source - 1
+        elif action == "down":
+            target = source + 1
+        elif action == "last":
+            target = count - 1
+        elif action.startswith("position:"):
+            target = int(action.split(":", 1)[1])
+        else:
+            QMessageBox.warning(self, "位置无效", "请选择一个有效的移动位置。")
+            return
+
+        target = max(0, min(target, count - 1))
+        reordered = list(move_to_index(self._task_paths_in_list(), source, target))
+        selected_path = reordered[target]
+        result = self._run(
+            lambda: self.controller.save_task_order(reordered), self.queue_output
+        )
+        if result is not None:
+            for index in range(self.task_list.count()):
+                item = self.task_list.item(index)
+                if Path(item.data(Qt.UserRole)) == selected_path:
+                    self.task_list.setCurrentItem(item)
+                    break
+            self.queue_output.append(
+                f"已将 {selected_path.name} 移到第 {target + 1} 位并保存。"
+            )
+
+    def _restore_task_order(self) -> None:
+        if self.queue_active:
+            QMessageBox.information(
+                self,
+                "队列运行中",
+                "当前队列已经锁定执行顺序；请等待结束后再恢复排序。",
+            )
+            return
+        result = self._run(self.controller.restore_task_order, self.queue_output)
+        if result is not None:
+            self.queue_output.append("已恢复按任务首个 A 编号排序，并清除人工槽位顺序。")
 
     def _task_check_changed(self, item: QListWidgetItem) -> None:
         path_text = item.data(Qt.UserRole)
