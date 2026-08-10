@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Callable, TypeVar
 
 from PySide6.QtCore import QObject, QThread, Qt, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
 from douk_manager.controller import ManagerController
 from douk_manager.core.engine import assess_process_exit
 from douk_manager.core.settings_tasks import EarliestRule
-from douk_manager.core.task_order import drop_target_index, move_to_index
+from douk_manager.core.task_order import move_to_index
 
 
 T = TypeVar("T")
@@ -63,64 +63,6 @@ class ActionWorker(QObject):
             self.error = exc
         finally:
             self.done.emit()
-
-
-class ReorderableTaskList(QListWidget):
-    orderChanged = Signal()
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._drag_source_row: int | None = None
-
-    def startDrag(self, supported_actions) -> None:  # noqa: N802
-        self._drag_source_row = self.currentRow()
-        try:
-            super().startDrag(supported_actions)
-        finally:
-            self._drag_source_row = None
-
-    def dropEvent(self, event) -> None:  # noqa: N802
-        if event.source() is not self:
-            event.ignore()
-            return
-        source_row = (
-            self._drag_source_row
-            if self._drag_source_row is not None
-            else self.currentRow()
-        )
-        if not 0 <= source_row < self.count():
-            event.ignore()
-            return
-
-        point = event.position().toPoint()
-        hovered = self.indexAt(point)
-        if hovered.isValid():
-            hovered_row: int | None = hovered.row()
-            drop_below = point.y() >= self.visualRect(hovered).center().y()
-        else:
-            hovered_row = None
-            drop_below = True
-        target_row = drop_target_index(
-            source_row,
-            hovered_row,
-            drop_below,
-            self.count(),
-        )
-
-        event.setDropAction(Qt.DropAction.MoveAction)
-        event.accept()
-        if target_row == source_row:
-            return
-
-        # QListWidget's default internal drop can duplicate a row when the
-        # pointer lands on an item.  Move the existing item object explicitly
-        # so the row count and task identities cannot change.
-        item = self.takeItem(source_row)
-        if item is None:
-            return
-        self.insertItem(target_row, item)
-        self.setCurrentItem(item)
-        self.orderChanged.emit()
 
 
 class MainWindow(QMainWindow):
@@ -307,19 +249,19 @@ class MainWindow(QMainWindow):
         label.setWordWrap(True)
         layout.addWidget(label)
         task_row = QHBoxLayout()
-        self.task_list = ReorderableTaskList()
+        self.task_list = QListWidget()
         self.task_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.task_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
-        self.task_list.setDragEnabled(True)
-        self.task_list.setAcceptDrops(True)
-        self.task_list.setDropIndicatorShown(True)
-        self.task_list.setDefaultDropAction(Qt.DropAction.MoveAction)
-        self.task_list.setDragDropOverwriteMode(False)
+        self.task_list.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
+        self.task_list.setDragEnabled(False)
+        self.task_list.setAcceptDrops(False)
+        self.task_list.viewport().setAcceptDrops(False)
+        self.task_list.setDropIndicatorShown(False)
+        self.task_list.setDefaultDropAction(Qt.DropAction.IgnoreAction)
         self.task_list.setToolTip(
-            "勾选决定是否参加队列；高亮一项后可在右侧精确移动，也可直接拖拽。"
+            "勾选决定是否参加队列；高亮一项后使用右侧位置控制，"
+            "或按 Alt+↑ / Alt+↓ 移动。列表拖放已完全关闭。"
         )
         self.task_list.itemChanged.connect(self._task_check_changed)
-        self.task_list.orderChanged.connect(self._task_order_dragged)
         task_row.addWidget(self.task_list, 1)
 
         order_box = QGroupBox("调整队列顺序")
@@ -345,10 +287,29 @@ class MainWindow(QMainWindow):
         move_button = QPushButton("移动高亮任务")
         move_button.clicked.connect(self._move_highlighted_task)
         order_layout.addWidget(move_button)
+        self.queue_move_up_shortcut = QShortcut(QKeySequence("Alt+Up"), self.task_list)
+        self.queue_move_up_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut
+        )
+        self.queue_move_up_shortcut.activated.connect(
+            lambda: self._move_highlighted_task_by_action("up")
+        )
+        self.queue_move_down_shortcut = QShortcut(
+            QKeySequence("Alt+Down"), self.task_list
+        )
+        self.queue_move_down_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut
+        )
+        self.queue_move_down_shortcut.activated.connect(
+            lambda: self._move_highlighted_task_by_action("down")
+        )
         restore_button = QPushButton("恢复按 A 编号排序")
         restore_button.clicked.connect(self._restore_task_order)
         order_layout.addWidget(restore_button)
-        order_note = QLabel("拖拽、精确移动和顺序执行共用同一顺序，重启后保留。")
+        order_note = QLabel(
+            "精确移动、Alt+↑ / Alt+↓ 和顺序执行共用同一顺序，重启后保留；"
+            "列表不支持拖放。"
+        )
         order_note.setWordWrap(True)
         order_layout.addWidget(order_note)
         order_layout.addStretch()
@@ -695,15 +656,14 @@ class MainWindow(QMainWindow):
                 item = QListWidgetItem(f"{state_text} {path.name}")
                 item.setData(Qt.UserRole, str(path))
                 item.setFlags(
-                    item.flags()
-                    | Qt.ItemIsUserCheckable
-                    | Qt.ItemIsDragEnabled
-                    | Qt.ItemIsDropEnabled
+                    (item.flags() | Qt.ItemIsUserCheckable)
+                    & ~Qt.ItemIsDragEnabled
+                    & ~Qt.ItemIsDropEnabled
                 )
                 item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
                 item.setToolTip(
                     "勾选后可复制为正式 settings.json，或加入顺序下载队列；"
-                    "拖拽只调整执行顺序。"
+                    "高亮后可使用右侧位置控制或 Alt+↑ / Alt+↓ 调整执行顺序。"
                 )
                 self.task_list.addItem(item)
                 if str(path) == current_path:
@@ -751,27 +711,12 @@ class MainWindow(QMainWindow):
             for index in range(self.task_list.count())
         ]
 
-    def _task_order_dragged(self) -> None:
-        if self.queue_active:
-            QMessageBox.information(
-                self,
-                "队列运行中",
-                "当前队列已经锁定执行顺序；请等待结束后再调整下一次的顺序。",
-            )
-            self.refresh_tasks()
-            return
-        result = self._run(
-            lambda: self.controller.save_task_order(self._task_paths_in_list()),
-            self.queue_output,
-        )
-        # Always rebuild from the canonical task directory.  This also rolls
-        # the visual list back immediately if a task was added/deleted during
-        # the drag or saving failed for any other reason.
-        self.refresh_tasks()
-        if result is not None:
-            self.queue_output.append("拖拽顺序已保存，下一次启动仍会保留。")
-
     def _move_highlighted_task(self) -> None:
+        self._move_highlighted_task_by_action(
+            str(self.queue_move_target.currentData() or "")
+        )
+
+    def _move_highlighted_task_by_action(self, action: str) -> None:
         if self.queue_active:
             QMessageBox.information(
                 self,
@@ -783,7 +728,6 @@ class MainWindow(QMainWindow):
         if source < 0:
             QMessageBox.information(self, "未高亮任务", "请先单击高亮一个要移动的任务。")
             return
-        action = str(self.queue_move_target.currentData() or "")
         count = self.task_list.count()
         if action == "first":
             target = 0
