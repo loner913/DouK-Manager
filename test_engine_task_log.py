@@ -1,0 +1,64 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from douk_manager.config import AppConfig
+from douk_manager.core.backup import BackupService
+from douk_manager.core.engine import EngineService
+from tests.helpers import make_test_paths
+
+
+class _RunningProcess:
+    pid = 12345
+    returncode = None
+
+    @staticmethod
+    def poll() -> None:
+        return None
+
+
+class EngineTaskLogTests(unittest.TestCase):
+    def test_task_log_names_template_and_explains_pause_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_test_paths(Path(directory), 3)
+            active = json.loads(paths.active_settings.read_text(encoding="utf-8"))
+            active["run_command"] = "5 1 1 Q"
+            for index, account in enumerate(active["accounts_urls"]):
+                account["enable"] = index == 0
+            paths.active_settings.write_text(
+                json.dumps(active, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            config = AppConfig(
+                engine_exe=str(paths.engine_exe),
+                video_root=str(paths.video_root),
+                index_root=str(paths.index_root),
+                batch_accounts=50,
+                rest_seconds=150,
+            )
+            service = EngineService(paths, config, BackupService(paths))
+            service.external_running = lambda: False
+
+            with patch(
+                "douk_manager.core.engine.subprocess.Popen",
+                return_value=_RunningProcess(),
+            ):
+                run = service.start(task_template=Path("A51.json"))
+
+            content = run.task_log.read_text(encoding="utf-8")
+            self.assertIn("Log scope: one downloader process", content)
+            self.assertIn("Task template: A51.json", content)
+            self.assertIn("Selected accounts: 1", content)
+            self.assertIn("Pause every accounts: 50", content)
+            self.assertIn("Pause seconds: 150", content)
+            self.assertNotIn("Batch accounts:", content)
+            self.assertEqual(run.task_template, "A51.json")
+            self.assertEqual(run.selected_accounts, 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
