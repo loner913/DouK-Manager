@@ -57,6 +57,36 @@ def move_to_index(
     return tuple(result)
 
 
+def drop_target_index(
+    source_index: int,
+    hovered_index: int | None,
+    drop_below: bool,
+    item_count: int,
+) -> int:
+    """Return the final row for a single-item drag.
+
+    ``hovered_index`` describes the row under the pointer before the source row
+    is removed.  Treating the upper and lower halves as insertion zones makes
+    the target unambiguous: a task is always inserted before or after another
+    task and can never overwrite it.
+    """
+
+    if item_count <= 0 or not 0 <= source_index < item_count:
+        raise TaskOrderError("拖拽源任务已经不在列表中，请刷新后重试。")
+    if hovered_index is None:
+        insertion_index = item_count
+    else:
+        if not 0 <= hovered_index < item_count:
+            raise TaskOrderError("拖拽目标位置已经失效，请刷新后重试。")
+        insertion_index = hovered_index + int(drop_below)
+
+    # The insertion position was measured before removing the source.  Rows
+    # after it therefore shift left once the source is taken out.
+    if insertion_index > source_index:
+        insertion_index -= 1
+    return max(0, min(insertion_index, item_count - 1))
+
+
 class TaskOrderService:
     """Persist queue slots without changing task templates or official data."""
 

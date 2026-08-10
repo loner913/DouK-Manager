@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
 from douk_manager.controller import ManagerController
 from douk_manager.core.engine import assess_process_exit
 from douk_manager.core.settings_tasks import EarliestRule
-from douk_manager.core.task_order import move_to_index
+from douk_manager.core.task_order import drop_target_index, move_to_index
 
 
 T = TypeVar("T")
@@ -68,16 +68,59 @@ class ActionWorker(QObject):
 class ReorderableTaskList(QListWidget):
     orderChanged = Signal()
 
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._drag_source_row: int | None = None
+
+    def startDrag(self, supported_actions) -> None:  # noqa: N802
+        self._drag_source_row = self.currentRow()
+        try:
+            super().startDrag(supported_actions)
+        finally:
+            self._drag_source_row = None
+
     def dropEvent(self, event) -> None:  # noqa: N802
-        before = tuple(
-            self.item(index).data(Qt.UserRole) for index in range(self.count())
+        if event.source() is not self:
+            event.ignore()
+            return
+        source_row = (
+            self._drag_source_row
+            if self._drag_source_row is not None
+            else self.currentRow()
         )
-        super().dropEvent(event)
-        after = tuple(
-            self.item(index).data(Qt.UserRole) for index in range(self.count())
+        if not 0 <= source_row < self.count():
+            event.ignore()
+            return
+
+        point = event.position().toPoint()
+        hovered = self.indexAt(point)
+        if hovered.isValid():
+            hovered_row: int | None = hovered.row()
+            drop_below = point.y() >= self.visualRect(hovered).center().y()
+        else:
+            hovered_row = None
+            drop_below = True
+        target_row = drop_target_index(
+            source_row,
+            hovered_row,
+            drop_below,
+            self.count(),
         )
-        if event.isAccepted() and after != before:
-            self.orderChanged.emit()
+
+        event.setDropAction(Qt.DropAction.MoveAction)
+        event.accept()
+        if target_row == source_row:
+            return
+
+        # QListWidget's default internal drop can duplicate a row when the
+        # pointer lands on an item.  Move the existing item object explicitly
+        # so the row count and task identities cannot change.
+        item = self.takeItem(source_row)
+        if item is None:
+            return
+        self.insertItem(target_row, item)
+        self.setCurrentItem(item)
+        self.orderChanged.emit()
 
 
 class MainWindow(QMainWindow):
@@ -287,6 +330,18 @@ class MainWindow(QMainWindow):
         order_layout.addWidget(order_help)
         self.queue_move_target = QComboBox()
         order_layout.addWidget(self.queue_move_target)
+        position_row = QHBoxLayout()
+        position_row.addWidget(QLabel("指定第几位"))
+        self.queue_move_position = QSpinBox()
+        self.queue_move_position.setRange(1, 1)
+        self.queue_move_position.setSuffix(" 位")
+        self.queue_move_position.setKeyboardTracking(False)
+        position_row.addWidget(self.queue_move_position, 1)
+        order_layout.addLayout(position_row)
+        self.queue_move_target.currentIndexChanged.connect(
+            self._update_move_position_enabled
+        )
+        self.task_list.currentRowChanged.connect(self._task_highlight_changed)
         move_button = QPushButton("移动高亮任务")
         move_button.clicked.connect(self._move_highlighted_task)
         order_layout.addWidget(move_button)
@@ -660,6 +715,7 @@ class MainWindow(QMainWindow):
         self._update_move_targets(self.task_list.count())
 
     def _update_move_targets(self, count: int) -> None:
+        previous_action = str(self.queue_move_target.currentData() or "")
         signals_were_blocked = self.queue_move_target.blockSignals(True)
         try:
             self.queue_move_target.clear()
@@ -667,12 +723,27 @@ class MainWindow(QMainWindow):
             self.queue_move_target.addItem("上移一位", "up")
             self.queue_move_target.addItem("下移一位", "down")
             self.queue_move_target.addItem("移到最后", "last")
-            for position in range(1, count + 1):
-                self.queue_move_target.addItem(
-                    f"移到第 {position} 位", f"position:{position - 1}"
-                )
+            self.queue_move_target.addItem("移到指定位置", "position")
+            previous_index = self.queue_move_target.findData(previous_action)
+            if previous_index >= 0:
+                self.queue_move_target.setCurrentIndex(previous_index)
         finally:
             self.queue_move_target.blockSignals(signals_were_blocked)
+        self.queue_move_position.setRange(1, max(1, count))
+        current_row = self.task_list.currentRow()
+        if current_row >= 0:
+            self.queue_move_position.setValue(current_row + 1)
+        self._update_move_position_enabled()
+
+    def _update_move_position_enabled(self) -> None:
+        self.queue_move_position.setEnabled(
+            self.task_list.count() > 0
+            and self.queue_move_target.currentData() == "position"
+        )
+
+    def _task_highlight_changed(self, row: int) -> None:
+        if row >= 0:
+            self.queue_move_position.setValue(row + 1)
 
     def _task_paths_in_list(self) -> list[Path]:
         return [
@@ -693,6 +764,10 @@ class MainWindow(QMainWindow):
             lambda: self.controller.save_task_order(self._task_paths_in_list()),
             self.queue_output,
         )
+        # Always rebuild from the canonical task directory.  This also rolls
+        # the visual list back immediately if a task was added/deleted during
+        # the drag or saving failed for any other reason.
+        self.refresh_tasks()
         if result is not None:
             self.queue_output.append("拖拽顺序已保存，下一次启动仍会保留。")
 
@@ -718,8 +793,8 @@ class MainWindow(QMainWindow):
             target = source + 1
         elif action == "last":
             target = count - 1
-        elif action.startswith("position:"):
-            target = int(action.split(":", 1)[1])
+        elif action == "position":
+            target = self.queue_move_position.value() - 1
         else:
             QMessageBox.warning(self, "位置无效", "请选择一个有效的移动位置。")
             return

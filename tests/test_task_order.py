@@ -8,7 +8,9 @@ from douk_manager.core.backup import BackupService
 from douk_manager.core.json_store import read_json
 from douk_manager.core.settings_tasks import SettingsTaskService
 from douk_manager.core.task_order import (
+    TaskOrderError,
     TaskOrderService,
+    drop_target_index,
     move_to_index,
     task_start_number,
 )
@@ -101,6 +103,30 @@ class TaskOrderTests(unittest.TestCase):
             move_to_index(paths, 0, 3),
             (Path("A2.json"), Path("A3.json"), Path("A4.json"), Path("A1.json")),
         )
+
+    def test_drop_uses_whole_row_halves_as_non_overlapping_insert_zones(self) -> None:
+        # Dropping below A2 moves A1 after it; dropping above A2 moves A3
+        # before it.  A viewport drop always moves to the final row.
+        self.assertEqual(drop_target_index(0, 1, True, 4), 1)
+        self.assertEqual(drop_target_index(2, 1, False, 4), 1)
+        self.assertEqual(drop_target_index(0, None, True, 4), 3)
+        # Dropping within either half adjacent to the source is a safe no-op.
+        self.assertEqual(drop_target_index(1, 1, False, 4), 1)
+        self.assertEqual(drop_target_index(1, 1, True, 4), 1)
+
+    def test_duplicate_drag_result_is_rejected_without_changing_saved_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_test_paths(Path(directory), 20)
+            tasks = SettingsTaskService(paths, BackupService(paths))
+            a1 = tasks.create_task("A1", task_name="A1").task_path
+            a2 = tasks.create_task("A2", task_name="A2").task_path
+            order = TaskOrderService(paths)
+            self.assertEqual(order.list_tasks(), (a1, a2))
+
+            with self.assertRaises(TaskOrderError):
+                order.save_manual_order((a2, a2))
+
+            self.assertEqual(TaskOrderService(paths).list_tasks(), (a1, a2))
 
 
 if __name__ == "__main__":
