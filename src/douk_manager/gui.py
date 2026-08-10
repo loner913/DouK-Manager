@@ -731,6 +731,7 @@ class MainWindow(QMainWindow):
             lambda: self.controller.save_task_order(reordered), self.queue_output
         )
         if result is not None:
+            self.refresh_tasks()
             for index in range(self.task_list.count()):
                 item = self.task_list.item(index)
                 if Path(item.data(Qt.UserRole)) == selected_path:
@@ -750,6 +751,7 @@ class MainWindow(QMainWindow):
             return
         result = self._run(self.controller.restore_task_order, self.queue_output)
         if result is not None:
+            self.refresh_tasks()
             self.queue_output.append("已恢复按任务首个 A 编号排序，并清除人工槽位顺序。")
 
     def _task_check_changed(self, item: QListWidgetItem) -> None:

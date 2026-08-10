@@ -118,8 +118,8 @@ class WindowsIndexIntegrationTests(unittest.TestCase):
             index.mkdir()
 
             folders = {
-                "A1173 38224167560_发布作品": source / "UID2187354221600297_A1173 38224167560_发布作品",
-                "A1329小小ljj19777_发布作品": source / "UID70994864192_A1329小小ljj19777_发布作品",
+                "A1173 SafeAccountOne_发布作品": source / "UID111111111111_A1173 SafeAccountOne_发布作品",
+                "A1329SafeAccountTwo_发布作品": source / "UID222222222222_A1329SafeAccountTwo_发布作品",
             }
             for folder in folders.values():
                 folder.mkdir()

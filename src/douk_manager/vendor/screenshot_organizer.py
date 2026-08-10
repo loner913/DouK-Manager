@@ -4,7 +4,7 @@
 The authoritative account number is the A-number field immediately following
 the leading UID field in an account folder name:
 
-    UID3079086627103923_A115display-name_发布作品
+    UID1234567890123456_A115display-name_发布作品
 
 Any later ``A123``-like text belongs to the display-name/account text and is
 ignored.  A fatal ambiguity exists only when two different sibling account
