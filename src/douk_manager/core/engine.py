@@ -22,6 +22,8 @@ class EngineRun:
     started_at: datetime
     task_log: Path
     pause_after_exit: bool = False
+    task_template: str = "current settings.json"
+    selected_accounts: int = 0
 
     @property
     def running(self) -> bool:
@@ -105,7 +107,7 @@ class EngineService:
             if line.strip()
         )
 
-    def validate_ready(self) -> None:
+    def validate_ready(self) -> int:
         if not self.paths.engine_exe.is_file():
             raise EngineError(f"下载引擎不存在：{self.paths.engine_exe}")
         active = read_json(self.paths.active_settings)
@@ -114,22 +116,35 @@ class EngineService:
         accounts = active.get("accounts_urls")
         if not isinstance(accounts, list):
             raise EngineError("正式 settings.json 缺少 accounts_urls。")
-        if not any(
-            isinstance(account, dict)
+        selected_accounts = sum(
+            1
+            for account in accounts
+            if isinstance(account, dict)
             and account.get("enable", True)
             and str(account.get("url", "")).strip()
-            for account in accounts
-        ):
+        )
+        if selected_accounts < 1:
             raise EngineError("正式 settings.json 没有启用且 URL 有效的账号。")
+        return selected_accounts
 
-    def start(self, *, pause_after_exit: bool = False) -> EngineRun:
+    def start(
+        self,
+        *,
+        pause_after_exit: bool = False,
+        task_template: Path | None = None,
+    ) -> EngineRun:
         if self.external_running():
             raise EngineError("下载引擎已经在运行。")
+        display_template = (
+            task_template.name if task_template else "current settings.json"
+        )
         with critical_section(self.paths.lock_file):
-            self.validate_ready()
+            selected_accounts = self.validate_ready()
             snapshot = self.backup.create_critical_snapshot(
                 "BeforeDownload",
                 {
+                    "task_template": display_template,
+                    "selected_accounts": selected_accounts,
                     "batch_accounts": self.config.batch_accounts,
                     "rest_seconds": self.config.rest_seconds,
                     "run_command": "5 1 1 Q",
@@ -161,15 +176,22 @@ class EngineService:
             )
         except OSError as exc:
             raise EngineError(f"无法启动下载引擎：{exc}") from exc
-        task_log = self.paths.logs / f"DownloadTask_{datetime.now():%Y-%m-%d_%H-%M-%S}.log"
+        task_log = (
+            self.paths.logs
+            / f"DownloadTask_{datetime.now():%Y-%m-%d_%H-%M-%S-%f}.log"
+        )
         task_log.write_text(
             "\n".join(
                 (
                     f"Started: {datetime.now().isoformat(timespec='seconds')}",
+                    "Log scope: one downloader process",
+                    f"Task template: {display_template}",
                     f"Engine: {self.paths.engine_exe}",
+                    f"Active settings: {self.paths.active_settings}",
                     "run_command: 5 1 1 Q",
-                    f"Batch accounts: {self.config.batch_accounts}",
-                    f"Rest seconds: {self.config.rest_seconds}",
+                    f"Selected accounts: {selected_accounts}",
+                    f"Pause every accounts: {self.config.batch_accounts}",
+                    f"Pause seconds: {self.config.rest_seconds}",
                     f"Pause after exit: {pause_after_exit}",
                     f"Backup: {snapshot}",
                     "",
@@ -177,7 +199,14 @@ class EngineService:
             ),
             encoding="utf-8",
         )
-        self.current = EngineRun(process, datetime.now(), task_log, pause_after_exit)
+        self.current = EngineRun(
+            process=process,
+            started_at=datetime.now(),
+            task_log=task_log,
+            pause_after_exit=pause_after_exit,
+            task_template=display_template,
+            selected_accounts=selected_accounts,
+        )
         return self.current
 
     def _write_pause_wrapper(self) -> Path:

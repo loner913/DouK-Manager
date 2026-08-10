@@ -830,7 +830,8 @@ class MainWindow(QMainWindow):
             if start:
                 run = self._run(
                     lambda: self.controller.start_current_download(
-                        self.task_pause_console.isChecked()
+                        self.task_pause_console.isChecked(),
+                        task_template=result.task_path,
                     ),
                     self.task_output,
                 )
@@ -931,6 +932,13 @@ class MainWindow(QMainWindow):
         self.queue_pending = paths
         self.queue_active = True
         self.queue_output.append(f"队列开始，共 {len(paths)} 个任务。")
+        order_text = " → ".join(path.name for path in paths)
+        self.queue_output.append(f"本次执行顺序：{order_text}")
+        self.controller.logger.info(
+            "下载队列开始：任务数=%s；执行顺序=%s",
+            len(paths),
+            order_text,
+        )
         self._start_next_queue_item()
 
     def _start_next_queue_item(self) -> None:
@@ -940,6 +948,12 @@ class MainWindow(QMainWindow):
             )
             if messages:
                 self.queue_output.append("；".join(messages))
+            post_summary = "；".join(messages) if messages else "无"
+            self.controller.logger.info(
+                "下载队列执行结束：所选下载器进程均正常退出；"
+                "后续动作=%s；账号下载结果需核对下载器原生日志",
+                post_summary,
+            )
             self.queue_output.append(
                 "队列执行结束（仅表示所选下载器进程均已正常退出，"
                 "不代表每个账号均下载成功）。"
@@ -973,7 +987,10 @@ class MainWindow(QMainWindow):
         self.queue_output.append(assessment.headline)
         self.queue_output.append(assessment.detail)
         self.controller.logger.info(
-            "下载进程已退出：PID=%s；退出码=%s；状态=%s",
+            "下载进程已退出：模板=%s；已选账号=%s；PID=%s；"
+            "退出码=%s；状态=%s",
+            self.queue_current.task_template,
+            self.queue_current.selected_accounts,
             self.queue_current.process.pid,
             code,
             assessment.log_status,

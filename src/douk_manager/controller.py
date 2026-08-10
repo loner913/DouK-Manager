@@ -225,14 +225,28 @@ class ManagerController:
         self.logger.info("任务已激活：%s", path)
         return result
 
-    def start_current_download(self, pause_after_exit: bool = False) -> EngineRun:
+    def start_current_download(
+        self,
+        pause_after_exit: bool = False,
+        *,
+        task_template: Path | None = None,
+    ) -> EngineRun:
         self.require_safe_write()
-        result = self.engine.start(pause_after_exit=pause_after_exit)
+        result = self.engine.start(
+            pause_after_exit=pause_after_exit,
+            task_template=task_template,
+        )
         self._last_engine_running = True
         self.logger.info(
-            "下载引擎已启动：PID=%s；结束后保留窗口=%s",
+            "下载任务已启动：模板=%s；已选账号=%s；PID=%s；"
+            "每%s个账号暂停%s秒；结束后保留窗口=%s；任务日志=%s",
+            result.task_template,
+            result.selected_accounts,
             result.process.pid,
+            self.config.batch_accounts,
+            self.config.rest_seconds,
             pause_after_exit,
+            result.task_log,
         )
         return result
 
@@ -240,7 +254,10 @@ class ManagerController:
         self, task_path: Path, pause_after_exit: bool = False
     ) -> EngineRun:
         self.activate_task(task_path)
-        return self.start_current_download(pause_after_exit)
+        return self.start_current_download(
+            pause_after_exit,
+            task_template=task_path,
+        )
 
     def backup_now(self, category: str = "Manual") -> Path:
         self.require_safe_write()
