@@ -41,6 +41,7 @@ class EngineTaskLogTests(unittest.TestCase):
                 rest_seconds=150,
             )
             service = EngineService(paths, config, BackupService(paths))
+            service.external_running = lambda: False
 
             with patch(
                 "douk_manager.core.engine.subprocess.Popen",
