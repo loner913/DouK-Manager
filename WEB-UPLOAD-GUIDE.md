@@ -5,7 +5,7 @@
 ## 一、上传源码
 
 1. 下载并解压 `DouK-Manager-Source-v0.1.0.zip`。
-2. 打开私有仓库：`https://github.com/loner913/DouK-Manager`。
+2. 打开仓库：`https://github.com/loner913/DouK-Manager`。
 3. 在空仓库蓝色区域点击 `uploading an existing file`；仓库已有文件时使用 `Add file` → `Upload files`。
 4. 打开解压后的 `DouK-Manager-Source-v0.1.0` 文件夹。
 5. 选择文件夹里面的全部内容，而不是外层文件夹本身。
@@ -68,7 +68,7 @@ F:\DouK-Manager\DouKManager.exe
 
 1. 程序使用预设路径寻找当前 `main.exe`。
 2. 检查 `_internal\Volume`、数据库、主档和任务设置。
-3. 检查成功后自动创建 `Backups\Startup` 永久快照。
+3. 检查成功后自动创建 `Backups\Startup` 轻量快照，只包含三个关键文件，并按保留上限轮换。
 4. 先进入“账号采集”页面，点击“迁移旧Excel/分类/截图”。
 5. 确认迁移日志明确显示“settings_master.json 未复制”。
 6. 使用“账号任务”页面预览一个小范围，例如 `A1`。
@@ -78,4 +78,3 @@ F:\DouK-Manager\DouKManager.exe
 ## 四、Actions 失败时
 
 不要反复修改正式数据。打开失败的 Actions 记录，把红色步骤名称和错误日志截图保存。源码构建失败不会接触本机的 `Volume`。
-
