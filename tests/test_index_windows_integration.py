@@ -41,8 +41,8 @@ class WindowsIndexIntegrationTests(unittest.TestCase):
         for line in raw_log.splitlines():
             if not line:
                 break
-            if ": " in line:
-                key, value = line.split(": ", 1)
+            if "：" in line:
+                key, value = line.split("：", 1)
                 result[key] = value
         return result
 
@@ -127,9 +127,9 @@ class WindowsIndexIntegrationTests(unittest.TestCase):
 
             first = self._run_refresh(source, index)
             self.assertEqual(
-                first["Shortcut failures"], "0", msg=first["__raw_log__"]
+                first["创建或更新失败"], "0 个", msg=first["__raw_log__"]
             )
-            self.assertEqual(first["Created"], "2", msg=first["__raw_log__"])
+            self.assertEqual(first["新建快捷方式"], "2 个", msg=first["__raw_log__"])
 
             for display_name, target in folders.items():
                 shortcut = index / f"{display_name}.lnk"
@@ -141,11 +141,11 @@ class WindowsIndexIntegrationTests(unittest.TestCase):
 
             second = self._run_refresh(source, index)
             self.assertEqual(
-                second["Shortcut failures"], "0", msg=second["__raw_log__"]
+                second["创建或更新失败"], "0 个", msg=second["__raw_log__"]
             )
-            self.assertEqual(second["Created"], "0", msg=second["__raw_log__"])
-            self.assertEqual(second["Updated"], "0", msg=second["__raw_log__"])
-            self.assertEqual(second["Unchanged"], "2", msg=second["__raw_log__"])
+            self.assertEqual(second["新建快捷方式"], "0 个", msg=second["__raw_log__"])
+            self.assertEqual(second["更新快捷方式"], "0 个", msg=second["__raw_log__"])
+            self.assertEqual(second["保持不变"], "2 个", msg=second["__raw_log__"])
             self.assertEqual(len(list(index.glob("*.lnk"))), 2)
 
     def test_cleanup_self_test_deletes_only_broken_managed_shortcut(self) -> None:
@@ -172,4 +172,4 @@ class WindowsIndexIntegrationTests(unittest.TestCase):
             0,
             msg=f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
         )
-        self.assertIn("DouK cleanup self-test PASSED.", completed.stdout)
+        self.assertIn("DouK 清理功能隔离自检通过。", completed.stdout)

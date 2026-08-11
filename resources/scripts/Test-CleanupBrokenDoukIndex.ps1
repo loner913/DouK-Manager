@@ -1,4 +1,4 @@
-param()
+﻿param()
 
 $ErrorActionPreference = 'Stop'
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -43,13 +43,13 @@ function New-SelfTestShortcut {
     if ($Managed) {
         $shortcut.Description = "[DoukIndex] $TargetPath"
     } else {
-        $shortcut.Description = 'DouK cleanup self-test unmanaged shortcut'
+        $shortcut.Description = 'DouK 清理自检用非受管快捷方式'
     }
     $shortcut.Save()
 }
 
 try {
-    Assert-SelfTest -Condition (Test-Path -LiteralPath $cleanupScript -PathType Leaf) -Message "Cleanup script not found: $cleanupScript"
+    Assert-SelfTest -Condition (Test-Path -LiteralPath $cleanupScript -PathType Leaf) -Message "找不到清理脚本：$cleanupScript"
 
     New-Item -ItemType Directory -Path $validTarget -Force | Out-Null
     New-Item -ItemType Directory -Path $brokenTarget -Force | Out-Null
@@ -68,21 +68,27 @@ try {
         & $cleanupScript -SourceRoot $sourceRoot -IndexRoot $indexRoot *>&1
     ) | Out-String
 
-    Assert-SelfTest -Condition (Test-Path -LiteralPath $validShortcut -PathType Leaf) -Message 'Managed shortcut with an existing target was deleted.'
-    Assert-SelfTest -Condition (-not (Test-Path -LiteralPath $brokenShortcut)) -Message 'Managed shortcut with a missing target was not deleted.'
-    Assert-SelfTest -Condition (Test-Path -LiteralPath $unmanagedShortcut -PathType Leaf) -Message 'Unmanaged shortcut was deleted.'
-    Assert-SelfTest -Condition (Test-Path -LiteralPath $validTarget -PathType Container) -Message 'Existing source folder was modified or deleted.'
-    Assert-SelfTest -Condition ((Get-Content -LiteralPath (Join-Path $validTarget 'keep.txt') -Raw).Trim() -eq 'keep') -Message 'Existing source file was modified.'
-    Assert-SelfTest -Condition ($firstOutput -match 'Deleted 1 broken shortcuts') -Message "First cleanup did not report exactly one deletion.`n$firstOutput"
+    Assert-SelfTest -Condition (Test-Path -LiteralPath $validShortcut -PathType Leaf) -Message '目标存在的受管快捷方式被误删。'
+    Assert-SelfTest -Condition (-not (Test-Path -LiteralPath $brokenShortcut)) -Message '目标不存在的受管快捷方式未被删除。'
+    Assert-SelfTest -Condition (Test-Path -LiteralPath $unmanagedShortcut -PathType Leaf) -Message '非受管快捷方式被误删。'
+    Assert-SelfTest -Condition (Test-Path -LiteralPath $validTarget -PathType Container) -Message '现存源文件夹被修改或删除。'
+    Assert-SelfTest -Condition ((Get-Content -LiteralPath (Join-Path $validTarget 'keep.txt') -Raw).Trim() -eq 'keep') -Message '现存源文件被修改。'
+    $firstSummaryMatch = [regex]::Match($firstOutput, 'DOUK_INDEX_SUMMARY_JSON=(\{[^\r\n]+\})')
+    Assert-SelfTest -Condition $firstSummaryMatch.Success -Message "第一次清理未返回数字汇总。`n$firstOutput"
+    $firstSummary = $firstSummaryMatch.Groups[1].Value | ConvertFrom-Json
+    Assert-SelfTest -Condition ($firstSummary.DeletedShortcutsTotal -eq 1) -Message "第一次清理没有准确报告删除 1 个快捷方式。`n$firstOutput"
 
     $secondOutput = @(
         & $cleanupScript -SourceRoot $sourceRoot -IndexRoot $indexRoot *>&1
     ) | Out-String
 
-    Assert-SelfTest -Condition (Test-Path -LiteralPath $validShortcut -PathType Leaf) -Message 'Valid managed shortcut did not survive the second cleanup.'
-    Assert-SelfTest -Condition (Test-Path -LiteralPath $unmanagedShortcut -PathType Leaf) -Message 'Unmanaged shortcut did not survive the second cleanup.'
-    Assert-SelfTest -Condition ((Get-ChildItem -LiteralPath $indexRoot -Filter *.lnk -File).Count -eq 2) -Message 'Unexpected shortcut count after the second cleanup.'
-    Assert-SelfTest -Condition ($secondOutput -match 'Deleted 0 broken shortcuts') -Message "Second cleanup was not idempotent.`n$secondOutput"
+    Assert-SelfTest -Condition (Test-Path -LiteralPath $validShortcut -PathType Leaf) -Message '目标存在的受管快捷方式未通过第二次清理。'
+    Assert-SelfTest -Condition (Test-Path -LiteralPath $unmanagedShortcut -PathType Leaf) -Message '非受管快捷方式未通过第二次清理。'
+    Assert-SelfTest -Condition ((Get-ChildItem -LiteralPath $indexRoot -Filter *.lnk -File).Count -eq 2) -Message '第二次清理后的快捷方式数量异常。'
+    $secondSummaryMatch = [regex]::Match($secondOutput, 'DOUK_INDEX_SUMMARY_JSON=(\{[^\r\n]+\})')
+    Assert-SelfTest -Condition $secondSummaryMatch.Success -Message "第二次清理未返回数字汇总。`n$secondOutput"
+    $secondSummary = $secondSummaryMatch.Groups[1].Value | ConvertFrom-Json
+    Assert-SelfTest -Condition ($secondSummary.DeletedShortcutsTotal -eq 0) -Message "第二次清理不是幂等操作。`n$secondOutput"
 } catch {
     $failure = $_ | Out-String
 } finally {
@@ -92,13 +98,12 @@ try {
 }
 
 if ($failure) {
-    [Console]::Error.WriteLine("DouK cleanup self-test FAILED.`n$failure")
+    [Console]::Error.WriteLine("DouK 清理功能隔离自检失败。`n$failure")
     exit 1
 }
 
-Write-Host 'DouK cleanup self-test PASSED.' -ForegroundColor Green
-Write-Host 'First run: deleted only the managed broken shortcut.'
-Write-Host 'Second run: deleted 0 shortcuts.'
-Write-Host 'Kept: valid managed shortcut, unmanaged shortcut, existing source folder and file.'
-Write-Host 'Scope: Windows temporary directory only; formal source and index folders were not used.'
-
+Write-Host 'DouK 清理功能隔离自检通过。' -ForegroundColor Green
+Write-Host '第一次运行：只删除了目标不存在的受管快捷方式。'
+Write-Host '第二次运行：删除 0 个快捷方式。'
+Write-Host '已保留：有效受管快捷方式、非受管快捷方式、现存源文件夹及文件。'
+Write-Host '测试范围：仅使用 Windows 临时目录，未读取或修改正式源目录和索引目录。'

@@ -1,15 +1,14 @@
-param(
-    [Parameter(Mandatory = $true)][string]$SourceRoot,
-    [Parameter(Mandatory = $true)][string]$IndexRoot,
+﻿param(
+    [string]$SourceRoot = 'F:\DouK-Downloader',
+    [string]$IndexRoot = 'F:\Douk videos',
     [switch]$OpenIndexFolderAfterRun,
     [switch]$PromptDeleteBrokenShortcuts
 )
 
-# Compatibility entry point only.  DouK Manager packages and executes the
-# authoritative implementation under resources/scripts.
+# 兼容入口；DouK 管理器实际打包并执行 resources/scripts 下的正式脚本。
 $scriptPath = Join-Path $PSScriptRoot 'resources\scripts\Refresh-DoukIndex.ps1'
 if (-not (Test-Path -LiteralPath $scriptPath -PathType Leaf)) {
-    throw "Managed index script not found: $scriptPath"
+    throw "找不到正式索引脚本：$scriptPath"
 }
 
 & $scriptPath @PSBoundParameters

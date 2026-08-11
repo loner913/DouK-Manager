@@ -319,15 +319,19 @@ class MainWindow(QMainWindow):
         form = QFormLayout(options)
         self.queue_screenshot_mode = self._post_combo(self.controller.config.screenshot_post_mode)
         self.queue_index_mode = self._post_combo(self.controller.config.index_post_mode)
-        self.queue_cleanup = QCheckBox("索引刷新后清理失效快捷方式")
+        self.queue_cleanup = QCheckBox("索引刷新后再次扫描并重试清理")
         self.queue_cleanup.setChecked(self.controller.config.cleanup_after_index)
+        self.queue_cleanup.setToolTip(
+            "索引刷新本身已自动清理两类受管快捷方式；勾选后会再运行一次独立清理，"
+            "用于复查或重试第一次删除失败的项目。"
+        )
         self.queue_pause_console = QCheckBox(
             "下载结束后保留黑框，查看统计后按任意键关闭（手动检查推荐）"
         )
         self.queue_pause_console.setChecked(True)
         form.addRow("截图归档", self.queue_screenshot_mode)
         form.addRow("索引刷新", self.queue_index_mode)
-        form.addRow("索引清理", self.queue_cleanup)
+        form.addRow("清理复查", self.queue_cleanup)
         form.addRow("结果查看", self.queue_pause_console)
         layout.addWidget(options)
         buttons = QHBoxLayout()
@@ -407,7 +411,11 @@ class MainWindow(QMainWindow):
         self.refresh_index_button = QPushButton("立即刷新索引")
         self.refresh_index_button.clicked.connect(self._refresh_index)
         buttons.addWidget(self.refresh_index_button)
-        self.cleanup_index_button = QPushButton("立即清理失效快捷方式")
+        self.cleanup_index_button = QPushButton("立即重新扫描并清理快捷方式")
+        self.cleanup_index_button.setToolTip(
+            "独立扫描并清理两类受管快捷方式，可用于不刷新索引时的维护，"
+            "或重试上次删除失败的项目。"
+        )
         self.cleanup_index_button.clicked.connect(self._cleanup_index)
         buttons.addWidget(self.cleanup_index_button)
         self.cleanup_test_button = QPushButton("安全自检清理功能")
@@ -459,13 +467,16 @@ class MainWindow(QMainWindow):
         self.setting_rest_seconds = self._spin(0, 86400, self.controller.config.rest_seconds)
         self.setting_screenshot_mode = self._post_combo(self.controller.config.screenshot_post_mode)
         self.setting_index_mode = self._post_combo(self.controller.config.index_post_mode)
-        self.setting_cleanup = QCheckBox("刷新索引后清理失效快捷方式")
+        self.setting_cleanup = QCheckBox("刷新索引后再次扫描并重试清理")
         self.setting_cleanup.setChecked(self.controller.config.cleanup_after_index)
+        self.setting_cleanup.setToolTip(
+            "刷新已自动清理；此选项会额外运行独立清理，用于复查或重试失败项。"
+        )
         form.addRow("每批账号数", self.setting_batch_accounts)
         form.addRow("暂停秒数", self.setting_rest_seconds)
         form.addRow("默认截图归档", self.setting_screenshot_mode)
         form.addRow("默认索引刷新", self.setting_index_mode)
-        form.addRow("默认索引清理", self.setting_cleanup)
+        form.addRow("默认清理复查", self.setting_cleanup)
         layout.addWidget(task_box)
         note = QLabel(
             "兼容版下载引擎会读取这里的批次和暂停数值；旧版仍按自身内置值运行。"
@@ -1096,7 +1107,10 @@ class MainWindow(QMainWindow):
     def _refresh_index(self) -> None:
         def show_result(result: object) -> None:
             if result is not None:
-                self.post_output.setPlainText("索引刷新完成。\n" + result.output)
+                details = ("\n\n详细输出：\n" + result.output) if result.output else ""
+                self.post_output.setPlainText(
+                    result.display_summary("索引刷新") + details
+                )
 
         self._run_index_background(
             self.controller.refresh_index,
@@ -1107,11 +1121,14 @@ class MainWindow(QMainWindow):
     def _cleanup_index(self) -> None:
         def show_result(result: object) -> None:
             if result is not None:
-                self.post_output.setPlainText("失效快捷方式清理完成。\n" + result.output)
+                details = ("\n\n详细输出：\n" + result.output) if result.output else ""
+                self.post_output.setPlainText(
+                    result.display_summary("失效快捷方式清理") + details
+                )
 
         self._run_index_background(
             self.controller.cleanup_index,
-            started_message="正在后台清理失效快捷方式，界面可以继续使用……",
+            started_message="正在后台重新扫描并清理受管快捷方式，界面可以继续使用……",
             success=show_result,
         )
 

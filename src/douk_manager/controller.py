@@ -320,12 +320,12 @@ class ManagerController:
 
     def refresh_index(self) -> IndexResult:
         result = self.indexer.refresh(self.paths.video_root, self.paths.index_root)
-        self.logger.info("索引刷新完成")
+        self.logger.info(result.display_summary("索引刷新"))
         return result
 
     def cleanup_index(self) -> IndexResult:
         result = self.indexer.cleanup(self.paths.video_root, self.paths.index_root)
-        self.logger.info("失效快捷方式清理完成")
+        self.logger.info(result.display_summary("失效快捷方式清理"))
         return result
 
     def cleanup_index_self_test(self) -> IndexResult:
@@ -339,9 +339,11 @@ class ManagerController:
             result = self.organize_screenshots()
             messages.append(f"截图归档：{result.moved}张")
         if self.config.index_post_mode == timing:
-            self.refresh_index()
-            messages.append("索引刷新：完成")
+            index_result = self.refresh_index()
+            messages.append(index_result.display_summary("索引刷新"))
             if self.config.cleanup_after_index:
-                self.cleanup_index()
-                messages.append("失效快捷方式清理：完成")
+                cleanup_result = self.cleanup_index()
+                messages.append(
+                    cleanup_result.display_summary("失效快捷方式清理")
+                )
         return messages
