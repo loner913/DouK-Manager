@@ -54,14 +54,19 @@ class IndexSummaryTests(unittest.TestCase):
             "保持不变1147",
             "空源文件夹87",
             "目标已移动或删除的文件夹3",
-            "计划7（空源目录对应4、目标不存在3）",
-            "实际删除6（空源目录对应4、目标不存在2）",
-            "失败1",
+            "空源目录对应快捷方式：发现4、实际删除4、剩余0",
+            "目标不存在的快捷方式：发现3、实际删除2、剩余1",
+            "快捷方式清理：计划7、实际删除6、删除失败1、读取失败0",
             r"删除来源仅限 F:\Douk videos",
         )
         for fragment in expected_fragments:
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, text)
+        self.assertGreaterEqual(text.count("\n"), 5)
+        self.assertIn("空源目录对应快捷方式：发现4、实际删除4、剩余0", text)
+        self.assertIn("目标不存在的快捷方式：发现3、实际删除2、剩余1", text)
+        for line in text.splitlines():
+            self.assertTrue(line.startswith("索引刷新："), line)
         self.assertNotIn("DOUK_INDEX_SUMMARY_JSON", visible)
         self.assertNotIn("源文件夹删除", text)
 
@@ -102,7 +107,8 @@ class IndexSummaryTests(unittest.TestCase):
         self.assertEqual(len(messages), 2)
         self.assertIn("索引刷新：快捷方式新建5", messages[0])
         self.assertIn("计划7", messages[0])
-        self.assertIn("失效快捷方式清理：源目录检查", messages[1])
+        self.assertIn("失效快捷方式清理：重新扫描完成", messages[1])
+        self.assertIn("源目录检查", messages[1])
         self.assertIn("实际删除6", messages[1])
 
 

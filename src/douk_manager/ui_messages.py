@@ -20,7 +20,7 @@ def format_information(
     merge: bool = False,
     include_date: bool = False,
 ) -> str:
-    """Add a real timestamp to every user-visible information entry."""
+    """Timestamp semantic lines; merge only when the caller marks one event."""
 
     lines = _message_lines(messages)
     if not lines:

@@ -320,12 +320,14 @@ class ManagerController:
 
     def refresh_index(self) -> IndexResult:
         result = self.indexer.refresh(self.paths.video_root, self.paths.index_root)
-        self.logger.info(result.display_summary("索引刷新"))
+        for line in result.display_lines("索引刷新"):
+            self.logger.info(line)
         return result
 
     def cleanup_index(self) -> IndexResult:
         result = self.indexer.cleanup(self.paths.video_root, self.paths.index_root)
-        self.logger.info(result.display_summary("失效快捷方式清理"))
+        for line in result.display_lines("失效快捷方式清理"):
+            self.logger.info(line)
         return result
 
     def cleanup_index_self_test(self) -> IndexResult:

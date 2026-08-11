@@ -61,8 +61,39 @@ class InformationFormattingTests(unittest.TestCase):
         self.assertIn('f"队列开始，共 {len(paths)} 个任务。"', gui_source)
         self.assertIn('f"本次执行顺序：{order_text}"', gui_source)
         self.assertIn(
-            "self._append_info(self.queue_output, assessment.headline, assessment.detail)",
+            "assessment.detail,\n            merge=True,",
             gui_source,
+        )
+        self.assertIn('self.controller.logger.info("队列后续动作：%s", line)', gui_source)
+        self.assertNotIn('post_summary = "；".join(messages)', gui_source)
+
+    def test_information_box_defaults_to_separate_events(self) -> None:
+        gui_source = (
+            Path(__file__).parents[1] / "src" / "douk_manager" / "gui.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "def _append_info(output: QTextEdit, *messages: object, merge: bool = False)",
+            gui_source,
+        )
+
+    def test_same_second_does_not_merge_different_operations(self) -> None:
+        text = format_information(
+            "截图归档：0张",
+            "索引刷新：新建0、更新0、保持不变1158",
+            "源目录检查：账号文件夹1245、空源文件夹87",
+            "失效快捷方式清理：实际删除0",
+            at=self.moment,
+        )
+
+        self.assertEqual(
+            text.splitlines(),
+            [
+                "[09:07:05] 截图归档：0张",
+                "[09:07:05] 索引刷新：新建0、更新0、保持不变1158",
+                "[09:07:05] 源目录检查：账号文件夹1245、空源文件夹87",
+                "[09:07:05] 失效快捷方式清理：实际删除0",
+            ],
         )
 
 

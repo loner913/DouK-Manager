@@ -20,39 +20,49 @@ class IndexResult:
     output: str
     summary: dict[str, Any] | None = None
 
-    def display_summary(self, title: str) -> str:
+    def display_lines(self, title: str) -> tuple[str, ...]:
         if self.summary is None:
-            return f"{title}：脚本执行完成，但未返回数字汇总"
+            return (f"{title}：脚本执行完成，但未返回数字汇总",)
 
         summary = self.summary
-        parts: list[str] = []
+        lines: list[str] = []
         if summary["Mode"] == "Refresh":
-            parts.append(
-                "快捷方式新建{Created}、更新{Updated}、保持不变{Unchanged}、"
+            lines.append(
+                f"{title}：快捷方式新建{{Created}}、更新{{Updated}}、保持不变{{Unchanged}}、"
                 "创建或更新失败{IndexFailures}".format(**summary)
             )
-        parts.extend(
+        else:
+            lines.append(f"{title}：重新扫描完成")
+        lines.extend(
             (
-                "源目录检查：账号文件夹{SourceFoldersScanned}、空源文件夹"
+                f"{title}：源目录检查：账号文件夹{{SourceFoldersScanned}}、空源文件夹"
                 "{EmptySourceFolders}（仅提示，需手动处理）、忽略非账号文件夹"
                 "{IgnoredSourceFolders}".format(**summary),
-                "目标已移动或删除的文件夹{MovedOrDeletedTargetFolders}".format(
+                f"{title}：目标已移动或删除的文件夹"
+                "{MovedOrDeletedTargetFolders}".format(
                     **summary
                 ),
-                "快捷方式删除：计划{PlannedShortcutDeletions}（空源目录对应"
-                "{EmptySourceShortcutsDetected}、目标不存在"
-                "{MissingTargetShortcutsDetected}），实际删除"
-                "{DeletedShortcutsTotal}（空源目录对应"
-                "{DeletedEmptySourceShortcuts}、目标不存在"
-                "{DeletedMissingTargetShortcuts}），失败"
-                "{ShortcutDeleteFailures}".format(**summary),
-                "清理后剩余：空源目录对应{RemainingEmptySourceShortcuts}、"
-                "目标不存在{RemainingMissingTargetShortcuts}；快捷方式读取失败"
-                "{ShortcutReadFailures}".format(**summary),
-                f"删除来源仅限 {summary['IndexRoot']} 顶层带 [DoukIndex] 标记的 .lnk",
+                f"{title}：空源目录对应快捷方式：发现"
+                "{EmptySourceShortcutsDetected}、"
+                "实际删除{DeletedEmptySourceShortcuts}、剩余"
+                "{RemainingEmptySourceShortcuts}".format(**summary),
+                f"{title}：目标不存在的快捷方式：发现"
+                "{MissingTargetShortcutsDetected}、"
+                "实际删除{DeletedMissingTargetShortcuts}、剩余"
+                "{RemainingMissingTargetShortcuts}".format(**summary),
+                f"{title}：快捷方式清理：计划{{PlannedShortcutDeletions}}、实际删除"
+                "{DeletedShortcutsTotal}、删除失败{ShortcutDeleteFailures}、"
+                "读取失败{ShortcutReadFailures}".format(**summary),
+                f"{title}：删除来源仅限 {summary['IndexRoot']} 顶层带 "
+                "[DoukIndex] 标记的 .lnk",
             )
         )
-        return f"{title}：" + "；".join(parts)
+        return tuple(lines)
+
+    def display_summary(self, title: str) -> str:
+        """Return semantic lines; the UI assigns a timestamp to every line."""
+
+        return "\n".join(self.display_lines(title))
 
 
 _SUMMARY_PREFIX = "DOUK_INDEX_SUMMARY_JSON="

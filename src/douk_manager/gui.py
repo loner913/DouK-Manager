@@ -544,7 +544,7 @@ class MainWindow(QMainWindow):
         return EarliestRule.from_text(value.text())
 
     @staticmethod
-    def _append_info(output: QTextEdit, *messages: object, merge: bool = True) -> None:
+    def _append_info(output: QTextEdit, *messages: object, merge: bool = False) -> None:
         text = format_information(*messages, merge=merge)
         if text:
             output.append(text)
@@ -967,6 +967,7 @@ class MainWindow(QMainWindow):
             self.queue_output,
             f"队列开始，共 {len(paths)} 个任务。",
             f"本次执行顺序：{order_text}",
+            merge=True,
         )
         self.controller.logger.info(
             "下载队列开始：任务数=%s；执行顺序=%s",
@@ -980,12 +981,21 @@ class MainWindow(QMainWindow):
             messages = self._run(
                 lambda: self.controller.run_post_actions("queue"), self.queue_output
             )
-            post_summary = "；".join(messages) if messages else "无"
             self.controller.logger.info(
                 "下载队列执行结束：所选下载器进程均正常退出；"
-                "后续动作=%s；账号下载结果需核对下载器原生日志",
-                post_summary,
+                "账号下载结果需核对下载器原生日志"
             )
+            post_lines = [
+                line.strip()
+                for message in (messages or [])
+                for line in str(message).splitlines()
+                if line.strip()
+            ]
+            if post_lines:
+                for line in post_lines:
+                    self.controller.logger.info("队列后续动作：%s", line)
+            else:
+                self.controller.logger.info("队列后续动作：无")
             final_message = (
                 "队列执行结束（仅表示所选下载器进程均已正常退出，"
                 "不代表每个账号均下载成功）。"
@@ -1018,7 +1028,12 @@ class MainWindow(QMainWindow):
             return
         code = self.queue_current.process.returncode
         assessment = assess_process_exit(code)
-        self._append_info(self.queue_output, assessment.headline, assessment.detail)
+        self._append_info(
+            self.queue_output,
+            assessment.headline,
+            assessment.detail,
+            merge=True,
+        )
         self.controller.logger.info(
             "下载进程已退出：模板=%s；已选账号=%s；PID=%s；"
             "退出码=%s；状态=%s",
