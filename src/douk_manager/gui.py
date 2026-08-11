@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, TypeVar
 
@@ -34,6 +35,7 @@ from douk_manager.controller import ManagerController
 from douk_manager.core.engine import assess_process_exit
 from douk_manager.core.settings_tasks import EarliestRule
 from douk_manager.core.task_order import move_to_index
+from douk_manager.ui_messages import format_information
 
 
 T = TypeVar("T")
@@ -82,7 +84,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._apply_style()
         startup_message = self.controller.try_startup_backup()
-        self.overview_output.setPlainText(startup_message)
+        self._replace_info(self.overview_output, startup_message)
         self.refresh_all()
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self._poll_processes)
@@ -541,6 +543,16 @@ class MainWindow(QMainWindow):
             return EarliestRule.empty()
         return EarliestRule.from_text(value.text())
 
+    @staticmethod
+    def _append_info(output: QTextEdit, *messages: object, merge: bool = True) -> None:
+        text = format_information(*messages, merge=merge)
+        if text:
+            output.append(text)
+
+    @staticmethod
+    def _replace_info(output: QTextEdit, *messages: object, merge: bool = False) -> None:
+        output.setPlainText(format_information(*messages, merge=merge))
+
     def _run(self, action: Callable[[], T], output: QTextEdit | None = None) -> T | None:
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
@@ -550,7 +562,7 @@ class MainWindow(QMainWindow):
             message = str(exc)
             self.controller.logger.exception("界面操作失败：%s", message)
             if output is not None:
-                output.append("【失败】" + message)
+                self._append_info(output, "【失败】" + message)
             self.statusBar().showMessage("操作失败")
             QMessageBox.critical(self, "操作失败", message)
             return None
@@ -566,10 +578,10 @@ class MainWindow(QMainWindow):
         success: Callable[[object], None],
     ) -> None:
         if self.background_thread is not None and self.background_thread.isRunning():
-            self.post_output.append("已有索引任务正在运行，请等待完成。")
+            self._append_info(self.post_output, "已有索引任务正在运行，请等待完成。")
             return
 
-        self.post_output.setPlainText(started_message)
+        self._replace_info(self.post_output, started_message)
         self.statusBar().showMessage(started_message)
         self.refresh_index_button.setEnabled(False)
         self.cleanup_index_button.setEnabled(False)
@@ -602,7 +614,7 @@ class MainWindow(QMainWindow):
                     "后台索引操作失败：%s", message, exc_info=worker.error
                 )
                 if self.background_output is not None:
-                    self.background_output.append("【失败】" + message)
+                    self._append_info(self.background_output, "【失败】" + message)
                 self.statusBar().showMessage("操作失败")
                 QMessageBox.critical(self, "操作失败", message)
             elif self.background_success is not None:
@@ -767,8 +779,9 @@ class MainWindow(QMainWindow):
                 if Path(item.data(Qt.UserRole)) == selected_path:
                     self.task_list.setCurrentItem(item)
                     break
-            self.queue_output.append(
-                f"已将 {selected_path.name} 移到第 {target + 1} 位并保存。"
+            self._append_info(
+                self.queue_output,
+                f"已将 {selected_path.name} 移到第 {target + 1} 位并保存。",
             )
 
     def _restore_task_order(self) -> None:
@@ -782,7 +795,9 @@ class MainWindow(QMainWindow):
         result = self._run(self.controller.restore_task_order, self.queue_output)
         if result is not None:
             self.refresh_tasks()
-            self.queue_output.append("已恢复按任务首个 A 编号排序，并清除人工槽位顺序。")
+            self._append_info(
+                self.queue_output, "已恢复按任务首个 A 编号排序，并清除人工槽位顺序。"
+            )
 
     def _task_check_changed(self, item: QListWidgetItem) -> None:
         path_text = item.data(Qt.UserRole)
@@ -804,19 +819,16 @@ class MainWindow(QMainWindow):
             self.task_output,
         )
         if preview:
-            self.task_output.setPlainText(
-                "\n".join(
-                    (
-                        f"标准化选择：{preview.compact}",
-                        f"主档位置总数：{preview.total_positions}",
-                        f"选中位置：{preview.selected_positions}",
-                        f"有效URL：{preview.selected_valid_urls}",
-                        f"空白URL位置：{preview.selected_blank_urls}",
-                        f"其他位置将设为 false：{preview.unselected_positions}",
-                        f"重复编号：{len(preview.selection.duplicate_numbers)}",
-                        "主档 enable：不会修改",
-                    )
-                )
+            self._replace_info(
+                self.task_output,
+                f"标准化选择：{preview.compact}",
+                f"主档位置总数：{preview.total_positions}",
+                f"选中位置：{preview.selected_positions}",
+                f"有效URL：{preview.selected_valid_urls}",
+                f"空白URL位置：{preview.selected_blank_urls}",
+                f"其他位置将设为 false：{preview.unselected_positions}",
+                f"重复编号：{len(preview.selection.duplicate_numbers)}",
+                "主档 enable：不会修改",
             )
 
     def _create_task(self, activate: bool, start: bool) -> None:
@@ -832,12 +844,15 @@ class MainWindow(QMainWindow):
             self.task_output,
         )
         if result:
-            self.task_output.append(f"任务文件：{result.task_path}")
-            self.task_output.append(f"账号范围：{result.preview.compact}")
+            messages: list[object] = [
+                f"任务文件：{result.task_path}",
+                f"账号范围：{result.preview.compact}",
+            ]
             if result.backup_path:
-                self.task_output.append(f"修改前关键文件备份：{result.backup_path}")
+                messages.append(f"修改前关键文件备份：{result.backup_path}")
             if activate:
-                self.task_output.append(f"已激活：{self.controller.paths.active_settings}")
+                messages.append(f"已激活：{self.controller.paths.active_settings}")
+            self._append_info(self.task_output, *messages)
             if start:
                 run = self._run(
                     lambda: self.controller.start_current_download(
@@ -850,7 +865,9 @@ class MainWindow(QMainWindow):
                     self.queue_active = True
                     self.queue_current = run
                     self.queue_pending = []
-                    self.task_output.append(f"下载引擎已启动，PID={run.process.pid}")
+                    self._append_info(
+                        self.task_output, f"下载引擎已启动，PID={run.process.pid}"
+                    )
 
     def _create_task_template(self) -> None:
         self._create_task(False, False)
@@ -875,7 +892,7 @@ class MainWindow(QMainWindow):
         if result is not None:
             lines = [f"已生成 {len(result)} 个任务："]
             lines.extend(f"{item.task_path.name}：{item.preview.selected_positions}个位置" for item in result)
-            self.batch_output.setPlainText("\n".join(lines))
+            self._replace_info(self.batch_output, *lines)
             self.refresh_tasks()
 
     def _selected_task_paths(self) -> list[Path]:
@@ -894,10 +911,11 @@ class MainWindow(QMainWindow):
             return
         result = self._run(lambda: self.controller.activate_task(paths[0]), self.queue_output)
         if result:
-            self.queue_output.append(
-                f"已将模板 {paths[0].name} 复制为正式 settings.json。"
+            self._append_info(
+                self.queue_output,
+                f"已将模板 {paths[0].name} 复制为正式 settings.json。",
+                "任务模板仍永久保留，以后可以再次勾选复用。",
             )
-            self.queue_output.append("任务模板仍永久保留，以后可以再次勾选复用。")
 
     def _apply_queue_options(self) -> bool:
         values = {
@@ -926,7 +944,9 @@ class MainWindow(QMainWindow):
             self.queue_active = True
             self.queue_current = run
             self.queue_pending = []
-            self.queue_output.append(f"启动当前 settings.json，PID={run.process.pid}")
+            self._append_info(
+                self.queue_output, f"启动当前 settings.json，PID={run.process.pid}"
+            )
 
     def _start_queue(self) -> None:
         if self.queue_active:
@@ -942,9 +962,12 @@ class MainWindow(QMainWindow):
             return
         self.queue_pending = paths
         self.queue_active = True
-        self.queue_output.append(f"队列开始，共 {len(paths)} 个任务。")
         order_text = " → ".join(path.name for path in paths)
-        self.queue_output.append(f"本次执行顺序：{order_text}")
+        self._append_info(
+            self.queue_output,
+            f"队列开始，共 {len(paths)} 个任务。",
+            f"本次执行顺序：{order_text}",
+        )
         self.controller.logger.info(
             "下载队列开始：任务数=%s；执行顺序=%s",
             len(paths),
@@ -957,18 +980,17 @@ class MainWindow(QMainWindow):
             messages = self._run(
                 lambda: self.controller.run_post_actions("queue"), self.queue_output
             )
-            if messages:
-                self.queue_output.append("；".join(messages))
             post_summary = "；".join(messages) if messages else "无"
             self.controller.logger.info(
                 "下载队列执行结束：所选下载器进程均正常退出；"
                 "后续动作=%s；账号下载结果需核对下载器原生日志",
                 post_summary,
             )
-            self.queue_output.append(
+            final_message = (
                 "队列执行结束（仅表示所选下载器进程均已正常退出，"
                 "不代表每个账号均下载成功）。"
             )
+            self._append_info(self.queue_output, *(messages or []), final_message)
             self.queue_active = False
             self.queue_current = None
             return
@@ -984,7 +1006,8 @@ class MainWindow(QMainWindow):
             self.queue_pending.clear()
             return
         self.queue_current = run
-        self.queue_output.append(
+        self._append_info(
+            self.queue_output,
             f"正在运行：{path.name}；PID={run.process.pid}；剩余={len(self.queue_pending)}"
         )
 
@@ -995,8 +1018,7 @@ class MainWindow(QMainWindow):
             return
         code = self.queue_current.process.returncode
         assessment = assess_process_exit(code)
-        self.queue_output.append(assessment.headline)
-        self.queue_output.append(assessment.detail)
+        self._append_info(self.queue_output, assessment.headline, assessment.detail)
         self.controller.logger.info(
             "下载进程已退出：模板=%s；已选账号=%s；PID=%s；"
             "退出码=%s；状态=%s",
@@ -1008,10 +1030,21 @@ class MainWindow(QMainWindow):
         )
         try:
             with self.queue_current.task_log.open("a", encoding="utf-8") as handle:
-                handle.write(f"Exited: code={code}\n")
-                handle.write(f"Process status: {assessment.log_status}\n")
+                log_messages = [
+                    f"Exited: code={code}",
+                    f"Process status: {assessment.log_status}",
+                ]
                 if assessment.normal_exit:
-                    handle.write("Download result: unverified\n")
+                    log_messages.append("Download result: unverified")
+                handle.write(
+                    format_information(
+                        *log_messages,
+                        at=datetime.now(),
+                        merge=True,
+                        include_date=True,
+                    )
+                    + "\n"
+                )
         except OSError:
             self.controller.logger.exception("写入下载任务退出日志失败")
         if not assessment.normal_exit:
@@ -1021,7 +1054,7 @@ class MainWindow(QMainWindow):
             return
         messages = self._run(lambda: self.controller.run_post_actions("batch"), self.queue_output)
         if messages:
-            self.queue_output.append("；".join(messages))
+            self._append_info(self.queue_output, *messages)
         self.queue_current = None
         self._start_next_queue_item()
 
@@ -1039,78 +1072,73 @@ class MainWindow(QMainWindow):
             return
         result = self._run(self.controller.backup_now, self.overview_output)
         if result:
-            self.overview_output.append(f"完整 Volume 备份完成：{result}")
+            self._append_info(self.overview_output, f"完整 Volume 备份完成：{result}")
 
     def _migrate_collector(self) -> None:
         result = self._run(self.controller.migrate_collector, self.collector_output)
         if result:
-            self.collector_output.setPlainText(
-                "\n".join(
-                    (
-                        "旧采集器数据复制完成（源文件未删除）。",
-                        "已复制：" + ("、".join(result.copied_files) or "无"),
-                        "已跳过：" + ("、".join(result.skipped_files) or "无"),
-                        f"复制截图：{result.copied_screenshots}",
-                        f"跳过同名截图：{result.skipped_screenshots}",
-                        f"Excel 对齐：A{result.excel_original_max} → A{result.excel_final_max}",
-                        f"Excel 新增行：{result.excel_rows_added}",
-                        (
-                            "历史链接写法差异："
-                            f"{result.excel_existing_url_differences} 行（已原样保留）"
-                        ),
-                        "settings_master.json 未复制，采集器将直接使用唯一正式主档。",
-                    )
-                )
+            self._replace_info(
+                self.collector_output,
+                "旧采集器数据复制完成（源文件未删除）。",
+                "已复制：" + ("、".join(result.copied_files) or "无"),
+                "已跳过：" + ("、".join(result.skipped_files) or "无"),
+                f"复制截图：{result.copied_screenshots}",
+                f"跳过同名截图：{result.skipped_screenshots}",
+                f"Excel 对齐：A{result.excel_original_max} → A{result.excel_final_max}",
+                f"Excel 新增行：{result.excel_rows_added}",
+                (
+                    "历史链接写法差异："
+                    f"{result.excel_existing_url_differences} 行（已原样保留）"
+                ),
+                "settings_master.json 未复制，采集器将直接使用唯一正式主档。",
             )
 
     def _start_collector(self) -> None:
         result = self._run(self.controller.start_collector, self.collector_output)
         if result:
-            self.collector_output.append(
+            self._append_info(
+                self.collector_output,
                 "账号采集服务已启动，并已通过 "
-                f"http://127.0.0.1:{self.controller.config.collector_port}/health 验证。"
+                f"http://127.0.0.1:{self.controller.config.collector_port}/health 验证。",
+                f"采集服务日志：{result}",
             )
-            self.collector_output.append(f"采集服务日志：{result}")
 
     def _stop_collector(self) -> None:
         self.controller.stop_collector()
-        self.collector_output.append("账号采集服务已停止。")
+        self._append_info(self.collector_output, "账号采集服务已停止。")
         self.refresh_all()
 
     def _export_userscript(self) -> None:
         result = self._run(self.controller.collector.export_userscript, self.collector_output)
         if result:
-            self.collector_output.append(f"油猴脚本已导出：{result}")
+            self._append_info(self.collector_output, f"油猴脚本已导出：{result}")
             self._open_path(result.parent)
 
     def _preview_screenshots(self) -> None:
         result = self._run(self.controller.screenshot_preview, self.post_output)
         if result:
-            self.post_output.setPlainText(
-                "\n".join(
-                    (
-                        f"识别账号文件夹：{result.recognized_folders}",
-                        f"识别截图：{result.recognized_images}",
-                        f"可以安全归档：{result.movable}",
-                        f"找不到账号文件夹：{result.missing_account_folder}",
-                        f"目标已有同名文件：{result.already_existing}",
-                        f"忽略非规范账号文件夹：{result.unmatched_folders}",
-                    )
-                )
+            self._replace_info(
+                self.post_output,
+                f"识别账号文件夹：{result.recognized_folders}",
+                f"识别截图：{result.recognized_images}",
+                f"可以安全归档：{result.movable}",
+                f"找不到账号文件夹：{result.missing_account_folder}",
+                f"目标已有同名文件：{result.already_existing}",
+                f"忽略非规范账号文件夹：{result.unmatched_folders}",
             )
 
     def _organize_screenshots(self) -> None:
         result = self._run(self.controller.organize_screenshots, self.post_output)
         if result:
-            self.post_output.append(f"完成：安全归档 {result.moved} 张。")
+            self._append_info(self.post_output, f"完成：安全归档 {result.moved} 张。")
 
     def _refresh_index(self) -> None:
         def show_result(result: object) -> None:
             if result is not None:
-                details = ("\n\n详细输出：\n" + result.output) if result.output else ""
-                self.post_output.setPlainText(
-                    result.display_summary("索引刷新") + details
-                )
+                messages = [result.display_summary("索引刷新")]
+                if result.output:
+                    messages.extend(("详细输出：", result.output))
+                self._replace_info(self.post_output, *messages)
 
         self._run_index_background(
             self.controller.refresh_index,
@@ -1121,10 +1149,10 @@ class MainWindow(QMainWindow):
     def _cleanup_index(self) -> None:
         def show_result(result: object) -> None:
             if result is not None:
-                details = ("\n\n详细输出：\n" + result.output) if result.output else ""
-                self.post_output.setPlainText(
-                    result.display_summary("失效快捷方式清理") + details
-                )
+                messages = [result.display_summary("失效快捷方式清理")]
+                if result.output:
+                    messages.extend(("详细输出：", result.output))
+                self._replace_info(self.post_output, *messages)
 
         self._run_index_background(
             self.controller.cleanup_index,
@@ -1135,9 +1163,10 @@ class MainWindow(QMainWindow):
     def _cleanup_index_self_test(self) -> None:
         def show_result(result: object) -> None:
             if result is not None:
-                self.post_output.setPlainText(
-                    "清理功能隔离自检通过。正式视频目录和索引目录均未参与测试。\n"
-                    + result.output
+                self._replace_info(
+                    self.post_output,
+                    "清理功能隔离自检通过。正式视频目录和索引目录均未参与测试。",
+                    result.output,
                 )
 
         self._run_index_background(
@@ -1162,7 +1191,7 @@ class MainWindow(QMainWindow):
         }
         result = self._run(lambda: self.controller.reconfigure(values), self.settings_output)
         if result:
-            self.settings_output.setPlainText(result)
+            self._replace_info(self.settings_output, result)
             self.queue_screenshot_mode.setCurrentIndex(self.setting_screenshot_mode.currentIndex())
             self.queue_index_mode.setCurrentIndex(self.setting_index_mode.currentIndex())
             self.queue_cleanup.setChecked(self.setting_cleanup.isChecked())
@@ -1191,20 +1220,17 @@ class MainWindow(QMainWindow):
         )
         if result:
             packaged_volume = "有（安装时会丢弃，绝不覆盖正式 Volume）" if result.contains_packaged_volume else "无"
-            self.settings_output.setPlainText(
-                "\n".join(
-                    (
-                        "更新包只读预检通过。",
-                        f"ZIP：{result.archive}",
-                        f"SHA-256：{result.archive_sha256}",
-                        f"包内根目录：{result.package_prefix}",
-                        f"文件数：{result.file_count}",
-                        f"解压大小：{result.uncompressed_bytes / 1024 / 1024:.1f} MB",
-                        f"main.exe：{result.main_exe_bytes / 1024 / 1024:.1f} MB",
-                        f"包内 Volume：{packaged_volume}",
-                        "当前正式 Volume 尚未修改。",
-                    )
-                )
+            self._replace_info(
+                self.settings_output,
+                "更新包只读预检通过。",
+                f"ZIP：{result.archive}",
+                f"SHA-256：{result.archive_sha256}",
+                f"包内根目录：{result.package_prefix}",
+                f"文件数：{result.file_count}",
+                f"解压大小：{result.uncompressed_bytes / 1024 / 1024:.1f} MB",
+                f"main.exe：{result.main_exe_bytes / 1024 / 1024:.1f} MB",
+                f"包内 Volume：{packaged_volume}",
+                "当前正式 Volume 尚未修改。",
             )
 
     def _apply_engine_update(self) -> None:
@@ -1230,20 +1256,17 @@ class MainWindow(QMainWindow):
             lambda: self.controller.apply_engine_update(archive), self.settings_output
         )
         if result:
-            self.settings_output.setPlainText(
-                "\n".join(
-                    (
-                        "下载引擎安全更新完成。",
-                        f"更新前永久备份：{result.backup_path}",
-                        f"旧引擎回退目录：{result.rollback_path}",
-                        f"旧 main.exe：{result.old_main_sha256}",
-                        f"新 main.exe：{result.new_main_sha256}",
-                        "settings_master.json：哈希一致",
-                        "settings.json：哈希一致",
-                        "DouK-Downloader.db：哈希一致且 quick_check=ok",
-                        "现在可以通过下载队列启动兼容版下载引擎。",
-                    )
-                )
+            self._replace_info(
+                self.settings_output,
+                "下载引擎安全更新完成。",
+                f"更新前永久备份：{result.backup_path}",
+                f"旧引擎回退目录：{result.rollback_path}",
+                f"旧 main.exe：{result.old_main_sha256}",
+                f"新 main.exe：{result.new_main_sha256}",
+                "settings_master.json：哈希一致",
+                "settings.json：哈希一致",
+                "DouK-Downloader.db：哈希一致且 quick_check=ok",
+                "现在可以通过下载队列启动兼容版下载引擎。",
             )
 
     def _browse_dir(self, edit: QLineEdit) -> None:

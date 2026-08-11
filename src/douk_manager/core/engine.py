@@ -10,6 +10,7 @@ from douk_manager.config import AppConfig, ManagedPaths
 from douk_manager.core.backup import BackupService
 from douk_manager.core.json_store import read_json
 from douk_manager.core.locks import critical_section
+from douk_manager.ui_messages import format_information
 
 
 class EngineError(RuntimeError):
@@ -180,28 +181,30 @@ class EngineService:
             self.paths.logs
             / f"DownloadTask_{datetime.now():%Y-%m-%d_%H-%M-%S-%f}.log"
         )
+        started_at = datetime.now()
         task_log.write_text(
-            "\n".join(
-                (
-                    f"Started: {datetime.now().isoformat(timespec='seconds')}",
-                    "Log scope: one downloader process",
-                    f"Task template: {display_template}",
-                    f"Engine: {self.paths.engine_exe}",
-                    f"Active settings: {self.paths.active_settings}",
-                    "run_command: 5 1 1 Q",
-                    f"Selected accounts: {selected_accounts}",
-                    f"Pause every accounts: {self.config.batch_accounts}",
-                    f"Pause seconds: {self.config.rest_seconds}",
-                    f"Pause after exit: {pause_after_exit}",
-                    f"Backup: {snapshot}",
-                    "",
-                )
-            ),
+            format_information(
+                "Started",
+                "Log scope: one downloader process",
+                f"Task template: {display_template}",
+                f"Engine: {self.paths.engine_exe}",
+                f"Active settings: {self.paths.active_settings}",
+                "run_command: 5 1 1 Q",
+                f"Selected accounts: {selected_accounts}",
+                f"Pause every accounts: {self.config.batch_accounts}",
+                f"Pause seconds: {self.config.rest_seconds}",
+                f"Pause after exit: {pause_after_exit}",
+                f"Backup: {snapshot}",
+                at=started_at,
+                merge=True,
+                include_date=True,
+            )
+            + "\n",
             encoding="utf-8",
         )
         self.current = EngineRun(
             process=process,
-            started_at=datetime.now(),
+            started_at=started_at,
             task_log=task_log,
             pause_after_exit=pause_after_exit,
             task_template=display_template,
