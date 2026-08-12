@@ -42,6 +42,22 @@ class NativeLogLocatorTests(unittest.TestCase):
             )
             self.assertEqual(list(log_dir.iterdir()), [native])
 
+    def test_new_empty_log_is_a_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_dir = Path(directory)
+            before = snapshot_native_logs(log_dir)
+            native = log_dir / "empty.log"
+            native.touch()
+            os.utime(native, (START.timestamp(), START.timestamp()))
+
+            result = locate_native_logs(before, log_dir, START, END, 1)
+
+            self.assertTrue(result.reliable)
+            self.assertEqual(
+                result.segments,
+                (NativeLogSegment(native.resolve(), 0, 0),),
+            )
+
     def test_grown_existing_log_starts_at_old_byte_offset(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             log_dir = Path(directory)
@@ -112,6 +128,27 @@ class NativeLogLocatorTests(unittest.TestCase):
 
             self.assertTrue(result.reliable)
             self.assertEqual(result.segments[0].path, first.resolve())
+
+    def test_anchor_after_first_64_kib_does_not_resolve_ambiguity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_dir = Path(directory)
+            before = snapshot_native_logs(log_dir)
+            first = log_dir / "late-anchor.log"
+            second = log_dir / "no-anchor.log"
+            first.write_bytes(
+                b"x" * (64 * 1024) + "共有 2 个账号的作品等待下载\n".encode("utf-8")
+            )
+            second.write_bytes(b"no task anchor\n")
+            os.utime(first, (START.timestamp(), START.timestamp()))
+            os.utime(second, (START.timestamp(), START.timestamp()))
+
+            result = locate_native_logs(before, log_dir, START, END, 2)
+
+            self.assertFalse(result.reliable)
+            self.assertEqual(
+                result.reason,
+                "存在多个候选原生日志，无法唯一确定本次日志。",
+            )
 
 
 if __name__ == "__main__":

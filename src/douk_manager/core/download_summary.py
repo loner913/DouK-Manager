@@ -96,9 +96,12 @@ def locate_native_logs(
             if stat.st_mtime < earliest_mtime:
                 continue
             state = before_by_path.get(str(resolved).casefold())
-            offset = state.size if state is not None else 0
-            if stat.st_size > offset:
-                candidates.append(NativeLogSegment(resolved, offset, stat.st_size - offset))
+            if state is None:
+                candidates.append(NativeLogSegment(resolved, 0, stat.st_size))
+            elif stat.st_size > state.size:
+                candidates.append(
+                    NativeLogSegment(resolved, state.size, stat.st_size - state.size)
+                )
 
     if len(candidates) == 1:
         return LocatedNativeLogs(tuple(candidates), "size-delta", True)
