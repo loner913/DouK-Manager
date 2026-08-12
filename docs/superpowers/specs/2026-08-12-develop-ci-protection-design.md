@@ -31,9 +31,11 @@ these triggers:
 | `workflow_dispatch` | selected ref | run tests, build the portable package, and upload it for explicit acceptance |
 | `push` | `main` | no routine workflow run; formal release automation will be designed separately for v0.2.0 |
 
-Path filters remain for source, resources, tests, package metadata, the spec,
-and the workflow itself. Documentation-only changes outside the workflow and
-its design do not spend a Windows runner.
+Pull requests do not use path filters because a skipped workflow would leave a
+required check pending and make the pull request impossible to merge. Push
+builds retain filters for source, resources, tests, package metadata, the spec,
+and the workflow itself, so unrelated documentation changes do not create a
+new Windows package.
 
 Testing and packaging use separate jobs. The packaging job depends on the test
 job and runs only for `develop` pushes or manual dispatches. The ZIP remains

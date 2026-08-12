@@ -1,9 +1,11 @@
-name: 构建 Windows 便携版
+name: Develop CI
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [develop]
   push:
-    branches: [main]
+    branches: [develop]
     paths:
       - "src/**"
       - "resources/**"
@@ -12,35 +14,69 @@ on:
       - "pyproject.toml"
       - "DouKManager.spec"
       - ".github/workflows/build-windows.yml"
+      - "docs/superpowers/specs/**"
 
 permissions:
   contents: read
 
 jobs:
-  test-and-build:
+  test:
+    name: Test
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 获取源码
+        uses: actions/checkout@v7
+
+      - name: 配置 Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装测试依赖
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+
+      - name: 自动测试
+        shell: pwsh
+        run: python -m unittest discover -s tests -v
+
+  package:
+    name: Windows portable package
+    needs: test
+    if: github.event_name != 'pull_request'
     runs-on: windows-latest
     timeout-minutes: 45
 
     steps:
       - name: 获取源码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 配置 Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
 
-      - name: 安装依赖
+      - name: 安装构建依赖
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e .
           python -m pip install pyinstaller
 
-      - name: 自动测试
+      - name: 生成构建标识
+        id: identity
         shell: pwsh
-        run: python -m unittest discover -s tests -v
+        run: |
+          $shortSha = "${{ github.sha }}".Substring(0, 7)
+          $safeRef = "${{ github.ref_name }}" -replace '[^A-Za-z0-9._-]', '-'
+          "sha=$shortSha" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "ref=$safeRef" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: 构建便携版
         shell: pwsh
@@ -49,11 +85,10 @@ jobs:
       - name: 写入构建信息
         shell: pwsh
         run: |
-          $commit = "${{ github.sha }}".Substring(0, 7)
           $text = @(
             "DouK 全流程一体化管理器"
             "Version: 0.1.1"
-            "Commit: $commit"
+            "Commit: ${{ steps.identity.outputs.sha }}"
             "Built: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss K')"
           )
           Set-Content -LiteralPath "dist\DouK-Manager\BUILD-INFO.txt" -Value $text -Encoding UTF8
@@ -63,10 +98,9 @@ jobs:
         run: Compress-Archive -Path "dist\DouK-Manager\*" -DestinationPath "DouK-Manager_Windows_X64.zip" -Force
 
       - name: 上传构建结果
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: DouK-Manager_Windows_X64
+          name: DouK-Manager_Windows_X64-${{ steps.identity.outputs.ref }}-run-${{ github.run_number }}-${{ steps.identity.outputs.sha }}
           path: DouK-Manager_Windows_X64.zip
           if-no-files-found: error
-          retention-days: 90
-
+          retention-days: 30
