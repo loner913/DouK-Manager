@@ -76,7 +76,12 @@ git commit -m "test: define develop CI policy"
 
 - [ ] **Step 1: Change triggers and split jobs**
 
-Set `pull_request.branches` and `push.branches` to `[develop]`, preserve `workflow_dispatch`, and keep relevant path filters on pull requests and pushes. Rename the workflow to `Develop CI` and add a `test` job named `Test` that installs the existing project dependencies and runs:
+Set `pull_request.branches` and `push.branches` to `[develop]` and preserve
+`workflow_dispatch`. Do not apply path filters to pull requests because a
+skipped required workflow would block merging indefinitely. Retain relevant
+path filters for `develop` pushes so documentation-only merges do not create a
+package. Rename the workflow to `Develop CI` and add a `test` job named `Test`
+that installs the existing project dependencies and runs:
 
 ```powershell
 python -m unittest discover -s tests -v
@@ -100,7 +105,9 @@ retention-days: 30
 
 - [ ] **Step 3: Remove the Actions runtime warning**
 
-Use the latest stable major versions supported by GitHub-hosted runners for checkout and setup-python, while retaining `actions/upload-artifact@v4` unless GitHub documents a newer stable major.
+Use `actions/checkout@v7`, `actions/setup-python@v7`, and
+`actions/upload-artifact@v7`, which are the latest stable majors confirmed from
+their official GitHub releases on 2026-08-12.
 
 - [ ] **Step 4: Run focused and full tests**
 

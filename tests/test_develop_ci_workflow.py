@@ -30,6 +30,11 @@ class DevelopCiWorkflowTests(unittest.TestCase):
         )
         self.assertIn("workflow_dispatch:", self.workflow)
 
+        pull_request_block = self.workflow.split("  pull_request:", 1)[1].split(
+            "  push:", 1
+        )[0]
+        self.assertNotIn("paths:", pull_request_block)
+
     def test_test_job_has_stable_name_and_read_only_permissions(self) -> None:
         self.assertRegex(self.workflow, r"(?m)^name: Develop CI$")
         self.assertRegex(
@@ -56,9 +61,9 @@ class DevelopCiWorkflowTests(unittest.TestCase):
         self.assertIn("retention-days: 30", self.workflow)
 
     def test_official_actions_do_not_use_node20_generations(self) -> None:
-        self.assertIn("actions/checkout@v5", self.workflow)
-        self.assertIn("actions/setup-python@v6", self.workflow)
-        self.assertIn("actions/upload-artifact@v4", self.workflow)
+        self.assertIn("actions/checkout@v7", self.workflow)
+        self.assertIn("actions/setup-python@v7", self.workflow)
+        self.assertIn("actions/upload-artifact@v7", self.workflow)
         self.assertIsNone(re.search(r"actions/checkout@v4", self.workflow))
         self.assertIsNone(re.search(r"actions/setup-python@v5", self.workflow))
 
