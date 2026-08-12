@@ -194,7 +194,7 @@ class EngineService:
             finally:
                 engine_mutex.close()
         task_log = (
-            self.paths.logs
+            self.paths.download_task_logs
             / f"DownloadTask_{datetime.now():%Y-%m-%d_%H-%M-%S-%f}.log"
         )
         started_at = datetime.now()

@@ -54,13 +54,24 @@ class CollectorStartupTests(unittest.TestCase):
                 return_value=process,
             ) as popen, patch("douk_manager.integrations.collector.time.sleep"):
                 service.start()
-            self.assertTrue(service.running)
-            self.assertIsNotNone(service.last_log_path)
-            child_env = popen.call_args.kwargs["env"]
-            self.assertEqual(child_env["PYTHONIOENCODING"], "utf-8")
-            self.assertEqual(child_env["PYTHONUTF8"], "1")
-            self.assertEqual(child_env["DOUK_GLOBAL_LOCK_PATH"], str(service.paths.lock_file))
-            service.stop()
+            try:
+                self.assertTrue(service.running)
+                self.assertIsNotNone(service.last_log_path)
+                self.assertEqual(
+                    service.last_log_path.parent, service.paths.collector_logs
+                )
+                self.assertRegex(
+                    service.last_log_path.name,
+                    r"^Collector_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.log$",
+                )
+                child_env = popen.call_args.kwargs["env"]
+                self.assertEqual(child_env["PYTHONIOENCODING"], "utf-8")
+                self.assertEqual(child_env["PYTHONUTF8"], "1")
+                self.assertEqual(
+                    child_env["DOUK_GLOBAL_LOCK_PATH"], str(service.paths.lock_file)
+                )
+            finally:
+                service.stop()
 
     def test_early_process_exit_includes_log_and_exit_code(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

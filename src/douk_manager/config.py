@@ -71,6 +71,11 @@ class ManagedPaths:
     data: Path
     config_file: Path
     logs: Path
+    manager_logs: Path
+    collector_logs: Path
+    download_task_logs: Path
+    index_refresh_logs: Path
+    index_cleanup_logs: Path
     backups: Path
     tasks: Path
     updates: Path
@@ -95,11 +100,17 @@ class ManagedPaths:
         engine_root = engine_exe.parent
         volume = engine_root / "_internal" / "Volume"
         collector_data = data / "Collector"
+        logs = app_root / "Logs"
         return cls(
             root=app_root,
             data=data,
             config_file=data / "app_config.json",
-            logs=app_root / "Logs",
+            logs=logs,
+            manager_logs=logs / "Manager",
+            collector_logs=logs / "Collector",
+            download_task_logs=logs / "DownloadTasks",
+            index_refresh_logs=logs / "IndexRefresh",
+            index_cleanup_logs=logs / "IndexCleanup",
             backups=app_root / "Backups",
             tasks=data / "Tasks",
             updates=app_root / "Updates",
@@ -121,6 +132,11 @@ class ManagedPaths:
         for path in (
             self.data,
             self.logs,
+            self.manager_logs,
+            self.collector_logs,
+            self.download_task_logs,
+            self.index_refresh_logs,
+            self.index_cleanup_logs,
             self.backups,
             self.tasks,
             self.updates,
