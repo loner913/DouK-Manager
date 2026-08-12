@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import os
 import subprocess
+import ctypes
+import hashlib
+from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -82,6 +85,8 @@ class EngineService:
     def external_running(self) -> bool:
         if self.current and self.current.running:
             return True
+        if _windows_engine_mutex_exists(self.paths.engine_exe):
+            return True
         if os.name != "nt" or not self.paths.engine_exe.name:
             return False
         escaped_name = self.paths.engine_exe.name.replace("'", "''")
@@ -140,43 +145,54 @@ class EngineService:
             task_template.name if task_template else "current settings.json"
         )
         with critical_section(self.paths.lock_file):
-            selected_accounts = self.validate_ready()
-            snapshot = self.backup.create_critical_snapshot(
-                "BeforeDownload",
-                {
-                    "task_template": display_template,
-                    "selected_accounts": selected_accounts,
-                    "batch_accounts": self.config.batch_accounts,
-                    "rest_seconds": self.config.rest_seconds,
-                    "run_command": "5 1 1 Q",
-                    "pause_after_exit": pause_after_exit,
-                },
-                keep_latest=5,
-            )
-        env = os.environ.copy()
-        env["DOUK_ACCOUNT_BATCH_SIZE"] = str(self.config.batch_accounts)
-        env["DOUK_ACCOUNT_REST_SECONDS"] = str(self.config.rest_seconds)
-        env["DOUK_MANAGER_BACKUP"] = str(snapshot)
-        creationflags = 0
-        command = [str(self.paths.engine_exe)]
-        if os.name == "nt":
-            creationflags = subprocess.CREATE_NEW_CONSOLE
-            if pause_after_exit:
-                command = [
-                    "cmd.exe",
-                    "/d",
-                    "/c",
-                    str(self._write_pause_wrapper()),
-                ]
-        try:
-            process = subprocess.Popen(
-                command,
-                cwd=str(self.paths.engine_root),
-                env=env,
-                creationflags=creationflags,
-            )
-        except OSError as exc:
-            raise EngineError(f"无法启动下载引擎：{exc}") from exc
+            if self.external_running():
+                raise EngineError("下载引擎已经在运行。")
+            engine_mutex = _WindowsEngineMutex.acquire(self.paths.engine_exe)
+            try:
+                selected_accounts = self.validate_ready()
+                snapshot = self.backup.create_critical_snapshot(
+                    "BeforeDownload",
+                    {
+                        "task_template": display_template,
+                        "selected_accounts": selected_accounts,
+                        "batch_accounts": self.config.batch_accounts,
+                        "rest_seconds": self.config.rest_seconds,
+                        "run_command": "5 1 1 Q",
+                        "pause_after_exit": pause_after_exit,
+                    },
+                    keep_latest=5,
+                )
+                env = os.environ.copy()
+                env["DOUK_ACCOUNT_BATCH_SIZE"] = str(self.config.batch_accounts)
+                env["DOUK_ACCOUNT_REST_SECONDS"] = str(self.config.rest_seconds)
+                env["DOUK_MANAGER_BACKUP"] = str(snapshot)
+                creationflags = 0
+                command = [str(self.paths.engine_exe)]
+                popen_options = {}
+                if os.name == "nt":
+                    creationflags = subprocess.CREATE_NEW_CONSOLE
+                    if pause_after_exit:
+                        command = [
+                            "cmd.exe",
+                            "/d",
+                            "/c",
+                            str(self._write_pause_wrapper()),
+                        ]
+                    popen_options = engine_mutex.popen_options()
+                try:
+                    process = subprocess.Popen(
+                        command,
+                        cwd=str(self.paths.engine_root),
+                        env=env,
+                        creationflags=creationflags,
+                        **popen_options,
+                    )
+                except OSError as exc:
+                    raise EngineError(f"无法启动下载引擎：{exc}") from exc
+            except OSError as exc:
+                raise EngineError(f"无法准备下载引擎启动：{exc}") from exc
+            finally:
+                engine_mutex.close()
         task_log = (
             self.paths.logs
             / f"DownloadTask_{datetime.now():%Y-%m-%d_%H-%M-%S-%f}.log"
@@ -238,3 +254,86 @@ class EngineService:
         temporary.write_text(content, encoding="ascii", newline="")
         os.replace(temporary, wrapper_path)
         return wrapper_path
+
+
+class _SecurityAttributes(ctypes.Structure):
+    _fields_ = (
+        ("nLength", wintypes.DWORD),
+        ("lpSecurityDescriptor", wintypes.LPVOID),
+        ("bInheritHandle", wintypes.BOOL),
+    )
+
+
+class _WindowsEngineMutex:
+    ERROR_ALREADY_EXISTS = 183
+
+    def __init__(self, handle: int | None = None) -> None:
+        self.handle = handle
+
+    @classmethod
+    def acquire(cls, engine_exe: Path) -> "_WindowsEngineMutex":
+        if os.name != "nt":
+            return cls()
+        handle, already_exists = _create_windows_mutex(engine_exe, inheritable=True)
+        if not handle:
+            raise EngineError("无法创建下载引擎单实例互斥对象。")
+        if already_exists:
+            _close_windows_handle(handle)
+            raise EngineError("下载引擎已经在运行。")
+        return cls(handle)
+
+    def popen_options(self) -> dict:
+        if self.handle is None:
+            return {}
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.lpAttributeList = {"handle_list": [self.handle]}
+        return {"startupinfo": startupinfo, "close_fds": True}
+
+    def close(self) -> None:
+        if self.handle is not None:
+            _close_windows_handle(self.handle)
+            self.handle = None
+
+
+def _engine_mutex_name(engine_exe: Path) -> str:
+    normalized = os.path.normcase(os.path.normpath(str(engine_exe.resolve())))
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return f"Local\\DouKManager.Engine.{digest}"
+
+
+def _create_windows_mutex(
+    engine_exe: Path, *, inheritable: bool
+) -> tuple[int | None, bool]:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = (
+        ctypes.POINTER(_SecurityAttributes),
+        wintypes.BOOL,
+        wintypes.LPCWSTR,
+    )
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    attributes = _SecurityAttributes(
+        ctypes.sizeof(_SecurityAttributes), None, bool(inheritable)
+    )
+    ctypes.set_last_error(0)
+    handle = kernel32.CreateMutexW(
+        ctypes.byref(attributes) if inheritable else None,
+        False,
+        _engine_mutex_name(engine_exe),
+    )
+    return handle, ctypes.get_last_error() == _WindowsEngineMutex.ERROR_ALREADY_EXISTS
+
+
+def _close_windows_handle(handle: int) -> None:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle(handle)
+
+
+def _windows_engine_mutex_exists(engine_exe: Path) -> bool:
+    if os.name != "nt":
+        return False
+    handle, already_exists = _create_windows_mutex(engine_exe, inheritable=False)
+    if handle:
+        _close_windows_handle(handle)
+    return already_exists

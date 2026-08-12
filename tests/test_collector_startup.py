@@ -59,6 +59,7 @@ class CollectorStartupTests(unittest.TestCase):
             child_env = popen.call_args.kwargs["env"]
             self.assertEqual(child_env["PYTHONIOENCODING"], "utf-8")
             self.assertEqual(child_env["PYTHONUTF8"], "1")
+            self.assertEqual(child_env["DOUK_GLOBAL_LOCK_PATH"], str(service.paths.lock_file))
             service.stop()
 
     def test_early_process_exit_includes_log_and_exit_code(self) -> None:

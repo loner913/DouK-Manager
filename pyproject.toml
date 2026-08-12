@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "douk-manager"
-version = "0.1.0"
+version = "0.1.1"
 description = "DouK 全流程一体化管理器"
 requires-python = ">=3.12"
 dependencies = [

@@ -52,7 +52,7 @@ jobs:
           $commit = "${{ github.sha }}".Substring(0, 7)
           $text = @(
             "DouK 全流程一体化管理器"
-            "Version: 0.1.0"
+            "Version: 0.1.1"
             "Commit: $commit"
             "Built: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss K')"
           )

@@ -127,6 +127,11 @@ class ManagerController:
         if self.read_only_reason:
             raise ControllerError(self.read_only_reason)
 
+    def require_collector_start(self) -> None:
+        if self.engine.external_running():
+            return
+        self.require_safe_write()
+
     def reconfigure(self, values: dict[str, Any]) -> str:
         if self.engine.external_running():
             raise ControllerError("下载引擎正在运行，禁止切换正式路径或重建服务。")
@@ -285,7 +290,7 @@ class ManagerController:
         return result
 
     def start_collector(self) -> Path:
-        self.require_safe_write()
+        self.require_collector_start()
         self.collector.start()
         self._last_collector_running = True
         log_path = self.collector.last_log_path or self.paths.logs
