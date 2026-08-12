@@ -604,7 +604,11 @@ def _iter_segment_lines(segment: NativeLogSegment) -> Iterator[str]:
         if start > 0:
             if start == len(_UTF8_BOM):
                 handle.seek(0)
-                discard_partial = handle.read(len(_UTF8_BOM)) != _UTF8_BOM
+                starts_after_bom = handle.read(len(_UTF8_BOM)) == _UTF8_BOM
+                if not starts_after_bom:
+                    handle.seek(start - 1)
+                    previous = handle.read(1)
+                    discard_partial = previous not in (b"\n", b"\r")
             else:
                 handle.seek(start - 1)
                 previous = handle.read(1)

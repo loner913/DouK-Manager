@@ -483,6 +483,29 @@ class DownloadSummaryParserTests(unittest.TestCase):
             summary.started_outcomes[0].status, AccountStatus.NO_ELIGIBLE_WORKS
         )
 
+    def test_offset_three_after_non_bom_newline_preserves_first_new_line(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "native.log"
+        appended = (
+            "开始处理第 1 个账号\n标识：A9example\n筛选处理后作品数量: 0\n"
+        ).encode("utf-8")
+        path.write_bytes(b"ab\n" + appended)
+
+        summary = parse_download_summary(
+            self._planned(9),
+            LocatedNativeLogs(
+                (NativeLogSegment(path, 3, len(appended)),), "non-bom-offset", True
+            ),
+            0,
+        )
+
+        self.assertEqual(summary.started_count, 1)
+        self.assertEqual(
+            summary.started_outcomes[0].status, AccountStatus.NO_ELIGIBLE_WORKS
+        )
+        self.assertTrue(summary.reliable)
+
     def test_offset_inside_utf8_character_discards_stale_bytes_before_decoding(
         self,
     ) -> None:
