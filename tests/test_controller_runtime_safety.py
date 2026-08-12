@@ -150,6 +150,9 @@ class ControllerRuntimeSafetyTests(unittest.TestCase):
     def test_two_concurrent_engine_starts_launch_only_one_process(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             paths = make_test_paths(Path(directory))
+            active = read_json(paths.active_settings)
+            active["run_command"] = "5 1 1 Q"
+            write_json_atomic(paths.active_settings, active)
             config = SimpleNamespace(batch_accounts=50, rest_seconds=150)
             services = [
                 EngineService(paths, config, Mock()) for _ in range(2)
@@ -170,7 +173,6 @@ class ControllerRuntimeSafetyTests(unittest.TestCase):
 
             for index, service in enumerate(services):
                 service.external_running = Mock(side_effect=checker(index))
-                service.validate_ready = Mock(return_value=2)
                 service.backup.create_critical_snapshot.return_value = (
                     paths.backups / "concurrent-start"
                 )
@@ -232,10 +234,12 @@ class ControllerRuntimeSafetyTests(unittest.TestCase):
     def test_failed_process_launch_releases_engine_mutex(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             paths = make_test_paths(Path(directory))
+            active = read_json(paths.active_settings)
+            active["run_command"] = "5 1 1 Q"
+            write_json_atomic(paths.active_settings, active)
             config = SimpleNamespace(batch_accounts=50, rest_seconds=150)
             service = EngineService(paths, config, Mock())
             service.external_running = Mock(return_value=False)
-            service.validate_ready = Mock(return_value=2)
             service.backup.create_critical_snapshot.return_value = (
                 paths.backups / "failed-start"
             )

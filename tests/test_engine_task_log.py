@@ -28,11 +28,14 @@ class EngineTaskLogTests(unittest.TestCase):
             active = json.loads(paths.active_settings.read_text(encoding="utf-8"))
             active["run_command"] = "5 1 1 Q"
             for index, account in enumerate(active["accounts_urls"]):
-                account["enable"] = index == 0
+                account["enable"] = index in (0, 2)
             paths.active_settings.write_text(
                 json.dumps(active, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            native_log_dir = paths.volume / "Log"
+            native_log_dir.mkdir()
+            (native_log_dir / "existing.log").write_text("native log", encoding="utf-8")
             config = AppConfig(
                 engine_exe=str(paths.engine_exe),
                 video_root=str(paths.video_root),
@@ -57,12 +60,22 @@ class EngineTaskLogTests(unittest.TestCase):
             )
             self.assertIn("Log scope: one downloader process", content)
             self.assertIn("Task template: A51.json", content)
-            self.assertIn("Selected accounts: 1", content)
+            self.assertIn("Selected accounts: 2", content)
             self.assertIn("Pause every accounts: 50", content)
             self.assertIn("Pause seconds: 150", content)
             self.assertNotIn("Batch accounts:", content)
             self.assertEqual(run.task_template, "A51.json")
-            self.assertEqual(run.selected_accounts, 1)
+            self.assertEqual(
+                [(item.task_index, item.a_number) for item in run.planned_accounts],
+                [(1, 1), (2, 3)],
+            )
+            self.assertEqual(run.selected_accounts, 2)
+            self.assertEqual(run.native_log_dir, paths.volume / "Log")
+            self.assertEqual(
+                [item.path.name for item in run.native_log_snapshot], ["existing.log"]
+            )
+            self.assertNotIn("native_log_snapshot", content)
+            self.assertNotIn(active["accounts_urls"][0]["url"], content)
 
 
 if __name__ == "__main__":

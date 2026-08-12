@@ -11,6 +11,13 @@ from pathlib import Path
 
 from douk_manager.config import AppConfig, ManagedPaths
 from douk_manager.core.backup import BackupService
+from douk_manager.core.download_summary import (
+    NativeLogState,
+    PlannedAccount,
+    SummaryInputError,
+    freeze_planned_accounts,
+    snapshot_native_logs,
+)
 from douk_manager.core.json_store import read_json
 from douk_manager.core.locks import critical_section
 from douk_manager.ui_messages import format_information
@@ -25,9 +32,15 @@ class EngineRun:
     process: subprocess.Popen
     started_at: datetime
     task_log: Path
+    planned_accounts: tuple[PlannedAccount, ...]
+    native_log_snapshot: tuple[NativeLogState, ...]
+    native_log_dir: Path
     pause_after_exit: bool = False
     task_template: str = "current settings.json"
-    selected_accounts: int = 0
+
+    @property
+    def selected_accounts(self) -> int:
+        return len(self.planned_accounts)
 
     @property
     def running(self) -> bool:
@@ -149,7 +162,18 @@ class EngineService:
                 raise EngineError("下载引擎已经在运行。")
             engine_mutex = _WindowsEngineMutex.acquire(self.paths.engine_exe)
             try:
-                selected_accounts = self.validate_ready()
+                if not self.paths.engine_exe.is_file():
+                    raise EngineError(f"Engine is missing: {self.paths.engine_exe}")
+                active = read_json(self.paths.active_settings)
+                if active.get("run_command") != "5 1 1 Q":
+                    raise EngineError("settings.json run_command must be '5 1 1 Q'.")
+                try:
+                    planned_accounts = freeze_planned_accounts(active)
+                except SummaryInputError as exc:
+                    raise EngineError(str(exc)) from exc
+                native_log_dir = self.paths.volume / "Log"
+                native_log_snapshot = snapshot_native_logs(native_log_dir)
+                selected_accounts = len(planned_accounts)
                 snapshot = self.backup.create_critical_snapshot(
                     "BeforeDownload",
                     {
@@ -222,9 +246,11 @@ class EngineService:
             process=process,
             started_at=started_at,
             task_log=task_log,
+            planned_accounts=planned_accounts,
+            native_log_snapshot=native_log_snapshot,
+            native_log_dir=native_log_dir,
             pause_after_exit=pause_after_exit,
             task_template=display_template,
-            selected_accounts=selected_accounts,
         )
         return self.current
 
