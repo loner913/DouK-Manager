@@ -35,7 +35,7 @@ class ManagerController:
         self.config = AppConfig.load(default_paths.config_file)
         self.paths = ManagedPaths.from_config(self.config, self.root)
         self.paths.ensure_manager_directories()
-        self.logger, self.log_path = setup_logging(self.paths.logs)
+        self.logger, self.log_path = setup_logging(self.paths.manager_logs)
         self.startup_backup: Path | None = None
         self.read_only_reason = ""
         self._last_collector_running = False
@@ -324,13 +324,21 @@ class ManagerController:
         return result
 
     def refresh_index(self) -> IndexResult:
-        result = self.indexer.refresh(self.paths.video_root, self.paths.index_root)
+        result = self.indexer.refresh(
+            self.paths.video_root,
+            self.paths.index_root,
+            self.paths.index_refresh_logs,
+        )
         for line in result.display_lines("索引刷新"):
             self.logger.info(line)
         return result
 
     def cleanup_index(self) -> IndexResult:
-        result = self.indexer.cleanup(self.paths.video_root, self.paths.index_root)
+        result = self.indexer.cleanup(
+            self.paths.video_root,
+            self.paths.index_root,
+            self.paths.index_cleanup_logs,
+        )
         for line in result.display_lines("失效快捷方式清理"):
             self.logger.info(line)
         return result

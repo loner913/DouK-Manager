@@ -50,6 +50,11 @@ class EngineTaskLogTests(unittest.TestCase):
                 run = service.start(task_template=Path("A51.json"))
 
             content = run.task_log.read_text(encoding="utf-8")
+            self.assertEqual(run.task_log.parent, paths.download_task_logs)
+            self.assertRegex(
+                run.task_log.name,
+                r"^DownloadTask_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}-\d{6}\.log$",
+            )
             self.assertIn("Log scope: one downloader process", content)
             self.assertIn("Task template: A51.json", content)
             self.assertIn("Selected accounts: 1", content)

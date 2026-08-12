@@ -98,7 +98,10 @@ class CollectorService:
             env["PYTHONPATH"] = os.pathsep.join(
                 part for part in (str(project_root() / "src"), existing) if part
             )
-        log_path = self.paths.logs / f"Collector_{datetime.now():%Y-%m-%d_%H-%M-%S}.log"
+        log_path = (
+            self.paths.collector_logs
+            / f"Collector_{datetime.now():%Y-%m-%d_%H-%M-%S}.log"
+        )
         self.last_log_path = log_path
         self._log_handle = log_path.open("a", encoding="utf-8")
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
