@@ -26,12 +26,12 @@ these triggers:
 
 | Event | Branch | Result |
 | --- | --- | --- |
-| `pull_request` | target `develop` | install dependencies and run the full unit-test suite; no artifact |
+| `pull_request` | target `develop` or `main` | install dependencies and run the full unit-test suite; no artifact |
 | `push` | `develop` | run the same test suite, build the portable package, and upload it |
 | `workflow_dispatch` | selected ref | run tests, build the portable package, and upload it for explicit acceptance |
 | `push` | `main` | no routine workflow run; formal release automation will be designed separately for v0.2.0 |
 
-Pull requests do not use path filters because a skipped workflow would leave a
+Pull requests to `develop` or `main` do not use path filters because a skipped workflow would leave a
 required check pending and make the pull request impossible to merge. Push
 builds retain filters for source, resources, tests, package metadata, the spec,
 and the workflow itself, so unrelated documentation changes do not create a

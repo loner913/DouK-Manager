@@ -76,8 +76,8 @@ git commit -m "test: define develop CI policy"
 
 - [ ] **Step 1: Change triggers and split jobs**
 
-Set `pull_request.branches` and `push.branches` to `[develop]` and preserve
-`workflow_dispatch`. Do not apply path filters to pull requests because a
+Set `pull_request.branches` to `[develop, main]`, set `push.branches` to
+`[develop]`, and preserve `workflow_dispatch`. Do not apply path filters to pull requests because a
 skipped required workflow would block merging indefinitely. Retain relevant
 path filters for `develop` pushes so documentation-only merges do not create a
 package. Rename the workflow to `Develop CI` and add a `test` job named `Test`

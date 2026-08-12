@@ -18,7 +18,7 @@ class DevelopCiWorkflowTests(unittest.TestCase):
         self.assertIn("pull_request:", self.workflow)
         self.assertRegex(
             self.workflow,
-            r"pull_request:\s*\n\s*branches: \[develop\]",
+            r"pull_request:\s*\n\s*branches: \[develop, main\]",
         )
         self.assertRegex(
             self.workflow,
