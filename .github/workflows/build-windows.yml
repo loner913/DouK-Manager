@@ -87,7 +87,7 @@ jobs:
         run: |
           $text = @(
             "DouK 全流程一体化管理器"
-            "Version: 0.1.1"
+            "Version: 0.1.2"
             "Commit: ${{ steps.identity.outputs.sha }}"
             "Built: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss K')"
           )
