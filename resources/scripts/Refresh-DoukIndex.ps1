@@ -1,6 +1,8 @@
 ﻿param(
     [string]$SourceRoot = 'F:\DouK-Downloader',
     [string]$IndexRoot = 'F:\Douk videos',
+    [Parameter(Mandatory)]
+    [string]$LogRoot,
     [switch]$OpenIndexFolderAfterRun,
     [switch]$PromptDeleteBrokenShortcuts
 )
@@ -44,6 +46,7 @@ $DeleteBrokenShortcutsDuringRefresh = $true
 
 $srcFull = Get-NormalizedFullPath -Path $SourceRoot
 $idxFull = Get-NormalizedFullPath -Path $IndexRoot
+$logFull = Get-NormalizedFullPath -Path $LogRoot
 
 if (-not (Test-Path -LiteralPath $srcFull -PathType Container)) {
     throw "源目录不存在：$srcFull"
@@ -59,13 +62,12 @@ if (-not (Test-Path -LiteralPath $idxFull -PathType Container)) {
     New-Item -ItemType Directory -Path $idxFull -ErrorAction Stop | Out-Null
 }
 
-$logRoot = Join-Path $idxFull 'Logs'
-if (-not (Test-Path -LiteralPath $logRoot -PathType Container)) {
-    New-Item -ItemType Directory -Path $logRoot -ErrorAction Stop | Out-Null
+if (-not (Test-Path -LiteralPath $logFull -PathType Container)) {
+    New-Item -ItemType Directory -Path $logFull -ErrorAction Stop | Out-Null
 }
 
 $runTimestamp = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss-fff'
-$runLogPath = Join-Path $logRoot ("{0}_{1}.txt" -f $RunLogFilePrefix, $runTimestamp)
+$runLogPath = Join-Path $logFull ("{0}_{1}.txt" -f $RunLogFilePrefix, $runTimestamp)
 $script:shell = New-Object -ComObject WScript.Shell
 $script:shortcutReadFailures = @()
 

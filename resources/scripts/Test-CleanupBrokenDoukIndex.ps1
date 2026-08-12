@@ -9,6 +9,7 @@ $cleanupScript = Join-Path $PSScriptRoot 'Cleanup-BrokenDoukIndex.ps1'
 $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("DouK-Cleanup-SelfTest-{0}" -f [System.Guid]::NewGuid().ToString('N'))
 $sourceRoot = Join-Path $testRoot 'source'
 $indexRoot = Join-Path $testRoot 'index'
+$cleanupLogRoot = Join-Path $testRoot 'logs\IndexCleanup'
 $validTarget = Join-Path $sourceRoot 'UID100_A1Valid_works'
 $brokenTarget = Join-Path $sourceRoot 'UID200_A2Missing_works'
 $validShortcut = Join-Path $indexRoot 'A1Valid_works.lnk'
@@ -65,7 +66,7 @@ try {
     Remove-Item -LiteralPath $brokenTarget -Recurse -Force
 
     $firstOutput = @(
-        & $cleanupScript -SourceRoot $sourceRoot -IndexRoot $indexRoot *>&1
+        & $cleanupScript -SourceRoot $sourceRoot -IndexRoot $indexRoot -LogRoot $cleanupLogRoot *>&1
     ) | Out-String
 
     Assert-SelfTest -Condition (Test-Path -LiteralPath $validShortcut -PathType Leaf) -Message '目标存在的受管快捷方式被误删。'
@@ -79,7 +80,7 @@ try {
     Assert-SelfTest -Condition ($firstSummary.DeletedShortcutsTotal -eq 1) -Message "第一次清理没有准确报告删除 1 个快捷方式。`n$firstOutput"
 
     $secondOutput = @(
-        & $cleanupScript -SourceRoot $sourceRoot -IndexRoot $indexRoot *>&1
+        & $cleanupScript -SourceRoot $sourceRoot -IndexRoot $indexRoot -LogRoot $cleanupLogRoot *>&1
     ) | Out-String
 
     Assert-SelfTest -Condition (Test-Path -LiteralPath $validShortcut -PathType Leaf) -Message '目标存在的受管快捷方式未通过第二次清理。'

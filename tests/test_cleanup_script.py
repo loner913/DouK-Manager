@@ -51,17 +51,28 @@ class CleanupScriptTests(unittest.TestCase):
             with self.subTest(step=step):
                 self.assertIn(step, self.self_test)
 
-    def test_cleanup_report_is_written_inside_index_logs_folder(self) -> None:
-        self.assertIn("$logRoot = Join-Path $idxFull 'Logs'", self.cleanup)
+    def test_cleanup_report_is_written_inside_explicit_log_root(self) -> None:
+        self.assertIn("[Parameter(Mandatory)]", self.cleanup)
+        self.assertIn("[string]$LogRoot", self.cleanup)
+        self.assertIn("$logFull = Get-NormalizedFullPath -Path $LogRoot", self.cleanup)
         self.assertIn(
-            '$reportPath = Join-Path $logRoot ("{0}_{1}.txt" -f $CleanupReportFilePrefix, $runTimestamp)',
+            "New-Item -ItemType Directory -Path $logFull -ErrorAction Stop",
+            self.cleanup,
+        )
+        self.assertIn(
+            '$reportPath = Join-Path $logFull ("{0}_{1}.txt" -f $CleanupReportFilePrefix, $runTimestamp)',
             self.cleanup,
         )
         self.assertIn("Get-Date -Format 'yyyy-MM-dd_HH-mm-ss-fff'", self.cleanup)
-        self.assertNotIn(
-            '$reportPath = Join-Path $idxFull ("{0}_{1}.txt" -f $CleanupReportFilePrefix, $runTimestamp)',
+        self.assertIn(
+            "$CleanupReportFilePrefix = 'Cleanup-Broken-Shortcut-Report'",
             self.cleanup,
         )
+        self.assertNotIn("$logRoot = Join-Path $idxFull 'Logs'", self.cleanup)
+
+    def test_cleanup_self_test_forwards_temporary_log_root(self) -> None:
+        self.assertIn("$cleanupLogRoot = Join-Path $testRoot 'logs\\IndexCleanup'", self.self_test)
+        self.assertEqual(self.self_test.count("-LogRoot $cleanupLogRoot"), 2)
 
     def test_cleanup_log_and_console_are_chinese_and_numeric(self) -> None:
         required_text = (
