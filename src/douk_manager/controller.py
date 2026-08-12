@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import logging
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from douk_manager.config import AppConfig, ManagedPaths, application_root, update_config
 from douk_manager.core.backup import BackupService
+from douk_manager.core.download_summary import DownloadSummary
 from douk_manager.core.engine import EngineRun, EngineService
 from douk_manager.core.engine_update import (
     EnginePackagePreview,
@@ -252,6 +254,21 @@ class ManagerController:
             self.config.rest_seconds,
             pause_after_exit,
             result.task_log,
+        )
+        return result
+
+    def summarize_download(
+        self, run: EngineRun, exit_code: int | None, ended_at: datetime
+    ) -> DownloadSummary:
+        result = self.engine.summarize_finished_run(run, exit_code, ended_at)
+        self.logger.info(
+            "下载账号汇总完成：模板=%s；计划=%s；实际开始=%s；完整=%s；可靠=%s；任务日志=%s",
+            run.task_template,
+            result.planned_count,
+            result.started_count,
+            result.complete,
+            result.reliable,
+            run.task_log,
         )
         return result
 

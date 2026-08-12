@@ -13,6 +13,7 @@ class EngineExitAssessmentTests(unittest.TestCase):
         self.assertEqual(result.log_status, "normal_exit_download_result_unverified")
         self.assertIn("进程正常退出", result.detail)
         self.assertIn("不代表所有账号均获取或下载成功", result.detail)
+        self.assertNotIn("所有账号下载成功", result.headline)
 
     def test_nonzero_exit_is_abnormal_and_stops_queue(self) -> None:
         result = assess_process_exit(3)

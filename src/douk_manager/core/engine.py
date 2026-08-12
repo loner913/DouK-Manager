@@ -12,10 +12,15 @@ from pathlib import Path
 from douk_manager.config import AppConfig, ManagedPaths
 from douk_manager.core.backup import BackupService
 from douk_manager.core.download_summary import (
+    DownloadSummary,
     NativeLogState,
     PlannedAccount,
     SummaryInputError,
+    SummaryWriteError,
+    format_summary_for_task_log,
     freeze_planned_accounts,
+    locate_native_logs,
+    parse_download_summary,
     snapshot_native_logs,
 )
 from douk_manager.core.json_store import read_json
@@ -253,6 +258,25 @@ class EngineService:
             task_template=display_template,
         )
         return self.current
+
+    def summarize_finished_run(
+        self, run: EngineRun, exit_code: int | None, ended_at: datetime
+    ) -> DownloadSummary:
+        located = locate_native_logs(
+            run.native_log_snapshot,
+            run.native_log_dir,
+            run.started_at,
+            ended_at,
+            len(run.planned_accounts),
+        )
+        summary = parse_download_summary(run.planned_accounts, located, exit_code)
+        block = format_summary_for_task_log(summary, ended_at)
+        try:
+            with run.task_log.open("a", encoding="utf-8", newline="") as handle:
+                handle.write("\n" + block)
+        except (OSError, UnicodeError) as exc:
+            raise SummaryWriteError("无法将账号汇总写入现有任务日志。") from exc
+        return summary
 
     def _write_pause_wrapper(self) -> Path:
         """Create a small ASCII-only launcher that keeps the native console open."""

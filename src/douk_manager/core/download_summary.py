@@ -8,6 +8,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Iterator
 
+from douk_manager.core.selector import compact_numbers
+
 
 @dataclass(frozen=True)
 class PlannedAccount:
@@ -39,6 +41,10 @@ class LocatedNativeLogs:
 
 
 class SummaryInputError(ValueError):
+    pass
+
+
+class SummaryWriteError(RuntimeError):
     pass
 
 
@@ -87,6 +93,133 @@ class DownloadSummary:
             for outcome in self.started_outcomes
             if outcome.status is status
         )
+
+
+_STATUS_DEFINITIONS = (
+    "有新作品下载：日志最终统计的下载作品数大于 0。",
+    "作品均被引擎跳过：筛选后有作品，但视频、图集和实况最终全部计入跳过。",
+    "无符合条件作品：筛选处理后的作品数量为 0。",
+    "私密账号：出现明确的私密账号提示。",
+    "处理异常，需核对：账号块中出现无法确认已恢复的错误，或 URL/sec_user_id 解析失败而未进入账号处理。",
+    "完成但有异常记录：出现网络中断或重试，但之后仍产生完整的作品统计；该项是附加备注，不重复计入主状态数量。",
+    "处理中断：账号已经开始处理，但进程结束前未形成可确认的最终结果。",
+    "未开始：仅指本次任务启动时 enable=true 且 URL 有效、但在进程结束前尚未轮到的账号；本次 enable=false 或 URL 为空的账号不参与统计。",
+    "结果不完整：用户停止、异常退出、日志截断、计划账号未全部完成，或其他证据不足导致无法确认完整任务结果。",
+)
+
+
+def format_summary_for_ui(summary: DownloadSummary) -> tuple[str, ...]:
+    lines = [_format_process_outcome(summary.exit_code)]
+    if not summary.reliable:
+        lines.append(f"账号结果：无法可靠汇总；原因：{_safe_failure_reason(summary)}")
+        return tuple(lines)
+
+    lines.extend(_format_account_result_lines(summary))
+    return tuple(lines)
+
+
+def format_summary_for_task_log(
+    summary: DownloadSummary, ended_at: datetime
+) -> str:
+    account_formula_valid, status_formula_valid = _validation_outcomes(summary)
+    lines = [
+        "【下载账号汇总】",
+        f"进程结束时间：{ended_at:%Y-%m-%d %H:%M:%S}",
+        f"退出码：{summary.exit_code}",
+        f"日志定位方式：{summary.located.method}",
+    ]
+    if summary.located.segments:
+        lines.extend(
+            f"日志区间：{segment.path.resolve()}；偏移={segment.offset}；长度={segment.length}"
+            for segment in summary.located.segments
+        )
+    else:
+        lines.append("日志区间：无可靠区间")
+
+    lines.extend(
+        (
+            "一级核对（计划账号=实际开始+进入处理前异常+未开始）："
+            + ("通过" if account_formula_valid else "未通过"),
+            "二级核对（实际开始=各主状态之和）："
+            + ("通过" if status_formula_valid else "未通过"),
+        )
+    )
+    if summary.reliable:
+        lines.extend(_format_account_result_lines(summary))
+    else:
+        lines.append(f"账号结果：无法可靠汇总；原因：{_safe_failure_reason(summary)}")
+    lines.extend(("【状态说明】", *_STATUS_DEFINITIONS))
+    return "\n".join(lines) + "\n"
+
+
+def _format_process_outcome(exit_code: int | None) -> str:
+    if exit_code == 0:
+        return "下载进程：正常退出（退出码 0）"
+    if exit_code is None:
+        return "下载进程：退出状态未知"
+    return f"下载进程：异常退出（退出码 {exit_code}）"
+
+
+def _format_account_result_lines(summary: DownloadSummary) -> list[str]:
+    status = "完整" if summary.complete else "结果不完整"
+    error_numbers = tuple(
+        sorted(set(summary.numbers_for(AccountStatus.ERROR) + summary.pre_start_errors))
+    )
+    lines = [
+        f"账号汇总：{status}",
+        f"计划账号：{summary.planned_count}",
+        f"实际开始：{summary.started_count}",
+        f"有新作品下载：{summary.primary_status_counts[AccountStatus.DOWNLOADED]}",
+        f"作品均被引擎跳过：{summary.primary_status_counts[AccountStatus.ALL_SKIPPED]}",
+        f"无符合条件作品：{summary.primary_status_counts[AccountStatus.NO_ELIGIBLE_WORKS]}",
+        f"私密账号：{summary.primary_status_counts[AccountStatus.PRIVATE]}",
+        f"处理异常，需核对：{len(error_numbers)}",
+        f"处理中断：{summary.primary_status_counts[AccountStatus.INTERRUPTED]}",
+        f"未开始：{len(summary.not_started)}",
+        f"完成但有异常记录：{len(summary.completed_with_anomaly)}",
+    ]
+    _append_number_line(lines, "私密账号", summary.numbers_for(AccountStatus.PRIVATE))
+    _append_number_line(lines, "处理异常", error_numbers)
+    _append_number_line(lines, "处理中断", summary.numbers_for(AccountStatus.INTERRUPTED))
+    _append_number_line(lines, "未开始", summary.not_started)
+    _append_number_line(lines, "异常后完成", summary.completed_with_anomaly)
+    lines.extend(
+        f"原生日志：{segment.path.resolve()}" for segment in summary.located.segments
+    )
+    return lines
+
+
+def _append_number_line(lines: list[str], label: str, numbers: tuple[int, ...]) -> None:
+    if not numbers:
+        return
+    compact = compact_numbers(numbers).replace(",", "、")
+    lines.append(f"{label}（{len(set(numbers))}）：{compact}")
+
+
+def _validation_outcomes(summary: DownloadSummary) -> tuple[bool, bool]:
+    account_formula_valid = (
+        summary.planned_count
+        == summary.started_count + len(summary.pre_start_errors) + len(summary.not_started)
+    )
+    status_formula_valid = summary.started_count == sum(
+        summary.primary_status_counts.values()
+    )
+    return account_formula_valid, status_formula_valid
+
+
+def _safe_failure_reason(summary: DownloadSummary) -> str:
+    reason_text = " ".join(summary.reasons).casefold()
+    if "多个候选" in reason_text or "唯一" in reason_text:
+        return "无法唯一确定本次原生日志。"
+    if "未找到" in reason_text or "缺失" in reason_text:
+        return "未找到本次原生日志。"
+    if "读取" in reason_text or "编码" in reason_text or "截断" in reason_text:
+        return "原生日志读取不完整。"
+    if "映射" in reason_text or "编号" in reason_text or "序号" in reason_text:
+        return "账号身份校验未通过。"
+    if "核对公式" in reason_text:
+        return "账号统计校验未通过。"
+    return "汇总证据不可靠。"
 
 
 @dataclass
