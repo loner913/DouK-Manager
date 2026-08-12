@@ -329,15 +329,7 @@ def parse_download_summary(
         status = (
             AccountStatus.INTERRUPTED if force_interrupted else _classify_block(block)
         )
-        if (
-            status
-            in (
-                AccountStatus.DOWNLOADED,
-                AccountStatus.ALL_SKIPPED,
-                AccountStatus.NO_ELIGIBLE_WORKS,
-            )
-            and block.logged_a_number is None
-        ):
+        if status is not AccountStatus.PRIVATE and block.logged_a_number is None:
             _add_reason(
                 reasons,
                 f"任务序号 {block.task_index} 缺少可验证的日志 A 编号。",
@@ -428,7 +420,7 @@ def parse_download_summary(
 
     started_outcomes.sort(key=lambda outcome: outcome.task_index)
     pre_start_indices.difference_update(started_indices)
-    highest_observed = max(started_indices | pre_start_indices, default=0)
+    highest_observed = max(observed_started_indices | pre_start_indices, default=0)
     remaining_indices = (
         set(plan_by_index) - observed_started_indices - pre_start_indices
     )
@@ -618,9 +610,21 @@ def _iter_segment_lines(segment: NativeLogSegment) -> Iterator[str]:
                 previous = handle.read(1)
                 discard_partial = previous not in (b"\n", b"\r")
         handle.seek(start)
+        if discard_partial:
+            while remaining > 0:
+                chunk = handle.read(min(_READ_CHUNK_SIZE, remaining))
+                if not chunk:
+                    raise _LogReadError("原生日志在声明片段结束前提前结束。")
+                newline_index = chunk.find(b"\n")
+                if newline_index < 0:
+                    remaining -= len(chunk)
+                    continue
+                consumed = newline_index + 1
+                remaining -= consumed
+                handle.seek(consumed - len(chunk), 1)
+                break
         decoder = getincrementaldecoder("utf-8-sig")(errors="replace")
         buffer = ""
-        discarding = discard_partial
         while remaining > 0:
             chunk = handle.read(min(_READ_CHUNK_SIZE, remaining))
             if not chunk:
@@ -634,10 +638,7 @@ def _iter_segment_lines(segment: NativeLogSegment) -> Iterator[str]:
                     raise _LogReadError("原生日志单行长度超过解析上限。")
                 if "\ufffd" in line:
                     raise _LogReadError("原生日志包含无法解码的 UTF-8 编码。")
-                if discarding:
-                    discarding = False
-                else:
-                    yield line.rstrip("\r")
+                yield line.rstrip("\r")
             if "\ufffd" in buffer:
                 raise _LogReadError("原生日志包含无法解码的 UTF-8 编码。")
             if len(buffer.encode("utf-8")) > _MAX_BUFFERED_LINE_SIZE:
@@ -645,7 +646,7 @@ def _iter_segment_lines(segment: NativeLogSegment) -> Iterator[str]:
         buffer += decoder.decode(b"", final=True)
         if "\ufffd" in buffer:
             raise _LogReadError("原生日志包含无法解码的 UTF-8 编码。")
-        if buffer and not discarding:
+        if buffer:
             yield buffer.rstrip("\r")
 
 

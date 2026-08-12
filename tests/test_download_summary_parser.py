@@ -110,6 +110,20 @@ class DownloadSummaryParserTests(unittest.TestCase):
             summary.primary_status_counts[AccountStatus.NO_ELIGIBLE_WORKS], 0
         )
 
+    def test_error_account_without_logged_mark_is_not_trusted(self) -> None:
+        summary = self._parse(
+            [
+                "开始处理第 1 个账号",
+                "[ERROR]: 视频下载地址解析失败",
+                "筛选处理后作品数量: 0",
+            ],
+            self._planned(7),
+        )
+
+        self.assertEqual(summary.started_outcomes, ())
+        self.assertFalse(summary.reliable)
+        self.assertTrue(any("缺少" in reason for reason in summary.reasons))
+
     def test_recovered_error_is_anomaly_overlay(self) -> None:
         summary = self._parse(
             [
@@ -165,12 +179,19 @@ class DownloadSummaryParserTests(unittest.TestCase):
 
     def test_started_but_unclosed_account_is_interrupted(self) -> None:
         summary = self._parse(
-            ["开始处理第 1 个账号"],
+            ["开始处理第 1 个账号", "标识：A8example"],
             self._planned(8),
         )
 
         self.assertEqual(summary.started_outcomes[0].status, AccountStatus.INTERRUPTED)
         self.assertFalse(summary.complete)
+
+    def test_interrupted_account_without_logged_mark_is_not_trusted(self) -> None:
+        summary = self._parse(["开始处理第 1 个账号"], self._planned(8))
+
+        self.assertEqual(summary.started_outcomes, ())
+        self.assertFalse(summary.reliable)
+        self.assertTrue(any("缺少" in reason for reason in summary.reasons))
 
     def test_read_failure_finalizes_current_as_interrupted_without_trailing_guess(
         self,
@@ -310,6 +331,22 @@ class DownloadSummaryParserTests(unittest.TestCase):
         self.assertNotIn(50, summary.not_started)
         self.assertEqual(summary.not_started, (80,))
 
+    def test_identity_failed_observed_index_keeps_prior_gap_uncertain(self) -> None:
+        summary = self._parse(
+            [
+                "开始处理第 2 个账号",
+                "标识：A99wrong",
+                "筛选处理后作品数量: 0",
+            ],
+            self._planned(10, 20, 30),
+        )
+
+        self.assertEqual(summary.started_outcomes, ())
+        self.assertNotIn(10, summary.not_started)
+        self.assertEqual(summary.not_started, (30,))
+        self.assertFalse(summary.reliable)
+        self.assertTrue(any("内部缺失" in reason for reason in summary.reasons))
+
     def test_pre_start_failure_uses_exact_frozen_numeric_leading_mark(self) -> None:
         summary = self._parse(
             [
@@ -445,6 +482,39 @@ class DownloadSummaryParserTests(unittest.TestCase):
         self.assertEqual(
             summary.started_outcomes[0].status, AccountStatus.NO_ELIGIBLE_WORKS
         )
+
+    def test_offset_inside_utf8_character_discards_stale_bytes_before_decoding(
+        self,
+    ) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "native.log"
+        stale = "旧的中文残行\n".encode("utf-8")
+        current = (
+            "开始处理第 1 个账号\n标识：A9example\n筛选处理后作品数量: 0\n"
+        ).encode("utf-8")
+        path.write_bytes(stale + current)
+        offset = len("旧".encode("utf-8")) + 1
+
+        summary = parse_download_summary(
+            self._planned(9),
+            LocatedNativeLogs(
+                (
+                    NativeLogSegment(
+                        path, offset, path.stat().st_size - offset
+                    ),
+                ),
+                "mid-character-offset",
+                True,
+            ),
+            0,
+        )
+
+        self.assertEqual(summary.started_count, 1)
+        self.assertEqual(
+            summary.started_outcomes[0].status, AccountStatus.NO_ELIGIBLE_WORKS
+        )
+        self.assertTrue(summary.reliable)
 
     def test_invalid_utf8_replacement_marks_partial_result_unreliable(self) -> None:
         directory = tempfile.TemporaryDirectory()
