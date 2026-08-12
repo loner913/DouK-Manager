@@ -47,6 +47,8 @@ class WindowsIndexIntegrationTests(unittest.TestCase):
         return result
 
     def _run_refresh(self, source: Path, index: Path) -> dict[str, str]:
+        log_root = index.parent / "logs" / "IndexRefresh"
+        log_root.mkdir(parents=True, exist_ok=True)
         completed = subprocess.run(
             [
                 "powershell.exe",
@@ -61,6 +63,8 @@ class WindowsIndexIntegrationTests(unittest.TestCase):
                 str(source),
                 "-IndexRoot",
                 str(index),
+                "-LogRoot",
+                str(log_root),
             ],
             check=False,
             capture_output=True,
@@ -74,8 +78,9 @@ class WindowsIndexIntegrationTests(unittest.TestCase):
             0,
             msg=f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
         )
+        self.assertFalse((index / "Logs").exists())
         newest_log = max(
-            (index / "Logs").glob("Refresh-DoukIndex-RunLog_*.txt"),
+            log_root.glob("Refresh-DoukIndex-RunLog_*.txt"),
             key=lambda path: path.stat().st_mtime_ns,
         )
         return self._summary(newest_log)

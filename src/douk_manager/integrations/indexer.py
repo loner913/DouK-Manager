@@ -144,12 +144,20 @@ def parse_index_output(output: str) -> tuple[str, dict[str, Any] | None]:
 
 
 class IndexService:
-    def _run(self, script_name: str, source: Path, index: Path, open_folder: bool) -> IndexResult:
+    def _run(
+        self,
+        script_name: str,
+        source: Path,
+        index: Path,
+        log_root: Path,
+        open_folder: bool,
+    ) -> IndexResult:
         if os.name != "nt":
             raise IndexError("快捷方式索引仅支持 Windows。")
         if not source.is_dir():
             raise IndexError(f"视频账号目录不存在：{source}")
         index.mkdir(parents=True, exist_ok=True)
+        log_root.mkdir(parents=True, exist_ok=True)
         script = resource_path(f"resources/scripts/{script_name}")
         if not script.is_file():
             raise IndexError(f"索引脚本缺失：{script}")
@@ -164,6 +172,8 @@ class IndexService:
             str(source),
             "-IndexRoot",
             str(index),
+            "-LogRoot",
+            str(log_root),
         ]
         if open_folder:
             command.append("-OpenIndexFolderAfterRun")
@@ -185,12 +195,14 @@ class IndexService:
         self,
         source: Path,
         index: Path,
+        log_root: Path,
         *,
         open_folder: bool = False,
         prompt_delete_broken: bool = False,
     ) -> IndexResult:
         if os.name != "nt":
             raise IndexError("快捷方式索引仅支持 Windows。")
+        log_root.mkdir(parents=True, exist_ok=True)
         script = resource_path("resources/scripts/Refresh-DoukIndex.ps1")
         command = [
             "powershell.exe",
@@ -203,6 +215,8 @@ class IndexService:
             str(source),
             "-IndexRoot",
             str(index),
+            "-LogRoot",
+            str(log_root),
         ]
         if open_folder:
             command.append("-OpenIndexFolderAfterRun")
@@ -222,9 +236,16 @@ class IndexService:
         visible_output, summary = parse_index_output(output)
         return IndexResult(completed.returncode, visible_output, summary)
 
-    def cleanup(self, source: Path, index: Path, *, open_folder: bool = False) -> IndexResult:
+    def cleanup(
+        self,
+        source: Path,
+        index: Path,
+        log_root: Path,
+        *,
+        open_folder: bool = False,
+    ) -> IndexResult:
         return self._run(
-            "Cleanup-BrokenDoukIndex.ps1", source, index, open_folder
+            "Cleanup-BrokenDoukIndex.ps1", source, index, log_root, open_folder
         )
 
     def cleanup_self_test(self) -> IndexResult:

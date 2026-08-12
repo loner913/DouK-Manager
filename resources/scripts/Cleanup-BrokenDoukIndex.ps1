@@ -1,6 +1,8 @@
 ﻿param(
     [string]$SourceRoot = 'F:\DouK-Downloader',
     [string]$IndexRoot = 'F:\Douk videos',
+    [Parameter(Mandatory)]
+    [string]$LogRoot,
     [switch]$OpenIndexFolderAfterRun
 )
 
@@ -34,10 +36,11 @@ function Test-PathIsStrictChildOfRoot {
 }
 
 $ManagedTag = '[DoukIndex]'
-$CleanupReportFilePrefix = 'Cleanup-BrokenDoukIndex-RunLog'
+$CleanupReportFilePrefix = 'Cleanup-Broken-Shortcut-Report'
 
 $srcFull = Get-NormalizedFullPath -Path $SourceRoot
 $idxFull = Get-NormalizedFullPath -Path $IndexRoot
+$logFull = Get-NormalizedFullPath -Path $LogRoot
 
 if (-not (Test-Path -LiteralPath $srcFull -PathType Container)) {
     throw "源目录不存在：$srcFull"
@@ -51,13 +54,12 @@ if ($srcFull.Equals($idxFull, [System.StringComparison]::OrdinalIgnoreCase) -or
     throw "源目录和快捷方式索引目录必须相互独立，不能相同或互相包含。"
 }
 
-$logRoot = Join-Path $idxFull 'Logs'
-if (-not (Test-Path -LiteralPath $logRoot -PathType Container)) {
-    New-Item -ItemType Directory -Path $logRoot -ErrorAction Stop | Out-Null
+if (-not (Test-Path -LiteralPath $logFull -PathType Container)) {
+    New-Item -ItemType Directory -Path $logFull -ErrorAction Stop | Out-Null
 }
 
 $runTimestamp = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss-fff'
-$reportPath = Join-Path $logRoot ("{0}_{1}.txt" -f $CleanupReportFilePrefix, $runTimestamp)
+$reportPath = Join-Path $logFull ("{0}_{1}.txt" -f $CleanupReportFilePrefix, $runTimestamp)
 $script:shell = New-Object -ComObject WScript.Shell
 $script:shortcutReadFailures = @()
 

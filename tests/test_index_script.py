@@ -60,6 +60,31 @@ class IndexScriptTests(unittest.TestCase):
         self.assertNotIn("CleanupReportFilePrefix", self.script)
         self.assertNotIn("GenerateCleanupReport", self.script)
 
+    def test_refresh_requires_explicit_log_root_outside_index(self) -> None:
+        self.assertIn("[Parameter(Mandatory)]", self.script)
+        self.assertIn("[string]$LogRoot", self.script)
+        self.assertIn("$logFull = Get-NormalizedFullPath -Path $LogRoot", self.script)
+        self.assertIn(
+            "New-Item -ItemType Directory -Path $logFull -ErrorAction Stop",
+            self.script,
+        )
+        self.assertIn(
+            '$runLogPath = Join-Path $logFull ("{0}_{1}.txt" -f $RunLogFilePrefix, $runTimestamp)',
+            self.script,
+        )
+        self.assertNotIn("$logRoot = Join-Path $idxFull 'Logs'", self.script)
+
+    def test_repository_wrapper_defaults_and_forwards_index_refresh_log_root(self) -> None:
+        wrapper = (Path(__file__).parents[1] / "Refresh-DoukIndex.ps1").read_text(
+            encoding="utf-8-sig"
+        )
+        self.assertIn(
+            "[string]$LogRoot = (Join-Path $PSScriptRoot 'Logs\\IndexRefresh')",
+            wrapper,
+        )
+        self.assertIn("$PSBoundParameters['LogRoot'] = $LogRoot", wrapper)
+        self.assertIn("& $scriptPath @PSBoundParameters", wrapper)
+
     def test_refresh_deletes_only_two_kinds_of_managed_index_shortcuts(self) -> None:
         safeguards = (
             "$sc.Description.StartsWith($ManagedTag + ' ')",
