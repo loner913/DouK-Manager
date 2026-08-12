@@ -42,6 +42,10 @@ class SummaryInputError(ValueError):
     pass
 
 
+class _LogReadError(Exception):
+    pass
+
+
 class AccountStatus(str, Enum):
     DOWNLOADED = "downloaded"
     ALL_SKIPPED = "all_skipped"
@@ -106,6 +110,29 @@ class _AccountBlock:
         field = ("downloaded_" if downloaded else "skipped_") + category
         setattr(self, field, value)
 
+    def clear_final_statistics(self) -> None:
+        self.filtered_count = None
+        self.downloaded_video = None
+        self.downloaded_gallery = None
+        self.downloaded_live = None
+        self.skipped_video = None
+        self.skipped_gallery = None
+        self.skipped_live = None
+
+    @property
+    def all_final_totals_present(self) -> bool:
+        totals = (
+            self.downloaded_video,
+            self.downloaded_gallery,
+            self.downloaded_live,
+            self.skipped_video,
+            self.skipped_gallery,
+            self.skipped_live,
+        )
+        return self.filtered_count is not None and all(
+            value is not None for value in totals
+        )
+
     @property
     def final_statistics_complete(self) -> bool:
         if self.filtered_count == 0:
@@ -154,6 +181,8 @@ _PRE_START_MARK_RE = re.compile(
 )
 _CATEGORY_NAMES = {"视频": "video", "图集": "gallery", "实况": "live"}
 _READ_CHUNK_SIZE = 64 * 1024
+_MAX_BUFFERED_LINE_SIZE = 1024 * 1024
+_UTF8_BOM = b"\xef\xbb\xbf"
 
 
 def freeze_planned_accounts(document: dict) -> tuple[PlannedAccount, ...]:
@@ -274,28 +303,46 @@ def parse_download_summary(
     reasons: list[str] = []
     started_outcomes: list[AccountOutcome] = []
     started_indices: set[int] = set()
+    observed_started_indices: set[int] = set()
     pre_start_indices: set[int] = set()
     current: _AccountBlock | None = None
+    parser_aborted = False
+    last_started_index = 0
 
     if not located.reliable:
         _add_reason(reasons, located.reason or "原生日志定位不可靠。")
 
-    def finalize(block: _AccountBlock) -> None:
+    def finalize(block: _AccountBlock, *, force_interrupted: bool = False) -> None:
         mapped = block.mapped
         if mapped is None or block.task_index in started_indices:
             return
-        if (
-            block.logged_mark_mismatch
-            or (
-                block.logged_a_number is not None
-                and block.logged_a_number != mapped.a_number
-            )
-        ):
+        identity_mismatch = block.logged_mark_mismatch or (
+            block.logged_a_number is not None
+            and block.logged_a_number != mapped.a_number
+        )
+        if identity_mismatch:
             _add_reason(
                 reasons,
                 f"任务序号 {block.task_index} 的日志 A 编号与冻结映射不一致。",
             )
-        status = _classify_block(block)
+            return
+        status = (
+            AccountStatus.INTERRUPTED if force_interrupted else _classify_block(block)
+        )
+        if (
+            status
+            in (
+                AccountStatus.DOWNLOADED,
+                AccountStatus.ALL_SKIPPED,
+                AccountStatus.NO_ELIGIBLE_WORKS,
+            )
+            and block.logged_a_number is None
+        ):
+            _add_reason(
+                reasons,
+                f"任务序号 {block.task_index} 缺少可验证的日志 A 编号。",
+            )
+            return
         completed_with_anomaly = (
             block.anomaly_signal
             and status
@@ -324,13 +371,17 @@ def parse_download_summary(
                 task_index = int(start_match.group(1))
                 if task_index not in plan_by_index:
                     _add_reason(reasons, f"日志任务序号 {task_index} 越界。")
-                elif task_index in started_indices:
+                elif task_index in observed_started_indices:
                     _add_reason(reasons, f"日志任务序号 {task_index} 重复。")
                 elif task_index in pre_start_indices:
                     _add_reason(
                         reasons,
                         f"任务序号 {task_index} 同时被标记为启动前错误和已开始。",
                     )
+                if task_index <= last_started_index:
+                    _add_reason(reasons, f"日志任务序号 {task_index} 顺序异常。")
+                last_started_index = max(last_started_index, task_index)
+                observed_started_indices.add(task_index)
                 current = _AccountBlock(task_index, plan_by_index.get(task_index))
                 continue
 
@@ -364,13 +415,23 @@ def parse_download_summary(
                 _consume_account_line(current, line, plan_by_a_number)
         if current is not None:
             finalize(current)
+    except _LogReadError as exc:
+        _add_reason(reasons, str(exc))
+        parser_aborted = True
+        if current is not None:
+            finalize(current, force_interrupted=True)
     except (OSError, UnicodeError) as exc:
         _add_reason(reasons, f"读取原生日志失败：{type(exc).__name__}。")
+        parser_aborted = True
+        if current is not None:
+            finalize(current, force_interrupted=True)
 
     started_outcomes.sort(key=lambda outcome: outcome.task_index)
     pre_start_indices.difference_update(started_indices)
     highest_observed = max(started_indices | pre_start_indices, default=0)
-    remaining_indices = set(plan_by_index) - started_indices - pre_start_indices
+    remaining_indices = (
+        set(plan_by_index) - observed_started_indices - pre_start_indices
+    )
     interior_missing = sorted(
         task_index
         for task_index in remaining_indices
@@ -389,7 +450,7 @@ def parse_download_summary(
             for task_index in remaining_indices
             if task_index > highest_observed
         )
-        if located.reliable
+        if located.reliable and not parser_aborted
         else []
     )
 
@@ -471,7 +532,7 @@ def _consume_account_line(
             total_match.group(1) == "下载",
             int(total_match.group(3)),
         )
-        if block.final_statistics_complete:
+        if block.unrecovered_error and block.all_final_totals_present:
             block.unrecovered_error = False
 
     if "该账号为私密账号" in line:
@@ -480,6 +541,7 @@ def _consume_account_line(
     is_error = "[ERROR]" in line
     block.anomaly_signal = block.anomaly_signal or is_warning or is_error
     if is_error:
+        block.clear_final_statistics()
         block.unrecovered_error = True
 
 
@@ -548,9 +610,13 @@ def _iter_segment_lines(segment: NativeLogSegment) -> Iterator[str]:
         remaining = max(segment.length, 0)
         discard_partial = False
         if start > 0:
-            handle.seek(start - 1)
-            previous = handle.read(1)
-            discard_partial = previous not in (b"\n", b"\r")
+            if start == len(_UTF8_BOM):
+                handle.seek(0)
+                discard_partial = handle.read(len(_UTF8_BOM)) != _UTF8_BOM
+            else:
+                handle.seek(start - 1)
+                previous = handle.read(1)
+                discard_partial = previous not in (b"\n", b"\r")
         handle.seek(start)
         decoder = getincrementaldecoder("utf-8-sig")(errors="replace")
         buffer = ""
@@ -558,16 +624,27 @@ def _iter_segment_lines(segment: NativeLogSegment) -> Iterator[str]:
         while remaining > 0:
             chunk = handle.read(min(_READ_CHUNK_SIZE, remaining))
             if not chunk:
-                break
+                raise _LogReadError("原生日志在声明片段结束前提前结束。")
             remaining -= len(chunk)
-            buffer += decoder.decode(chunk, final=False)
+            decoded = decoder.decode(chunk, final=False)
+            buffer += decoded
             while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
+                if len(line.encode("utf-8")) > _MAX_BUFFERED_LINE_SIZE:
+                    raise _LogReadError("原生日志单行长度超过解析上限。")
+                if "\ufffd" in line:
+                    raise _LogReadError("原生日志包含无法解码的 UTF-8 编码。")
                 if discarding:
                     discarding = False
                 else:
                     yield line.rstrip("\r")
+            if "\ufffd" in buffer:
+                raise _LogReadError("原生日志包含无法解码的 UTF-8 编码。")
+            if len(buffer.encode("utf-8")) > _MAX_BUFFERED_LINE_SIZE:
+                raise _LogReadError("原生日志单行长度超过解析上限。")
         buffer += decoder.decode(b"", final=True)
+        if "\ufffd" in buffer:
+            raise _LogReadError("原生日志包含无法解码的 UTF-8 编码。")
         if buffer and not discarding:
             yield buffer.rstrip("\r")
 

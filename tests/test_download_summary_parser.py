@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from douk_manager.core.download_summary import (
     AccountStatus,
@@ -171,6 +172,69 @@ class DownloadSummaryParserTests(unittest.TestCase):
         self.assertEqual(summary.started_outcomes[0].status, AccountStatus.INTERRUPTED)
         self.assertFalse(summary.complete)
 
+    def test_read_failure_finalizes_current_as_interrupted_without_trailing_guess(
+        self,
+    ) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "native.log"
+        path.touch()
+        located = LocatedNativeLogs(
+            (NativeLogSegment(path, 0, 100),), "synthetic-failure", True
+        )
+
+        def failing_lines(_segments):
+            yield "开始处理第 1 个账号"
+            yield "标识：A10example"
+            raise OSError("sensitive payload must not escape")
+
+        with patch(
+            "douk_manager.core.download_summary._iter_located_lines",
+            side_effect=failing_lines,
+        ):
+            summary = parse_download_summary(self._planned(10, 20, 30), located, 1)
+
+        self.assertEqual(summary.started_outcomes[0].status, AccountStatus.INTERRUPTED)
+        self.assertEqual(summary.not_started, ())
+        self.assertFalse(summary.reliable)
+        self.assertFalse(summary.complete)
+        self.assertTrue(any("OSError" in reason for reason in summary.reasons))
+        self.assertFalse(
+            any("sensitive payload" in reason for reason in summary.reasons)
+        )
+
+    def test_read_failure_preserves_prior_completed_and_current_partial_evidence(
+        self,
+    ) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "native.log"
+        path.touch()
+        located = LocatedNativeLogs(
+            (NativeLogSegment(path, 0, 100),), "synthetic-failure", True
+        )
+
+        def failing_lines(_segments):
+            yield "开始处理第 1 个账号"
+            yield "标识：A10example"
+            yield "筛选处理后作品数量: 0"
+            yield "开始处理第 2 个账号"
+            yield "标识：A20example"
+            raise OSError("redacted")
+
+        with patch(
+            "douk_manager.core.download_summary._iter_located_lines",
+            side_effect=failing_lines,
+        ):
+            summary = parse_download_summary(self._planned(10, 20, 30), located, 1)
+
+        self.assertEqual(
+            [outcome.status for outcome in summary.started_outcomes],
+            [AccountStatus.NO_ELIGIBLE_WORKS, AccountStatus.INTERRUPTED],
+        )
+        self.assertEqual(summary.not_started, ())
+        self.assertFalse(summary.reliable)
+
     def test_disabled_accounts_never_appear_in_not_started(self) -> None:
         summary = self._parse(
             [
@@ -298,6 +362,41 @@ class DownloadSummaryParserTests(unittest.TestCase):
         self.assertFalse(summary.reliable)
         self.assertTrue(any("同时" in reason for reason in summary.reasons))
 
+    def test_normal_completed_account_without_logged_mark_is_not_trusted(self) -> None:
+        summary = self._parse(
+            ["开始处理第 1 个账号", "筛选处理后作品数量: 0"],
+            self._planned(10),
+        )
+
+        self.assertEqual(summary.started_outcomes, ())
+        self.assertFalse(summary.reliable)
+        self.assertTrue(any("缺少" in reason for reason in summary.reasons))
+
+    def test_mismatched_logged_mark_does_not_emit_a_trusted_outcome(self) -> None:
+        summary = self._parse(
+            [
+                "开始处理第 1 个账号",
+                "标识：A99wrong",
+                "筛选处理后作品数量: 0",
+            ],
+            self._planned(10),
+        )
+
+        self.assertEqual(summary.started_outcomes, ())
+        self.assertEqual(summary.numbers_for(AccountStatus.NO_ELIGIBLE_WORKS), ())
+        self.assertFalse(summary.reliable)
+        self.assertTrue(any("不一致" in reason for reason in summary.reasons))
+
+    def test_private_account_without_logged_mark_uses_frozen_mapping(self) -> None:
+        summary = self._parse(
+            ["开始处理第 1 个账号", "该账号为私密账号"],
+            self._planned(10),
+        )
+
+        self.assertEqual(summary.started_outcomes[0].status, AccountStatus.PRIVATE)
+        self.assertEqual(summary.started_outcomes[0].a_number, 10)
+        self.assertTrue(summary.reliable)
+
     def test_segment_offset_discards_only_a_partial_first_line(self) -> None:
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -325,6 +424,105 @@ class DownloadSummaryParserTests(unittest.TestCase):
             summary.started_outcomes[0].status, AccountStatus.NO_ELIGIBLE_WORKS
         )
 
+    def test_offset_after_utf8_bom_preserves_the_appended_first_line(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "native.log"
+        appended = (
+            "开始处理第 1 个账号\n标识：A9example\n筛选处理后作品数量: 0\n"
+        ).encode("utf-8")
+        path.write_bytes(b"\xef\xbb\xbf" + appended)
+
+        summary = parse_download_summary(
+            self._planned(9),
+            LocatedNativeLogs(
+                (NativeLogSegment(path, 3, len(appended)),), "bom-offset", True
+            ),
+            0,
+        )
+
+        self.assertEqual(summary.started_count, 1)
+        self.assertEqual(
+            summary.started_outcomes[0].status, AccountStatus.NO_ELIGIBLE_WORKS
+        )
+
+    def test_invalid_utf8_replacement_marks_partial_result_unreliable(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "native.log"
+        path.write_bytes(
+            "开始处理第 1 个账号\n标识：A9example\n".encode("utf-8")
+            + b"\xff\n"
+        )
+
+        summary = parse_download_summary(
+            self._planned(9),
+            LocatedNativeLogs(
+                (NativeLogSegment(path, 0, path.stat().st_size),), "bad-utf8", True
+            ),
+            1,
+        )
+
+        self.assertEqual(summary.started_outcomes[0].status, AccountStatus.INTERRUPTED)
+        self.assertFalse(summary.reliable)
+        self.assertTrue(any("编码" in reason for reason in summary.reasons))
+
+    def test_eof_before_declared_segment_length_marks_result_unreliable(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "native.log"
+        path.write_text(
+            "开始处理第 1 个账号\n标识：A9example\n筛选处理后作品数量: 0\n",
+            encoding="utf-8",
+        )
+
+        summary = parse_download_summary(
+            self._planned(9),
+            LocatedNativeLogs(
+                (NativeLogSegment(path, 0, path.stat().st_size + 10),), "short", True
+            ),
+            0,
+        )
+
+        self.assertFalse(summary.reliable)
+        self.assertTrue(any("提前结束" in reason for reason in summary.reasons))
+
+    def test_newline_free_oversized_line_is_rejected_without_payload_reason(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "native.log"
+        path.write_bytes(b"x" * (2 * 1024 * 1024))
+
+        summary = parse_download_summary(
+            self._planned(9),
+            LocatedNativeLogs(
+                (NativeLogSegment(path, 0, path.stat().st_size),), "oversized", True
+            ),
+            1,
+        )
+
+        self.assertFalse(summary.reliable)
+        self.assertEqual(summary.not_started, ())
+        self.assertTrue(any("单行" in reason for reason in summary.reasons))
+        self.assertFalse(any("xxxxx" in reason for reason in summary.reasons))
+
+    def test_newline_terminated_oversized_line_is_rejected_before_yield(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "native.log"
+        path.write_bytes(b"x" * (1024 * 1024 + 1) + b"\n")
+
+        summary = parse_download_summary(
+            self._planned(9),
+            LocatedNativeLogs(
+                (NativeLogSegment(path, 0, path.stat().st_size),), "oversized", True
+            ),
+            1,
+        )
+
+        self.assertFalse(summary.reliable)
+        self.assertTrue(any("单行" in reason for reason in summary.reasons))
+
     def test_frozen_a_prefix_disambiguates_a_numeric_leading_mark(self) -> None:
         summary = self._parse(
             [
@@ -349,6 +547,45 @@ class DownloadSummaryParserTests(unittest.TestCase):
 
         self.assertFalse(summary.reliable)
         self.assertTrue(any("不一致" in reason for reason in summary.reasons))
+
+    def test_repeated_cached_stat_line_does_not_recover_latest_error(self) -> None:
+        summary = self._parse(
+            [
+                "开始处理第 1 个账号",
+                "标识：A7example",
+                "筛选处理后作品数量: 1",
+                "下载视频作品 1 个",
+                "跳过视频作品 0 个",
+                "下载图集作品 0 个",
+                "跳过图集作品 0 个",
+                "下载实况作品 0 个",
+                "跳过实况作品 0 个",
+                "[ERROR]: 后续处理失败",
+                "跳过实况作品 0 个",
+            ],
+            self._planned(7),
+        )
+
+        self.assertEqual(summary.started_outcomes[0].status, AccountStatus.ERROR)
+
+    def test_out_of_order_unique_task_indices_are_unreliable(self) -> None:
+        summary = self._parse(
+            [
+                "开始处理第 2 个账号",
+                "标识：A20example",
+                "筛选处理后作品数量: 0",
+                "开始处理第 1 个账号",
+                "标识：A10example",
+                "筛选处理后作品数量: 0",
+                "开始处理第 3 个账号",
+                "标识：A30example",
+                "筛选处理后作品数量: 0",
+            ],
+            self._planned(10, 20, 30),
+        )
+
+        self.assertFalse(summary.reliable)
+        self.assertTrue(any("顺序" in reason for reason in summary.reasons))
 
 
 if __name__ == "__main__":
