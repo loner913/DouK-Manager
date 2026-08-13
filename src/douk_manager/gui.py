@@ -1014,6 +1014,7 @@ class MainWindow(QMainWindow):
                 )
                 self.queue_active = False
                 self.queue_current = None
+                self._release_download_lifecycle()
                 return
             if self.queue_summaries_complete and self.queue_summaries_reliable:
                 summary_conclusion = "每个任务的账号汇总均完整且可靠。"
@@ -1039,17 +1040,21 @@ class MainWindow(QMainWindow):
             self._append_info(self.queue_output, *(messages or []), final_message)
             self.queue_active = False
             self.queue_current = None
+            self._release_download_lifecycle()
             return
         path = self.queue_pending.pop(0)
         run = self._run(
             lambda: self.controller.activate_and_start(
-                path, self.queue_pause_console.isChecked()
+                path,
+                self.queue_pause_console.isChecked(),
+                _queue_continuation=True,
             ),
             self.queue_output,
         )
         if run is None:
             self.queue_active = False
             self.queue_pending.clear()
+            self._release_download_lifecycle()
             return
         self.queue_current = run
         self._append_info(
@@ -1100,6 +1105,7 @@ class MainWindow(QMainWindow):
                 self.queue_pending.clear()
                 self.queue_current = None
                 self.queue_active = False
+                self._release_download_lifecycle()
                 return
 
             summary = worker.result
@@ -1108,6 +1114,7 @@ class MainWindow(QMainWindow):
                 self.queue_pending.clear()
                 self.queue_current = None
                 self.queue_active = False
+                self._release_download_lifecycle()
                 return
 
             self.queue_summaries_complete = (
@@ -1127,6 +1134,7 @@ class MainWindow(QMainWindow):
                 self.queue_pending.clear()
                 self.queue_current = None
                 self.queue_active = False
+                self._release_download_lifecycle()
                 return
             if messages:
                 self._append_info(self.queue_output, *messages)
@@ -1139,6 +1147,11 @@ class MainWindow(QMainWindow):
             self.download_summary_exit_code = None
             self.download_summary_assessment = None
             self.refresh_all()
+
+    def _release_download_lifecycle(self) -> None:
+        release = getattr(self.controller, "release_download_lifecycle", None)
+        if release is not None:
+            release()
 
     def _poll_processes(self) -> None:
         if not self.queue_active or self.queue_current is None:

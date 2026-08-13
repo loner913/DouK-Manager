@@ -284,6 +284,7 @@ class EngineService:
                 run.started_at,
                 ended_at,
                 len(run.planned_accounts),
+                run.planned_accounts,
             )
             summary = parse_download_summary(run.planned_accounts, located, exit_code)
             block = format_summary_for_task_log(summary, ended_at)

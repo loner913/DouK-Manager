@@ -246,9 +246,13 @@ class _AccountBlock:
     private: bool = False
     anomaly_signal: bool = False
     unrecovered_error: bool = False
+    statistics_conflict: bool = False
 
     def set_total(self, category: str, downloaded: bool, value: int) -> None:
         field = ("downloaded_" if downloaded else "skipped_") + category
+        previous = getattr(self, field)
+        if previous is not None and previous != value:
+            self.statistics_conflict = True
         setattr(self, field, value)
 
     def clear_final_statistics(self) -> None:
@@ -259,6 +263,7 @@ class _AccountBlock:
         self.skipped_video = None
         self.skipped_gallery = None
         self.skipped_live = None
+        self.statistics_conflict = False
 
     @property
     def all_final_totals_present(self) -> bool:
@@ -276,8 +281,8 @@ class _AccountBlock:
 
     @property
     def final_statistics_complete(self) -> bool:
-        if self.filtered_count == 0:
-            return True
+        if self.statistics_conflict:
+            return False
         totals = (
             self.downloaded_video,
             self.downloaded_gallery,
@@ -286,8 +291,12 @@ class _AccountBlock:
             self.skipped_gallery,
             self.skipped_live,
         )
-        return self.filtered_count is not None and all(
-            value is not None for value in totals
+        if self.filtered_count == 0:
+            return all(value in (None, 0) for value in totals)
+        return (
+            self.filtered_count is not None
+            and all(value is not None for value in totals)
+            and sum(value or 0 for value in totals) == self.filtered_count
         )
 
     @property
@@ -320,6 +329,7 @@ _TOTAL_RE = re.compile(r"(下载|跳过)(视频|图集|实况)作品\s*(\d+)\s*�
 _PRE_START_MARK_RE = re.compile(
     r"['\"]mark['\"]\s*:\s*['\"]([^'\"]+)['\"]", re.IGNORECASE
 )
+_RUN_ANCHOR_RE = re.compile(r"共有\s*\d+\s*个账号的作品等待下载")
 _CATEGORY_NAMES = {"视频": "video", "图集": "gallery", "实况": "live"}
 _READ_CHUNK_SIZE = 64 * 1024
 _MAX_BUFFERED_LINE_SIZE = 1024 * 1024
@@ -334,12 +344,14 @@ def freeze_planned_accounts(document: dict) -> tuple[PlannedAccount, ...]:
     for position, raw in enumerate(accounts, start=1):
         if not isinstance(raw, dict):
             raise SummaryInputError(f"settings.json 的 A{position} 不是对象。")
-        url = str(raw.get("url", "")).strip()
+        url = raw.get("url", "")
+        url = url.strip() if isinstance(url, str) else ""
         if not raw.get("enable", True) or not url:
             continue
-        mark = str(raw.get("mark", "")).strip()
-        if re.match(rf"^A{position}(?!\d)", mark, re.IGNORECASE) is None:
-            raise SummaryInputError(f"settings.json 的 A{position} mark 与数组位置不一致。")
+        mark = raw.get("mark", "")
+        if not isinstance(mark, str) or not mark.strip():
+            raise SummaryInputError(f"settings.json 的 A{position} 缺少有效 mark。")
+        mark = mark.strip()
         planned.append(PlannedAccount(len(planned) + 1, position, mark))
     if not planned:
         raise SummaryInputError("settings.json 没有启用且 URL 有效的账号。")
@@ -365,48 +377,62 @@ def locate_native_logs(
     started_at: datetime,
     ended_at: datetime,
     planned_count: int,
+    planned_accounts: tuple[PlannedAccount, ...] = (),
 ) -> LocatedNativeLogs:
-    del ended_at
     before_by_path = {
         str(state.path.resolve()).casefold(): state
         for state in before
     }
     earliest_mtime = (started_at - timedelta(seconds=2)).timestamp()
-    candidates: list[NativeLogSegment] = []
+    latest_mtime = (ended_at + timedelta(seconds=2)).timestamp()
+    candidate_records: list[tuple[int, str, NativeLogSegment]] = []
     if log_dir.is_dir():
-        for path in sorted(log_dir.glob("*.log"), key=lambda item: item.name.casefold()):
+        for path in log_dir.glob("*.log"):
             try:
                 resolved = path.resolve()
                 stat = resolved.stat()
             except OSError:
                 continue
-            if stat.st_mtime < earliest_mtime:
+            if stat.st_mtime < earliest_mtime or stat.st_mtime > latest_mtime:
                 continue
             state = before_by_path.get(str(resolved).casefold())
             if state is None:
-                candidates.append(NativeLogSegment(resolved, 0, stat.st_size))
+                segment = NativeLogSegment(resolved, 0, stat.st_size)
             elif stat.st_size > state.size:
-                candidates.append(
-                    NativeLogSegment(resolved, state.size, stat.st_size - state.size)
+                segment = NativeLogSegment(
+                    resolved, state.size, stat.st_size - state.size
                 )
+            else:
+                continue
+            candidate_records.append(
+                (stat.st_mtime_ns, resolved.name.casefold(), segment)
+            )
 
-    if len(candidates) == 1:
-        return LocatedNativeLogs(tuple(candidates), "size-delta", True)
+    candidate_records.sort(key=lambda item: (item[0], item[1]))
+    candidates = [item[2] for item in candidate_records]
+
     if not candidates:
         return LocatedNativeLogs((), "size-delta", False, "未找到本次新增或增长的原生日志。")
 
     anchor = f"共有 {planned_count} 个账号的作品等待下载"
     evaluations = [_evaluate_log_segment(segment, anchor) for segment in candidates]
-    scores = [evaluation[0] for evaluation in evaluations]
-    highest_score = max(scores)
-    winning_index = scores.index(highest_score)
-    if (
-        highest_score > 0
-        and scores.count(highest_score) == 1
-        and evaluations[winning_index][1]
-    ):
+    anchor_indices = [index for index, evaluation in enumerate(evaluations) if evaluation]
+    if len(anchor_indices) == 1:
+        first_index = anchor_indices[0]
+        segments = _select_run_segments(
+            candidates,
+            first_index,
+            planned_count,
+            planned_accounts,
+        )
+        if segments is not None:
+            return LocatedNativeLogs(segments, "size-delta-anchor", True)
+    if len(candidates) == 1:
         return LocatedNativeLogs(
-            (candidates[winning_index],), "size-delta-anchor", True
+            tuple(candidates),
+            "size-delta-anchor",
+            False,
+            "本次原生日志缺少运行锚点。",
         )
     return LocatedNativeLogs(
         (),
@@ -418,7 +444,7 @@ def locate_native_logs(
 
 def _evaluate_log_segment(
     segment: NativeLogSegment, planned_count_anchor: str
-) -> tuple[int, bool]:
+) -> bool:
     try:
         with segment.path.open("rb") as handle:
             handle.seek(segment.offset)
@@ -426,12 +452,80 @@ def _evaluate_log_segment(
                 "utf-8-sig", errors="replace"
             )
     except OSError:
-        return 0, False
-    has_planned_count_anchor = planned_count_anchor in content
-    score = 1 if has_planned_count_anchor else 0
-    if "开始处理第 1 个账号" in content:
-        score += 1
-    return score, has_planned_count_anchor
+        return False
+    return planned_count_anchor in content
+
+
+def _select_run_segments(
+    candidates: list[NativeLogSegment],
+    first_index: int,
+    planned_count: int,
+    planned_accounts: tuple[PlannedAccount, ...],
+) -> tuple[NativeLogSegment, ...] | None:
+    selected = [candidates[first_index]]
+    try:
+        events = _segment_task_events(candidates[first_index], planned_accounts)
+        if not _events_continue_after(events, 0, planned_count):
+            return None
+        last_event = events[-1] if events else 0
+
+        for segment in candidates[first_index + 1 :]:
+            if last_event >= planned_count or _segment_has_run_anchor(segment):
+                break
+            continuation = _segment_task_events(segment, planned_accounts)
+            if not continuation:
+                continue
+            if not _events_continue_after(continuation, last_event, planned_count):
+                return None
+            selected.append(segment)
+            last_event = continuation[-1]
+    except (OSError, UnicodeError, _LogReadError):
+        return None
+    return tuple(selected)
+
+
+def _segment_has_run_anchor(segment: NativeLogSegment) -> bool:
+    try:
+        with segment.path.open("rb") as handle:
+            handle.seek(segment.offset)
+            content = handle.read(min(segment.length, 64 * 1024)).decode(
+                "utf-8-sig", errors="replace"
+            )
+    except OSError:
+        return False
+    return _RUN_ANCHOR_RE.search(content) is not None
+
+
+def _segment_task_events(
+    segment: NativeLogSegment,
+    planned_accounts: tuple[PlannedAccount, ...],
+) -> tuple[int, ...]:
+    events: list[int] = []
+    for line in _iter_segment_lines(segment):
+        start_match = _START_RE.search(line)
+        if start_match:
+            events.append(int(start_match.group(1)))
+            continue
+        if "提取 sec_user_id 失败，错误配置：" not in line:
+            continue
+        mark_match = _PRE_START_MARK_RE.search(line)
+        if not mark_match:
+            continue
+        planned = _match_pre_start_mark(
+            mark_match.group(1).strip(), planned_accounts
+        )
+        if planned is not None:
+            events.append(planned.task_index)
+    return tuple(events)
+
+
+def _events_continue_after(
+    events: tuple[int, ...], previous: int, planned_count: int
+) -> bool:
+    if not events:
+        return True
+    expected = tuple(range(previous + 1, previous + 1 + len(events)))
+    return events == expected and events[-1] <= planned_count
 
 
 def parse_download_summary(
@@ -440,7 +534,6 @@ def parse_download_summary(
     exit_code: int | None,
 ) -> DownloadSummary:
     plan_by_index = {account.task_index: account for account in planned_accounts}
-    plan_by_a_number = {account.a_number: account for account in planned_accounts}
     reasons: list[str] = []
     started_outcomes: list[AccountOutcome] = []
     started_indices: set[int] = set()
@@ -448,7 +541,7 @@ def parse_download_summary(
     pre_start_indices: set[int] = set()
     current: _AccountBlock | None = None
     parser_aborted = False
-    last_started_index = 0
+    last_event_index = 0
 
     if not located.reliable:
         _add_reason(reasons, located.reason or "原生日志定位不可靠。")
@@ -466,6 +559,22 @@ def parse_download_summary(
                 reasons,
                 f"任务序号 {block.task_index} 的日志 A 编号与冻结映射不一致。",
             )
+            return
+        observed_total = block.downloaded_total + block.skipped_total
+        totals_exceed_filtered = (
+            block.filtered_count is not None
+            and observed_total > block.filtered_count
+        )
+        complete_totals_disagree = (
+            block.all_final_totals_present
+            and observed_total != block.filtered_count
+        )
+        if (
+            block.statistics_conflict
+            or totals_exceed_filtered
+            or complete_totals_disagree
+        ):
+            _add_reason(reasons, f"任务序号 {block.task_index} 的最终统计不一致。")
             return
         status = (
             AccountStatus.INTERRUPTED if force_interrupted else _classify_block(block)
@@ -511,9 +620,9 @@ def parse_download_summary(
                         reasons,
                         f"任务序号 {task_index} 同时被标记为启动前错误和已开始。",
                     )
-                if task_index <= last_started_index:
+                if task_index <= last_event_index:
                     _add_reason(reasons, f"日志任务序号 {task_index} 顺序异常。")
-                last_started_index = max(last_started_index, task_index)
+                last_event_index = max(last_event_index, task_index)
                 observed_started_indices.add(task_index)
                 current = _AccountBlock(task_index, plan_by_index.get(task_index))
                 continue
@@ -539,13 +648,16 @@ def parse_download_summary(
                             f"任务序号 {planned.task_index} 同时被标记为启动前错误和已开始。",
                         )
                     else:
+                        if planned.task_index <= last_event_index:
+                            _add_reason(reasons, f"日志任务序号 {planned.task_index} 顺序异常。")
                         pre_start_indices.add(planned.task_index)
+                        last_event_index = max(last_event_index, planned.task_index)
                 else:
                     _add_reason(reasons, "启动前错误缺少可识别的严格 A 编号。")
                 continue
 
             if current is not None:
-                _consume_account_line(current, line, plan_by_a_number)
+                _consume_account_line(current, line)
         if current is not None:
             finalize(current)
     except _LogReadError as exc:
@@ -643,20 +755,21 @@ def parse_download_summary(
 def _consume_account_line(
     block: _AccountBlock,
     line: str,
-    plan_by_a_number: dict[int, PlannedAccount],
 ) -> None:
     mark_match = _LOGGED_MARK_RE.search(line)
     if mark_match:
         logged_mark = mark_match.group(1).strip()
-        matched_number = _match_logged_mark(logged_mark, block.mapped, plan_by_a_number)
-        if matched_number is not None:
-            block.logged_a_number = matched_number
+        if block.mapped is not None and logged_mark == block.mapped.mark:
+            block.logged_a_number = block.mapped.a_number
         else:
             block.logged_mark_mismatch = True
 
     filtered_match = _FILTERED_RE.search(line)
     if filtered_match:
-        block.filtered_count = int(filtered_match.group(1))
+        value = int(filtered_match.group(1))
+        if block.filtered_count is not None and block.filtered_count != value:
+            block.statistics_conflict = True
+        block.filtered_count = value
 
     total_match = _TOTAL_RE.search(line)
     if total_match:
@@ -696,32 +809,6 @@ def _classify_block(block: _AccountBlock) -> AccountStatus:
     if block.filtered_count == 0:
         return AccountStatus.NO_ELIGIBLE_WORKS
     return AccountStatus.INTERRUPTED
-
-
-def _match_logged_mark(
-    logged_mark: str,
-    mapped: PlannedAccount | None,
-    plan_by_a_number: dict[int, PlannedAccount],
-) -> int | None:
-    if mapped is None:
-        return None
-    if logged_mark == mapped.mark:
-        return mapped.a_number
-    prefix = f"A{mapped.a_number}"
-    if not logged_mark.startswith(prefix) or mapped.mark != prefix:
-        return None
-    candidates = sorted(
-        (
-            a_number
-            for a_number in plan_by_a_number
-            if logged_mark.startswith(f"A{a_number}")
-        ),
-        key=lambda value: len(str(value)),
-        reverse=True,
-    )
-    if candidates and candidates[0] == mapped.a_number:
-        return mapped.a_number
-    return None
 
 
 def _match_pre_start_mark(
@@ -792,7 +879,7 @@ def _iter_segment_lines(segment: NativeLogSegment) -> Iterator[str]:
         if "\ufffd" in buffer:
             raise _LogReadError("原生日志包含无法解码的 UTF-8 编码。")
         if buffer:
-            yield buffer.rstrip("\r")
+            raise _LogReadError("原生日志最后一行未换行，记录不完整。")
 
 
 def _add_reason(reasons: list[str], reason: str) -> None:

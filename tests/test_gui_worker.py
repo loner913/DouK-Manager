@@ -202,6 +202,7 @@ class ActionWorkerTests(unittest.TestCase):
             run_post_actions=Mock(return_value=[]),
             create_task=Mock(),
             activate_task=Mock(),
+            release_download_lifecycle=Mock(),
         )
         window.queue_output = Mock()
         window.queue_active = True
@@ -320,6 +321,7 @@ class ActionWorkerTests(unittest.TestCase):
         self.assertEqual(window.queue_pending, [])
         window.controller.run_post_actions.assert_not_called()
         window._start_next_queue_item.assert_not_called()
+        window.controller.release_download_lifecycle.assert_called_once_with()
 
     def test_summary_error_stops_queue_without_advancing(self) -> None:
         window = self._window_harness()
@@ -345,6 +347,7 @@ class ActionWorkerTests(unittest.TestCase):
         window.controller.run_post_actions.assert_not_called()
         window._start_next_queue_item.assert_not_called()
         window.controller.logger.exception.assert_called_once()
+        window.controller.release_download_lifecycle.assert_called_once_with()
 
     def test_completion_always_releases_dedicated_summary_state(self) -> None:
         window = self._window_harness(exit_code=2)

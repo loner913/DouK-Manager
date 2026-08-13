@@ -641,6 +641,103 @@ class DownloadSummaryParserTests(unittest.TestCase):
         self.assertFalse(summary.reliable)
         self.assertTrue(any("不一致" in reason for reason in summary.reasons))
 
+    def test_prefix_like_logged_mark_never_matches_frozen_mark(self) -> None:
+        summary = self._parse(
+            [
+                "开始处理第 1 个账号",
+                "标识：A10other",
+                "筛选处理后作品数量: 0",
+            ],
+            (PlannedAccount(1, 1, "A1"),),
+        )
+
+        self.assertFalse(summary.reliable)
+        self.assertEqual(summary.started_outcomes, ())
+
+    def test_conflicting_or_contradictory_final_totals_are_unreliable(self) -> None:
+        summary = self._parse(
+            [
+                "开始处理第 1 个账号",
+                "标识：A1example",
+                "筛选处理后作品数量: 1",
+                "下载视频作品 2 个",
+                "跳过视频作品 0 个",
+                "下载图集作品 0 个",
+                "跳过图集作品 0 个",
+                "下载实况作品 0 个",
+                "跳过实况作品 0 个",
+            ],
+            self._planned(1),
+        )
+
+        self.assertFalse(summary.reliable)
+        self.assertFalse(summary.complete)
+
+    def test_zero_filtered_count_with_nonzero_partial_total_is_unreliable(self) -> None:
+        summary = self._parse(
+            [
+                "开始处理第 1 个账号",
+                "标识：A1example",
+                "筛选处理后作品数量: 0",
+                "下载视频作品 1 个",
+            ],
+            self._planned(1),
+        )
+
+        self.assertFalse(summary.reliable)
+        self.assertEqual(summary.started_outcomes, ())
+
+    def test_error_discards_prior_conflicting_statistics_before_recovery(self) -> None:
+        summary = self._parse(
+            [
+                "开始处理第 1 个账号",
+                "标识：A1example",
+                "筛选处理后作品数量: 1",
+                "下载视频作品 2 个",
+                "[ERROR]: 本轮统计作废并重试",
+                "筛选处理后作品数量: 1",
+                "下载视频作品 1 个",
+                "跳过视频作品 0 个",
+                "下载图集作品 0 个",
+                "跳过图集作品 0 个",
+                "下载实况作品 0 个",
+                "跳过实况作品 0 个",
+            ],
+            self._planned(1),
+        )
+
+        self.assertTrue(summary.reliable)
+        self.assertEqual(summary.started_outcomes[0].status, AccountStatus.DOWNLOADED)
+        self.assertTrue(summary.started_outcomes[0].completed_with_anomaly)
+
+    def test_pre_start_and_started_events_share_strict_order(self) -> None:
+        summary = self._parse(
+            [
+                "配置文件 accounts_urls 参数的 url redacted 提取 sec_user_id 失败，错误配置：{'mark': 'A20example'}",
+                "开始处理第 1 个账号",
+                "标识：A10example",
+                "筛选处理后作品数量: 0",
+            ],
+            self._planned(10, 20),
+        )
+
+        self.assertFalse(summary.reliable)
+        self.assertEqual(summary.not_started, ())
+
+    def test_unterminated_final_record_is_not_accepted(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "native.log"
+        path.write_text("开始处理第 1 个账号\n标识：A1example", encoding="utf-8")
+        summary = parse_download_summary(
+            self._planned(1),
+            LocatedNativeLogs((NativeLogSegment(path, 0, path.stat().st_size),), "synthetic", True),
+            0,
+        )
+
+        self.assertFalse(summary.reliable)
+        self.assertFalse(summary.complete)
+
     def test_repeated_cached_stat_line_does_not_recover_latest_error(self) -> None:
         summary = self._parse(
             [
