@@ -193,6 +193,52 @@ class DownloadSummaryParserTests(unittest.TestCase):
         self.assertFalse(summary.reliable)
         self.assertTrue(any("缺少" in reason for reason in summary.reasons))
 
+    def test_nonzero_exit_trailing_unmarked_account_uses_frozen_mapping(self) -> None:
+        summary = self._parse(
+            [
+                "开始处理第 1 个账号",
+                "标识：A51example",
+                "筛选处理后作品数量: 0",
+                "开始处理第 2 个账号",
+            ],
+            self._planned(51, 52, 53),
+            exit_code=0xC000013A,
+        )
+
+        self.assertTrue(summary.reliable)
+        self.assertFalse(summary.complete)
+        self.assertEqual(summary.started_count, 2)
+        self.assertEqual(
+            summary.started_outcomes[1].status, AccountStatus.INTERRUPTED
+        )
+        self.assertEqual(summary.started_outcomes[1].a_number, 52)
+        self.assertEqual(summary.not_started, (53,))
+
+    def test_nonzero_exit_does_not_trust_earlier_unmarked_account(self) -> None:
+        summary = self._parse(
+            [
+                "开始处理第 1 个账号",
+                "开始处理第 2 个账号",
+                "标识：A52example",
+                "筛选处理后作品数量: 0",
+            ],
+            self._planned(51, 52),
+            exit_code=0xC000013A,
+        )
+
+        self.assertFalse(summary.reliable)
+        self.assertTrue(any("缺少" in reason for reason in summary.reasons))
+
+    def test_nonzero_exit_never_accepts_a_conflicting_trailing_mark(self) -> None:
+        summary = self._parse(
+            ["开始处理第 1 个账号", "标识：A99wrong"],
+            self._planned(51),
+            exit_code=0xC000013A,
+        )
+
+        self.assertFalse(summary.reliable)
+        self.assertTrue(any("不一致" in reason for reason in summary.reasons))
+
     def test_read_failure_finalizes_current_as_interrupted_without_trailing_guess(
         self,
     ) -> None:

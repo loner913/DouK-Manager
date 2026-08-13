@@ -96,14 +96,16 @@ class DownloadSummary:
 
 
 _STATUS_DEFINITIONS = (
+    "已开始账号主状态：每个实际开始账号只计入一种主状态，六类主状态合计等于实际开始账号数。",
     "有新作品下载：日志最终统计的下载作品数大于 0。",
     "作品均被引擎跳过：筛选后有作品，但视频、图集和实况最终全部计入跳过。",
     "无符合条件作品：筛选处理后的作品数量为 0。",
     "私密账号：出现明确的私密账号提示。",
-    "处理异常，需核对：账号块中出现无法确认已恢复的错误，或 URL/sec_user_id 解析失败而未进入账号处理。",
-    "完成但有异常记录：出现网络中断或重试，但之后仍产生完整的作品统计；该项是附加备注，不重复计入主状态数量。",
+    "处理异常，需核对（已开始主状态）：账号块中出现无法确认已恢复的错误。",
     "处理中断：账号已经开始处理，但进程结束前未形成可确认的最终结果。",
-    "未开始：仅指本次任务启动时 enable=true 且 URL 有效、但在进程结束前尚未轮到的账号；本次 enable=false 或 URL 为空的账号不参与统计。",
+    "进入处理前异常（不计入已开始主状态合计）：URL/sec_user_id 解析失败而未进入账号处理。",
+    "未开始（不计入已开始主状态合计）：仅指本次任务启动时 enable=true 且 URL 有效、但在进程结束前尚未轮到的账号；本次 enable=false 或 URL 为空的账号不参与统计。",
+    "完成但有异常记录（附加状态，可与主状态重叠，不计入主状态合计）：出现网络中断或重试，但之后仍产生完整的作品统计。",
     "结果不完整：用户停止、异常退出、日志截断、计划账号未全部完成，或其他证据不足导致无法确认完整任务结果。",
 )
 
@@ -164,27 +166,31 @@ def _format_process_outcome(exit_code: int | None) -> str:
 
 def _format_account_result_lines(summary: DownloadSummary) -> list[str]:
     status = "完整" if summary.complete else "结果不完整"
-    error_numbers = tuple(
-        sorted(set(summary.numbers_for(AccountStatus.ERROR) + summary.pre_start_errors))
-    )
+    started_error_numbers = summary.numbers_for(AccountStatus.ERROR)
+    pre_start_error_numbers = summary.pre_start_errors
     lines = [
         f"账号汇总：{status}",
         f"计划账号：{summary.planned_count}",
         f"实际开始：{summary.started_count}",
+        "【已开始账号主状态（互斥，以下六项合计=实际开始）】",
         f"有新作品下载：{summary.primary_status_counts[AccountStatus.DOWNLOADED]}",
         f"作品均被引擎跳过：{summary.primary_status_counts[AccountStatus.ALL_SKIPPED]}",
         f"无符合条件作品：{summary.primary_status_counts[AccountStatus.NO_ELIGIBLE_WORKS]}",
         f"私密账号：{summary.primary_status_counts[AccountStatus.PRIVATE]}",
-        f"处理异常，需核对：{len(error_numbers)}",
+        f"处理异常，需核对（已开始主状态）：{summary.primary_status_counts[AccountStatus.ERROR]}",
         f"处理中断：{summary.primary_status_counts[AccountStatus.INTERRUPTED]}",
-        f"未开始：{len(summary.not_started)}",
-        f"完成但有异常记录：{len(summary.completed_with_anomaly)}",
+        "【未进入处理的计划账号（不计入已开始主状态合计）】",
+        f"进入处理前异常（不计入主状态合计）：{len(pre_start_error_numbers)}",
+        f"未开始（不计入主状态合计）：{len(summary.not_started)}",
+        "【附加状态（可与主状态重叠，不计入主状态合计）】",
+        f"完成但有异常记录（附加状态，不计入主状态合计）：{len(summary.completed_with_anomaly)}",
     ]
     _append_number_line(lines, "私密账号", summary.numbers_for(AccountStatus.PRIVATE))
-    _append_number_line(lines, "处理异常", error_numbers)
+    _append_number_line(lines, "已开始后处理异常", started_error_numbers)
+    _append_number_line(lines, "进入处理前异常", pre_start_error_numbers)
     _append_number_line(lines, "处理中断", summary.numbers_for(AccountStatus.INTERRUPTED))
     _append_number_line(lines, "未开始", summary.not_started)
-    _append_number_line(lines, "异常后完成", summary.completed_with_anomaly)
+    _append_number_line(lines, "附加状态：异常后完成", summary.completed_with_anomaly)
     lines.extend(
         f"原生日志：{segment.path.resolve()}" for segment in summary.located.segments
     )
@@ -546,7 +552,12 @@ def parse_download_summary(
     if not located.reliable:
         _add_reason(reasons, located.reason or "原生日志定位不可靠。")
 
-    def finalize(block: _AccountBlock, *, force_interrupted: bool = False) -> None:
+    def finalize(
+        block: _AccountBlock,
+        *,
+        force_interrupted: bool = False,
+        allow_trailing_unmarked_interrupted: bool = False,
+    ) -> None:
         mapped = block.mapped
         if mapped is None or block.task_index in started_indices:
             return
@@ -579,7 +590,17 @@ def parse_download_summary(
         status = (
             AccountStatus.INTERRUPTED if force_interrupted else _classify_block(block)
         )
-        if status is not AccountStatus.PRIVATE and block.logged_a_number is None:
+        frozen_interrupted_identity = (
+            allow_trailing_unmarked_interrupted
+            and status is AccountStatus.INTERRUPTED
+            and exit_code is not None
+            and exit_code != 0
+        )
+        if (
+            status is not AccountStatus.PRIVATE
+            and block.logged_a_number is None
+            and not frozen_interrupted_identity
+        ):
             _add_reason(
                 reasons,
                 f"任务序号 {block.task_index} 缺少可验证的日志 A 编号。",
@@ -659,7 +680,12 @@ def parse_download_summary(
             if current is not None:
                 _consume_account_line(current, line)
         if current is not None:
-            finalize(current)
+            finalize(
+                current,
+                allow_trailing_unmarked_interrupted=(
+                    exit_code is not None and exit_code != 0
+                ),
+            )
     except _LogReadError as exc:
         _add_reason(reasons, str(exc))
         parser_aborted = True

@@ -62,19 +62,32 @@ class DownloadSummaryOutputTests(unittest.TestCase):
         self.assertIn("账号汇总：结果不完整", lines)
         self.assertIn("计划账号：12", lines)
         self.assertIn("实际开始：8", lines)
+        self.assertIn(
+            "【已开始账号主状态（互斥，以下六项合计=实际开始）】", lines
+        )
         self.assertIn("有新作品下载：2", lines)
         self.assertIn("作品均被引擎跳过：2", lines)
         self.assertIn("无符合条件作品：1", lines)
         self.assertIn("私密账号：1", lines)
-        self.assertIn("处理异常，需核对：2", lines)
+        self.assertIn("处理异常，需核对（已开始主状态）：1", lines)
         self.assertIn("处理中断：1", lines)
-        self.assertIn("未开始：3", lines)
-        self.assertIn("完成但有异常记录：2", lines)
+        self.assertIn(
+            "【未进入处理的计划账号（不计入已开始主状态合计）】", lines
+        )
+        self.assertIn("进入处理前异常（不计入主状态合计）：1", lines)
+        self.assertIn("未开始（不计入主状态合计）：3", lines)
+        self.assertIn(
+            "【附加状态（可与主状态重叠，不计入主状态合计）】", lines
+        )
+        self.assertIn(
+            "完成但有异常记录（附加状态，不计入主状态合计）：2", lines
+        )
         self.assertIn("私密账号（1）：A55", lines)
-        self.assertIn("处理异常（2）：A68、A70", lines)
+        self.assertIn("已开始后处理异常（1）：A68", lines)
+        self.assertIn("进入处理前异常（1）：A70", lines)
         self.assertIn("处理中断（1）：A81", lines)
         self.assertIn("未开始（3）：A82-A84", lines)
-        self.assertIn("异常后完成（2）：A61、A74", lines)
+        self.assertIn("附加状态：异常后完成（2）：A61、A74", lines)
         self.assertIn(f"原生日志：{NATIVE_LOG.resolve()}", lines)
         joined = "\n".join(lines)
         self.assertNotIn("有新作品下载（", joined)
@@ -91,21 +104,24 @@ class DownloadSummaryOutputTests(unittest.TestCase):
         self.assertIn(f"日志区间：{NATIVE_LOG.resolve()}；偏移=128；长度=4096", text)
         self.assertIn("一级核对（计划账号=实际开始+进入处理前异常+未开始）：通过", text)
         self.assertIn("二级核对（实际开始=各主状态之和）：通过", text)
-        self.assertIn("处理异常（2）：A68、A70", text)
+        self.assertIn("已开始后处理异常（1）：A68", text)
+        self.assertIn("进入处理前异常（1）：A70", text)
         self.assertIn("私密账号（1）：A55", text)
         self.assertIn("处理中断（1）：A81", text)
         self.assertIn("未开始（3）：A82-A84", text)
-        self.assertIn("异常后完成（2）：A61、A74", text)
+        self.assertIn("附加状态：异常后完成（2）：A61、A74", text)
         self.assertIn("【状态说明】", text)
         expected_definitions = (
+            "已开始账号主状态：每个实际开始账号只计入一种主状态，六类主状态合计等于实际开始账号数。",
             "有新作品下载：日志最终统计的下载作品数大于 0。",
             "作品均被引擎跳过：筛选后有作品，但视频、图集和实况最终全部计入跳过。",
             "无符合条件作品：筛选处理后的作品数量为 0。",
             "私密账号：出现明确的私密账号提示。",
-            "处理异常，需核对：账号块中出现无法确认已恢复的错误，或 URL/sec_user_id 解析失败而未进入账号处理。",
-            "完成但有异常记录：出现网络中断或重试，但之后仍产生完整的作品统计；该项是附加备注，不重复计入主状态数量。",
+            "处理异常，需核对（已开始主状态）：账号块中出现无法确认已恢复的错误。",
             "处理中断：账号已经开始处理，但进程结束前未形成可确认的最终结果。",
-            "未开始：仅指本次任务启动时 enable=true 且 URL 有效、但在进程结束前尚未轮到的账号；本次 enable=false 或 URL 为空的账号不参与统计。",
+            "进入处理前异常（不计入已开始主状态合计）：URL/sec_user_id 解析失败而未进入账号处理。",
+            "未开始（不计入已开始主状态合计）：仅指本次任务启动时 enable=true 且 URL 有效、但在进程结束前尚未轮到的账号；本次 enable=false 或 URL 为空的账号不参与统计。",
+            "完成但有异常记录（附加状态，可与主状态重叠，不计入主状态合计）：出现网络中断或重试，但之后仍产生完整的作品统计。",
             "结果不完整：用户停止、异常退出、日志截断、计划账号未全部完成，或其他证据不足导致无法确认完整任务结果。",
         )
         for definition in expected_definitions:
