@@ -1390,9 +1390,11 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
     def closeEvent(self, event) -> None:  # noqa: N802
-        if self.download_summary_thread is not None:
+        if self.queue_current is not None or self.download_summary_thread is not None:
             QMessageBox.information(
-                self, "账号结果汇总中", "请等待账号结果汇总完成后再关闭管理器。"
+                self,
+                "下载任务尚未汇总完成",
+                "请等待当前下载任务结束并完成账号结果汇总后再关闭管理器。",
             )
             event.ignore()
             return

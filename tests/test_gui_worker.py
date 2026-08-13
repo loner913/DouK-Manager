@@ -383,6 +383,58 @@ class ActionWorkerTests(unittest.TestCase):
         event.accept.assert_not_called()
         window.controller.stop_collector.assert_not_called()
 
+    def test_close_rejects_running_current_before_summary_thread_exists(self) -> None:
+        window = self._window_harness()
+        window.queue_current.running = True
+        window.download_summary_thread = None
+        window.background_thread = None
+        window.controller.stop_collector = Mock()
+        event = SimpleNamespace(ignore=Mock(), accept=Mock())
+
+        with patch.object(gui_module.QMessageBox, "information") as information:
+            MainWindow.closeEvent(window, event)
+
+        information.assert_called_once()
+        message = " ".join(str(value) for value in information.call_args.args[1:])
+        self.assertIn("账号结果汇总", message)
+        event.ignore.assert_called_once_with()
+        event.accept.assert_not_called()
+        window.controller.stop_collector.assert_not_called()
+
+    def test_close_rejects_exited_current_before_summary_poll(self) -> None:
+        window = self._window_harness(exit_code=0)
+        self.assertFalse(window.queue_current.running)
+        window.download_summary_thread = None
+        window.background_thread = None
+        window.controller.stop_collector = Mock()
+        event = SimpleNamespace(ignore=Mock(), accept=Mock())
+
+        with patch.object(gui_module.QMessageBox, "information") as information:
+            MainWindow.closeEvent(window, event)
+
+        information.assert_called_once()
+        message = " ".join(str(value) for value in information.call_args.args[1:])
+        self.assertIn("账号结果汇总", message)
+        event.ignore.assert_called_once_with()
+        event.accept.assert_not_called()
+        window.controller.stop_collector.assert_not_called()
+
+    def test_close_accepts_when_no_current_run_or_background_work_exists(self) -> None:
+        window = self._window_harness()
+        window.queue_current = None
+        window.download_summary_thread = None
+        window.background_thread = None
+        window.controller.stop_collector = Mock()
+        event = SimpleNamespace(ignore=Mock(), accept=Mock())
+
+        with patch.object(gui_module.QMessageBox, "information") as information:
+            MainWindow.closeEvent(window, event)
+
+        information.assert_not_called()
+        event.ignore.assert_not_called()
+        event.accept.assert_called_once_with()
+        window.controller.stop_collector.assert_called_once_with()
+
     def test_final_queue_conclusion_flags_incomplete_or_unreliable_summary(self) -> None:
         window = self._window_harness()
         window.queue_pending = []
