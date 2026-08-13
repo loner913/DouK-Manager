@@ -61,11 +61,22 @@ class InformationFormattingTests(unittest.TestCase):
         self.assertIn('f"队列开始，共 {len(paths)} 个任务。"', gui_source)
         self.assertIn('f"本次执行顺序：{order_text}"', gui_source)
         self.assertIn(
-            "assessment.detail,\n            merge=True,",
+            'assessment.detail,\n            "正在汇总账号结果，请等待。",\n'
+            "            merge=True,",
             gui_source,
         )
         self.assertIn('self.controller.logger.info("队列后续动作：%s", line)', gui_source)
         self.assertNotIn('post_summary = "；".join(messages)', gui_source)
+
+    def test_queue_conclusion_comes_from_completed_account_summaries(self) -> None:
+        gui_source = (
+            Path(__file__).parents[1] / "src" / "douk_manager" / "gui.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertNotIn("账号下载结果需核对下载器原生日志", gui_source)
+        self.assertIn("每个任务的账号汇总均完整且可靠", gui_source)
+        self.assertIn("至少一个任务的账号汇总不完整或不可靠", gui_source)
+        self.assertNotIn("不代表每个账号均下载成功", gui_source)
 
     def test_information_box_defaults_to_separate_events(self) -> None:
         gui_source = (

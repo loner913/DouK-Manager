@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from douk_manager.controller import ManagerController
+from douk_manager.core.download_summary import format_summary_for_ui
 from douk_manager.core.engine import assess_process_exit
 from douk_manager.core.settings_tasks import EarliestRule
 from douk_manager.core.task_order import move_to_index
@@ -74,10 +75,17 @@ class MainWindow(QMainWindow):
         self.queue_pending: list[Path] = []
         self.queue_active = False
         self.queue_current = None
+        self.queue_summaries_complete = True
+        self.queue_summaries_reliable = True
         self.background_thread: QThread | None = None
         self.background_worker: ActionWorker | None = None
         self.background_output: QTextEdit | None = None
         self.background_success: Callable[[object], None] | None = None
+        self.download_summary_thread: QThread | None = None
+        self.download_summary_worker: ActionWorker | None = None
+        self.download_summary_run = None
+        self.download_summary_exit_code: int | None = None
+        self.download_summary_assessment = None
         self.setWindowTitle("DouK全流程一体化管理器")
         self.resize(1260, 820)
         self.setMinimumSize(1080, 700)
@@ -831,7 +839,19 @@ class MainWindow(QMainWindow):
                 "主档 enable：不会修改",
             )
 
+    def _queue_state_locked(self) -> bool:
+        if not self.queue_active and self.download_summary_thread is None:
+            return False
+        QMessageBox.warning(
+            self,
+            "队列运行中",
+            "当前下载任务仍在运行或正在汇总账号结果；请等待完成后再激活或启动其他任务。",
+        )
+        return True
+
     def _create_task(self, activate: bool, start: bool) -> None:
+        if activate and self._queue_state_locked():
+            return
         rule = self._earliest_rule(self.task_earliest_mode, self.task_earliest_value)
         result = self._run(
             lambda: self.controller.create_task(
@@ -865,6 +885,8 @@ class MainWindow(QMainWindow):
                     self.queue_active = True
                     self.queue_current = run
                     self.queue_pending = []
+                    self.queue_summaries_complete = True
+                    self.queue_summaries_reliable = True
                     self._append_info(
                         self.task_output, f"下载引擎已启动，PID={run.process.pid}"
                     )
@@ -903,6 +925,8 @@ class MainWindow(QMainWindow):
         ]
 
     def _activate_selected_task(self) -> None:
+        if self._queue_state_locked():
+            return
         paths = self._selected_task_paths()
         if len(paths) != 1:
             QMessageBox.information(
@@ -929,8 +953,7 @@ class MainWindow(QMainWindow):
         return bool(result)
 
     def _start_current(self) -> None:
-        if self.queue_active:
-            QMessageBox.warning(self, "队列运行中", "已有下载队列正在运行。")
+        if self._queue_state_locked():
             return
         if not self._apply_queue_options():
             return
@@ -944,13 +967,14 @@ class MainWindow(QMainWindow):
             self.queue_active = True
             self.queue_current = run
             self.queue_pending = []
+            self.queue_summaries_complete = True
+            self.queue_summaries_reliable = True
             self._append_info(
                 self.queue_output, f"启动当前 settings.json，PID={run.process.pid}"
             )
 
     def _start_queue(self) -> None:
-        if self.queue_active:
-            QMessageBox.warning(self, "队列运行中", "已有下载队列正在运行。")
+        if self._queue_state_locked():
             return
         paths = self._selected_task_paths()
         if not paths:
@@ -962,6 +986,8 @@ class MainWindow(QMainWindow):
             return
         self.queue_pending = paths
         self.queue_active = True
+        self.queue_summaries_complete = True
+        self.queue_summaries_reliable = True
         order_text = " → ".join(path.name for path in paths)
         self._append_info(
             self.queue_output,
@@ -981,9 +1007,22 @@ class MainWindow(QMainWindow):
             messages = self._run(
                 lambda: self.controller.run_post_actions("queue"), self.queue_output
             )
+            if messages is None:
+                self._append_info(
+                    self.queue_output,
+                    "【失败】队列后续动作失败；队列已停止，请检查上方错误。",
+                )
+                self.queue_active = False
+                self.queue_current = None
+                return
+            if self.queue_summaries_complete and self.queue_summaries_reliable:
+                summary_conclusion = "每个任务的账号汇总均完整且可靠。"
+            else:
+                summary_conclusion = (
+                    "至少一个任务的账号汇总不完整或不可靠；请查看上方信息及任务日志。"
+                )
             self.controller.logger.info(
-                "下载队列执行结束：所选下载器进程均正常退出；"
-                "账号下载结果需核对下载器原生日志"
+                "下载队列执行结束：%s", summary_conclusion
             )
             post_lines = [
                 line.strip()
@@ -996,10 +1035,7 @@ class MainWindow(QMainWindow):
                     self.controller.logger.info("队列后续动作：%s", line)
             else:
                 self.controller.logger.info("队列后续动作：无")
-            final_message = (
-                "队列执行结束（仅表示所选下载器进程均已正常退出，"
-                "不代表每个账号均下载成功）。"
-            )
+            final_message = f"队列执行结束。{summary_conclusion}"
             self._append_info(self.queue_output, *(messages or []), final_message)
             self.queue_active = False
             self.queue_current = None
@@ -1021,57 +1057,116 @@ class MainWindow(QMainWindow):
             f"正在运行：{path.name}；PID={run.process.pid}；剩余={len(self.queue_pending)}"
         )
 
+    def _start_download_summary(self, run, exit_code: int | None, assessment) -> None:
+        if self.download_summary_thread is not None:
+            return
+
+        ended_at = datetime.now()
+        thread = QThread(self)
+        worker = ActionWorker(
+            lambda: self.controller.summarize_download(run, exit_code, ended_at)
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.done.connect(thread.quit)
+        thread.finished.connect(self._finish_download_summary)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+        self.download_summary_thread = thread
+        self.download_summary_worker = worker
+        self.download_summary_run = run
+        self.download_summary_exit_code = exit_code
+        self.download_summary_assessment = assessment
+        thread.start()
+
+    @Slot()
+    def _finish_download_summary(self) -> None:
+        worker = self.download_summary_worker
+        assessment = self.download_summary_assessment
+        try:
+            if worker is None or assessment is None:
+                return
+            if worker.error is not None:
+                message = str(worker.error)
+                self.controller.logger.exception(
+                    "账号结果汇总失败：%s", message, exc_info=worker.error
+                )
+                self._append_info(
+                    self.queue_output,
+                    f"【失败】账号结果汇总失败：{message}",
+                    "队列已停止；剩余任务不会启动。",
+                )
+                self.queue_pending.clear()
+                self.queue_current = None
+                self.queue_active = False
+                return
+
+            summary = worker.result
+            self._append_info(self.queue_output, *format_summary_for_ui(summary))
+            if not assessment.normal_exit:
+                self.queue_pending.clear()
+                self.queue_current = None
+                self.queue_active = False
+                return
+
+            self.queue_summaries_complete = (
+                self.queue_summaries_complete and summary.complete
+            )
+            self.queue_summaries_reliable = (
+                self.queue_summaries_reliable and summary.reliable
+            )
+            messages = self._run(
+                lambda: self.controller.run_post_actions("batch"), self.queue_output
+            )
+            if messages is None:
+                self._append_info(
+                    self.queue_output,
+                    "【失败】本批后续动作失败；队列已停止，剩余任务不会启动。",
+                )
+                self.queue_pending.clear()
+                self.queue_current = None
+                self.queue_active = False
+                return
+            if messages:
+                self._append_info(self.queue_output, *messages)
+            self.queue_current = None
+            self._start_next_queue_item()
+        finally:
+            self.download_summary_thread = None
+            self.download_summary_worker = None
+            self.download_summary_run = None
+            self.download_summary_exit_code = None
+            self.download_summary_assessment = None
+            self.refresh_all()
+
     def _poll_processes(self) -> None:
         if not self.queue_active or self.queue_current is None:
             return
+        if self.download_summary_thread is not None:
+            return
         if self.queue_current.running:
             return
-        code = self.queue_current.process.returncode
+        run = self.queue_current
+        code = run.process.returncode
         assessment = assess_process_exit(code)
         self._append_info(
             self.queue_output,
             assessment.headline,
             assessment.detail,
+            "正在汇总账号结果，请等待。",
             merge=True,
         )
         self.controller.logger.info(
             "下载进程已退出：模板=%s；已选账号=%s；PID=%s；"
             "退出码=%s；状态=%s",
-            self.queue_current.task_template,
-            self.queue_current.selected_accounts,
-            self.queue_current.process.pid,
+            run.task_template,
+            run.selected_accounts,
+            run.process.pid,
             code,
             assessment.log_status,
         )
-        try:
-            with self.queue_current.task_log.open("a", encoding="utf-8") as handle:
-                log_messages = [
-                    f"Exited: code={code}",
-                    f"Process status: {assessment.log_status}",
-                ]
-                if assessment.normal_exit:
-                    log_messages.append("Download result: unverified")
-                handle.write(
-                    format_information(
-                        *log_messages,
-                        at=datetime.now(),
-                        merge=True,
-                        include_date=True,
-                    )
-                    + "\n"
-                )
-        except OSError:
-            self.controller.logger.exception("写入下载任务退出日志失败")
-        if not assessment.normal_exit:
-            self.queue_pending.clear()
-            self.queue_active = False
-            self.queue_current = None
-            return
-        messages = self._run(lambda: self.controller.run_post_actions("batch"), self.queue_output)
-        if messages:
-            self._append_info(self.queue_output, *messages)
-        self.queue_current = None
-        self._start_next_queue_item()
+        self._start_download_summary(run, code, assessment)
 
     def _manual_backup(self) -> None:
         answer = QMessageBox.question(
@@ -1295,6 +1390,12 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        if self.download_summary_thread is not None:
+            QMessageBox.information(
+                self, "账号结果汇总中", "请等待账号结果汇总完成后再关闭管理器。"
+            )
+            event.ignore()
+            return
         if self.background_thread is not None and self.background_thread.isRunning():
             QMessageBox.information(self, "索引任务运行中", "请等待索引任务完成后再关闭管理器。")
             event.ignore()
