@@ -122,6 +122,8 @@ def format_summary_for_task_log(
     summary: DownloadSummary, ended_at: datetime
 ) -> str:
     account_formula_valid, status_formula_valid = _validation_outcomes(summary)
+    account_validation = _format_validation(summary.reliable, account_formula_valid)
+    status_validation = _format_validation(summary.reliable, status_formula_valid)
     lines = [
         "【下载账号汇总】",
         f"进程结束时间：{ended_at:%Y-%m-%d %H:%M:%S}",
@@ -139,9 +141,9 @@ def format_summary_for_task_log(
     lines.extend(
         (
             "一级核对（计划账号=实际开始+进入处理前异常+未开始）："
-            + ("通过" if account_formula_valid else "未通过"),
+            + account_validation,
             "二级核对（实际开始=各主状态之和）："
-            + ("通过" if status_formula_valid else "未通过"),
+            + status_validation,
         )
     )
     if summary.reliable:
@@ -205,6 +207,12 @@ def _validation_outcomes(summary: DownloadSummary) -> tuple[bool, bool]:
         summary.primary_status_counts.values()
     )
     return account_formula_valid, status_formula_valid
+
+
+def _format_validation(reliable: bool, valid: bool) -> str:
+    if not reliable:
+        return "无法验证"
+    return "通过" if valid else "未通过"
 
 
 def _safe_failure_reason(summary: DownloadSummary) -> str:

@@ -5,9 +5,10 @@ import subprocess
 import ctypes
 import hashlib
 from ctypes import wintypes
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from threading import Lock
 
 from douk_manager.config import AppConfig, ManagedPaths
 from douk_manager.core.backup import BackupService
@@ -42,6 +43,15 @@ class EngineRun:
     native_log_dir: Path
     pause_after_exit: bool = False
     task_template: str = "current settings.json"
+    _summary_lock: Lock = field(
+        default_factory=Lock, init=False, repr=False, compare=False
+    )
+    _summary_result: DownloadSummary | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    _summary_write_error: SummaryWriteError | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     @property
     def selected_accounts(self) -> int:
@@ -262,21 +272,30 @@ class EngineService:
     def summarize_finished_run(
         self, run: EngineRun, exit_code: int | None, ended_at: datetime
     ) -> DownloadSummary:
-        located = locate_native_logs(
-            run.native_log_snapshot,
-            run.native_log_dir,
-            run.started_at,
-            ended_at,
-            len(run.planned_accounts),
-        )
-        summary = parse_download_summary(run.planned_accounts, located, exit_code)
-        block = format_summary_for_task_log(summary, ended_at)
-        try:
-            with run.task_log.open("a", encoding="utf-8", newline="") as handle:
-                handle.write("\n" + block)
-        except (OSError, UnicodeError) as exc:
-            raise SummaryWriteError("无法将账号汇总写入现有任务日志。") from exc
-        return summary
+        with run._summary_lock:
+            if run._summary_result is not None:
+                return run._summary_result
+            if run._summary_write_error is not None:
+                raise run._summary_write_error
+
+            located = locate_native_logs(
+                run.native_log_snapshot,
+                run.native_log_dir,
+                run.started_at,
+                ended_at,
+                len(run.planned_accounts),
+            )
+            summary = parse_download_summary(run.planned_accounts, located, exit_code)
+            block = format_summary_for_task_log(summary, ended_at)
+            try:
+                with run.task_log.open("a", encoding="utf-8", newline="") as handle:
+                    handle.write("\n" + block)
+            except (OSError, UnicodeError) as exc:
+                error = SummaryWriteError("无法将账号汇总写入现有任务日志。")
+                run._summary_write_error = error
+                raise error from exc
+            run._summary_result = summary
+            return summary
 
     def _write_pause_wrapper(self) -> Path:
         """Create a small ASCII-only launcher that keeps the native console open."""

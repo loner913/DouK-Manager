@@ -124,9 +124,55 @@ class DownloadSummaryOutputTests(unittest.TestCase):
         self.assertIn("下载进程：正常退出（退出码 0）", ui_text)
         self.assertIn("账号结果：无法可靠汇总；原因：汇总证据不可靠。", ui_text)
         self.assertNotIn("计划账号：", ui_text)
+        self.assertIn(
+            "一级核对（计划账号=实际开始+进入处理前异常+未开始）：无法验证",
+            task_text,
+        )
+        self.assertIn(
+            "二级核对（实际开始=各主状态之和）：无法验证",
+            task_text,
+        )
+        self.assertNotIn(
+            "核对（计划账号=实际开始+进入处理前异常+未开始）：通过",
+            task_text,
+        )
+        self.assertNotIn("核对（实际开始=各主状态之和）：通过", task_text)
         for forbidden in ("https://", "Cookie", "Response Headers", "Authorization"):
             self.assertNotIn(forbidden, ui_text)
             self.assertNotIn(forbidden, task_text)
+
+    def test_task_log_formats_every_located_segment_path_and_offset(self) -> None:
+        summary = make_summary()
+        second_log = Path(r"F:\Downloader\Volume\Log\continued.log")
+        summary = DownloadSummary(
+            planned_count=summary.planned_count,
+            started_outcomes=summary.started_outcomes,
+            pre_start_errors=summary.pre_start_errors,
+            not_started=summary.not_started,
+            primary_status_counts=summary.primary_status_counts,
+            completed_with_anomaly=summary.completed_with_anomaly,
+            complete=summary.complete,
+            reliable=summary.reliable,
+            reasons=summary.reasons,
+            located=LocatedNativeLogs(
+                (
+                    NativeLogSegment(NATIVE_LOG, 128, 4096),
+                    NativeLogSegment(second_log, 32, 2048),
+                ),
+                "size-delta-anchor",
+                True,
+            ),
+            exit_code=summary.exit_code,
+        )
+
+        text = format_summary_for_task_log(summary, ENDED_AT)
+
+        self.assertIn(
+            f"日志区间：{NATIVE_LOG.resolve()}；偏移=128；长度=4096", text
+        )
+        self.assertIn(
+            f"日志区间：{second_log.resolve()}；偏移=32；长度=2048", text
+        )
 
 
 if __name__ == "__main__":

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import builtins
 import json
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -109,9 +111,13 @@ class EngineTaskLogTests(unittest.TestCase):
             result = service.summarize_finished_run(
                 run, 0, started_at + timedelta(seconds=1)
             )
+            repeated = service.summarize_finished_run(
+                run, 0, started_at + timedelta(seconds=2)
+            )
 
             content = task_log.read_text(encoding="utf-8")
             self.assertTrue(result.complete)
+            self.assertIs(repeated, result)
             self.assertEqual(content.count("【下载账号汇总】"), 1)
             self.assertEqual(content.count("【状态说明】"), 1)
             self.assertTrue(content.startswith("existing task log\n"))
@@ -134,6 +140,127 @@ class EngineTaskLogTests(unittest.TestCase):
 
             with self.assertRaises(SummaryWriteError):
                 service.summarize_finished_run(run, 3, started_at)
+
+    def test_partial_append_failure_is_terminal_and_never_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_test_paths(Path(directory), 1)
+            native_log_dir = paths.volume / "Log"
+            native_log_dir.mkdir()
+            service = EngineService(paths, AppConfig(), BackupService(paths))
+            started_at = datetime.now()
+            task_log = paths.download_task_logs / "DownloadTask_partial.log"
+            task_log.write_text("existing task log\n", encoding="utf-8")
+            run = EngineRun(
+                process=_RunningProcess(),
+                started_at=started_at,
+                task_log=task_log,
+                planned_accounts=(),
+                native_log_snapshot=(),
+                native_log_dir=native_log_dir,
+            )
+            original_open = Path.open
+            append_attempts = 0
+
+            class _PartialWriter:
+                def __enter__(self):
+                    self.handle = builtins.open(task_log, "a", encoding="utf-8")
+                    return self
+
+                def write(self, content: str) -> None:
+                    self.handle.write(content[:20])
+                    self.handle.flush()
+                    raise OSError("simulated partial append")
+
+                def __exit__(self, *args) -> None:
+                    self.handle.close()
+
+            def guarded_open(path: Path, *args, **kwargs):
+                nonlocal append_attempts
+                if path == task_log and args and args[0] == "a":
+                    append_attempts += 1
+                    return _PartialWriter()
+                return original_open(path, *args, **kwargs)
+
+            with patch.object(Path, "open", guarded_open):
+                with self.assertRaises(SummaryWriteError):
+                    service.summarize_finished_run(run, 3, started_at)
+                with self.assertRaises(SummaryWriteError):
+                    service.summarize_finished_run(run, 3, started_at)
+
+            self.assertEqual(append_attempts, 1)
+            self.assertEqual(
+                task_log.read_text(encoding="utf-8").count("existing task log"), 1
+            )
+
+    def test_concurrent_completion_notifications_share_one_append_and_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_test_paths(Path(directory), 1)
+            native_log_dir = paths.volume / "Log"
+            native_log_dir.mkdir()
+            service = EngineService(paths, AppConfig(), BackupService(paths))
+            started_at = datetime.now()
+            task_log = paths.download_task_logs / "DownloadTask_concurrent.log"
+            task_log.write_text("existing task log\n", encoding="utf-8")
+            run = EngineRun(
+                process=_RunningProcess(),
+                started_at=started_at,
+                task_log=task_log,
+                planned_accounts=(),
+                native_log_snapshot=(),
+                native_log_dir=native_log_dir,
+            )
+            first_append_entered = threading.Event()
+            allow_first_append = threading.Event()
+            original_open = Path.open
+            append_attempts = 0
+
+            class _DelayedWriter:
+                def __enter__(self):
+                    self.handle = original_open(task_log, "a", encoding="utf-8")
+                    first_append_entered.set()
+                    allow_first_append.wait(timeout=2)
+                    return self.handle
+
+                def __exit__(self, *args):
+                    return self.handle.__exit__(*args)
+
+            def guarded_open(path: Path, *args, **kwargs):
+                nonlocal append_attempts
+                if path == task_log and args and args[0] == "a":
+                    append_attempts += 1
+                    return _DelayedWriter()
+                return original_open(path, *args, **kwargs)
+
+            results = []
+            errors = []
+
+            def summarize() -> None:
+                try:
+                    results.append(
+                        service.summarize_finished_run(run, 3, started_at)
+                    )
+                except Exception as exc:  # pragma: no cover - asserted below
+                    errors.append(exc)
+
+            with patch.object(Path, "open", guarded_open):
+                first = threading.Thread(target=summarize)
+                second = threading.Thread(target=summarize)
+                first.start()
+                self.assertTrue(first_append_entered.wait(timeout=2))
+                second.start()
+                allow_first_append.set()
+                first.join(timeout=2)
+                second.join(timeout=2)
+
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(append_attempts, 1)
+            self.assertEqual(len(results), 2)
+            self.assertIs(results[0], results[1])
+            self.assertEqual(
+                task_log.read_text(encoding="utf-8").count("【下载账号汇总】"), 1
+            )
 
     def test_controller_delegates_summary_and_logs_only_safe_audit_fields(self) -> None:
         controller = ManagerController.__new__(ManagerController)
