@@ -5,12 +5,25 @@ import subprocess
 import ctypes
 import hashlib
 from ctypes import wintypes
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from threading import Lock
 
 from douk_manager.config import AppConfig, ManagedPaths
 from douk_manager.core.backup import BackupService
+from douk_manager.core.download_summary import (
+    DownloadSummary,
+    NativeLogState,
+    PlannedAccount,
+    SummaryInputError,
+    SummaryWriteError,
+    format_summary_for_task_log,
+    freeze_planned_accounts,
+    locate_native_logs,
+    parse_download_summary,
+    snapshot_native_logs,
+)
 from douk_manager.core.json_store import read_json
 from douk_manager.core.locks import critical_section
 from douk_manager.ui_messages import format_information
@@ -25,9 +38,24 @@ class EngineRun:
     process: subprocess.Popen
     started_at: datetime
     task_log: Path
+    planned_accounts: tuple[PlannedAccount, ...]
+    native_log_snapshot: tuple[NativeLogState, ...]
+    native_log_dir: Path
     pause_after_exit: bool = False
     task_template: str = "current settings.json"
-    selected_accounts: int = 0
+    _summary_lock: Lock = field(
+        default_factory=Lock, init=False, repr=False, compare=False
+    )
+    _summary_result: DownloadSummary | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    _summary_write_error: SummaryWriteError | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+
+    @property
+    def selected_accounts(self) -> int:
+        return len(self.planned_accounts)
 
     @property
     def running(self) -> bool:
@@ -149,7 +177,18 @@ class EngineService:
                 raise EngineError("下载引擎已经在运行。")
             engine_mutex = _WindowsEngineMutex.acquire(self.paths.engine_exe)
             try:
-                selected_accounts = self.validate_ready()
+                if not self.paths.engine_exe.is_file():
+                    raise EngineError(f"Engine is missing: {self.paths.engine_exe}")
+                active = read_json(self.paths.active_settings)
+                if active.get("run_command") != "5 1 1 Q":
+                    raise EngineError("settings.json run_command must be '5 1 1 Q'.")
+                try:
+                    planned_accounts = freeze_planned_accounts(active)
+                except SummaryInputError as exc:
+                    raise EngineError(str(exc)) from exc
+                native_log_dir = self.paths.volume / "Log"
+                native_log_snapshot = snapshot_native_logs(native_log_dir)
+                selected_accounts = len(planned_accounts)
                 snapshot = self.backup.create_critical_snapshot(
                     "BeforeDownload",
                     {
@@ -222,11 +261,42 @@ class EngineService:
             process=process,
             started_at=started_at,
             task_log=task_log,
+            planned_accounts=planned_accounts,
+            native_log_snapshot=native_log_snapshot,
+            native_log_dir=native_log_dir,
             pause_after_exit=pause_after_exit,
             task_template=display_template,
-            selected_accounts=selected_accounts,
         )
         return self.current
+
+    def summarize_finished_run(
+        self, run: EngineRun, exit_code: int | None, ended_at: datetime
+    ) -> DownloadSummary:
+        with run._summary_lock:
+            if run._summary_result is not None:
+                return run._summary_result
+            if run._summary_write_error is not None:
+                raise run._summary_write_error
+
+            located = locate_native_logs(
+                run.native_log_snapshot,
+                run.native_log_dir,
+                run.started_at,
+                ended_at,
+                len(run.planned_accounts),
+                run.planned_accounts,
+            )
+            summary = parse_download_summary(run.planned_accounts, located, exit_code)
+            block = format_summary_for_task_log(summary, ended_at)
+            try:
+                with run.task_log.open("a", encoding="utf-8", newline="") as handle:
+                    handle.write("\n" + block)
+            except (OSError, UnicodeError) as exc:
+                error = SummaryWriteError("无法将账号汇总写入现有任务日志。")
+                run._summary_write_error = error
+                raise error from exc
+            run._summary_result = summary
+            return summary
 
     def _write_pause_wrapper(self) -> Path:
         """Create a small ASCII-only launcher that keeps the native console open."""

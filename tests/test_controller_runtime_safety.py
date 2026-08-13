@@ -20,6 +20,7 @@ from unittest.mock import Mock, patch
 
 from openpyxl import Workbook, load_workbook
 
+from douk_manager.config import AppConfig
 from douk_manager.controller import ControllerError, ManagerController
 from douk_manager.core.backup import BackupService
 from douk_manager.core.engine import EngineError, EngineService, _WindowsEngineMutex
@@ -147,9 +148,86 @@ class ControllerRuntimeSafetyTests(unittest.TestCase):
             controller.engine.start.assert_not_called()
             self.assertFalse(hasattr(controller, "restore_backup"))
 
+    def test_summary_lifecycle_lease_blocks_dangerous_operations_but_not_collector(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = make_controller(Path(directory), engine_running=False)
+            controller._download_lifecycle_active = True
+
+            blocked_operations = (
+                lambda: controller.create_task(
+                    "A1", EarliestRule.keep(), False, "blocked", True
+                ),
+                lambda: controller.generate_batches(1, 3, 1, EarliestRule.keep()),
+                lambda: controller.activate_task(controller.paths.tasks / "task.json"),
+                lambda: controller.backup_now(),
+                lambda: controller.apply_engine_update(Path(directory) / "engine.zip"),
+                lambda: controller.reconfigure({"engine_exe": "other-main.exe"}),
+                lambda: controller.update_post_options({"cleanup_after_index": True}),
+                lambda: controller.start_current_download(),
+            )
+
+            for operation in blocked_operations:
+                with self.subTest(operation=operation):
+                    with self.assertRaisesRegex(ControllerError, "账号结果汇总"):
+                        operation()
+
+            controller.start_collector()
+            controller.stop_collector()
+            controller.collector.start.assert_called_once_with()
+            controller.collector.stop.assert_called_once_with()
+
+    def test_reconfigure_can_repair_paths_without_an_existing_startup_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            controller = make_controller(root, engine_running=False)
+            controller.root = controller.paths.root
+            controller.config = AppConfig(
+                engine_exe=str(controller.paths.engine_exe),
+                video_root=str(controller.paths.video_root),
+                index_root=str(controller.paths.index_root),
+            )
+            controller.startup_backup = None
+            controller.read_only_reason = "旧路径不完整。"
+            controller.collector.running = False
+            controller._build_services = Mock()
+            controller.try_startup_backup = Mock(return_value="新路径仍待检查。")
+
+            result = controller.reconfigure(
+                {"engine_exe": str(root / "replacement" / "main.exe")}
+            )
+
+            self.assertEqual(result, "新路径仍待检查。")
+            controller.try_startup_backup.assert_called_once_with()
+            controller._build_services.assert_called_once_with()
+
+    def test_queue_options_do_not_require_a_startup_backup_while_idle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            controller = make_controller(root, engine_running=False)
+            controller.config = AppConfig(
+                engine_exe=str(controller.paths.engine_exe),
+                video_root=str(controller.paths.video_root),
+                index_root=str(controller.paths.index_root),
+            )
+            controller.startup_backup = None
+            controller.try_startup_backup = Mock(
+                side_effect=AssertionError("queue options must not trigger a backup")
+            )
+
+            result = controller.update_post_options(
+                {"cleanup_after_index": False}
+            )
+
+            self.assertTrue(result)
+            self.assertFalse(controller.config.cleanup_after_index)
+            controller.try_startup_backup.assert_not_called()
+
     def test_two_concurrent_engine_starts_launch_only_one_process(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             paths = make_test_paths(Path(directory))
+            active = read_json(paths.active_settings)
+            active["run_command"] = "5 1 1 Q"
+            write_json_atomic(paths.active_settings, active)
             config = SimpleNamespace(batch_accounts=50, rest_seconds=150)
             services = [
                 EngineService(paths, config, Mock()) for _ in range(2)
@@ -170,7 +248,6 @@ class ControllerRuntimeSafetyTests(unittest.TestCase):
 
             for index, service in enumerate(services):
                 service.external_running = Mock(side_effect=checker(index))
-                service.validate_ready = Mock(return_value=2)
                 service.backup.create_critical_snapshot.return_value = (
                     paths.backups / "concurrent-start"
                 )
@@ -232,10 +309,12 @@ class ControllerRuntimeSafetyTests(unittest.TestCase):
     def test_failed_process_launch_releases_engine_mutex(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             paths = make_test_paths(Path(directory))
+            active = read_json(paths.active_settings)
+            active["run_command"] = "5 1 1 Q"
+            write_json_atomic(paths.active_settings, active)
             config = SimpleNamespace(batch_accounts=50, rest_seconds=150)
             service = EngineService(paths, config, Mock())
             service.external_running = Mock(return_value=False)
-            service.validate_ready = Mock(return_value=2)
             service.backup.create_critical_snapshot.return_value = (
                 paths.backups / "failed-start"
             )

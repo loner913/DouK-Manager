@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import logging
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from douk_manager.config import AppConfig, ManagedPaths, application_root, update_config
 from douk_manager.core.backup import BackupService
+from douk_manager.core.download_summary import DownloadSummary
 from douk_manager.core.engine import EngineRun, EngineService
 from douk_manager.core.engine_update import (
     EnginePackagePreview,
@@ -40,6 +42,7 @@ class ManagerController:
         self.read_only_reason = ""
         self._last_collector_running = False
         self._last_engine_running = False
+        self._download_lifecycle_active = False
         self._build_services()
 
     def _build_services(self) -> None:
@@ -117,7 +120,12 @@ class ManagerController:
             self.logger.exception("启动前备份失败")
             return self.read_only_reason
 
+    def require_download_lifecycle_idle(self) -> None:
+        if getattr(self, "_download_lifecycle_active", False):
+            raise ControllerError("下载账号结果汇总或后续动作尚未完成，禁止修改配置或重新备份。")
+
     def require_safe_write(self) -> None:
+        self.require_download_lifecycle_idle()
         if self.engine.external_running():
             raise ControllerError("下载引擎正在运行，禁止修改配置或重新备份。")
         if self.startup_backup is None:
@@ -128,11 +136,14 @@ class ManagerController:
             raise ControllerError(self.read_only_reason)
 
     def require_collector_start(self) -> None:
+        if getattr(self, "_download_lifecycle_active", False):
+            return
         if self.engine.external_running():
             return
         self.require_safe_write()
 
     def reconfigure(self, values: dict[str, Any]) -> str:
+        self.require_download_lifecycle_idle()
         if self.engine.external_running():
             raise ControllerError("下载引擎正在运行，禁止切换正式路径或重建服务。")
         if self.collector.running:
@@ -152,6 +163,7 @@ class ManagerController:
 
     def update_post_options(self, values: dict[str, Any]) -> bool:
         """保存本次队列选项，不重建路径，也不制造一次多余的启动备份。"""
+        self.require_download_lifecycle_idle()
         screenshot_mode = values.get(
             "screenshot_post_mode", self.config.screenshot_post_mode
         )
@@ -253,11 +265,41 @@ class ManagerController:
             pause_after_exit,
             result.task_log,
         )
+        self._download_lifecycle_active = True
         return result
 
+    def summarize_download(
+        self, run: EngineRun, exit_code: int | None, ended_at: datetime
+    ) -> DownloadSummary:
+        result = self.engine.summarize_finished_run(run, exit_code, ended_at)
+        self.logger.info(
+            "下载账号汇总完成：模板=%s；计划=%s；实际开始=%s；完整=%s；可靠=%s；任务日志=%s",
+            run.task_template,
+            result.planned_count,
+            result.started_count,
+            result.complete,
+            result.reliable,
+            run.task_log,
+        )
+        return result
+
+    def release_download_lifecycle(self) -> None:
+        self._download_lifecycle_active = False
+
     def activate_and_start(
-        self, task_path: Path, pause_after_exit: bool = False
+        self,
+        task_path: Path,
+        pause_after_exit: bool = False,
+        *,
+        _queue_continuation: bool = False,
     ) -> EngineRun:
+        if _queue_continuation and getattr(self, "_download_lifecycle_active", False):
+            result = self.tasks.activate_existing_task(task_path)
+            self.logger.info("队列任务已激活：%s", result)
+            return self.engine.start(
+                pause_after_exit=pause_after_exit,
+                task_template=task_path,
+            )
         self.activate_task(task_path)
         return self.start_current_download(
             pause_after_exit,
