@@ -9,7 +9,13 @@ from typing import Any
 from douk_manager.config import AppConfig, ManagedPaths, application_root, update_config
 from douk_manager.core.backup import BackupService
 from douk_manager.core.download_summary import DownloadSummary
-from douk_manager.core.engine import EngineRun, EngineService
+from douk_manager.core.engine import (
+    BATCH_RUN_COMMAND,
+    ENGINE_MODE_MONITOR,
+    MONITOR_RUN_COMMAND,
+    EngineRun,
+    EngineService,
+)
 from douk_manager.core.engine_update import (
     EnginePackagePreview,
     EngineUpdateResult,
@@ -19,6 +25,7 @@ from douk_manager.core.json_store import read_json
 from douk_manager.core.locks import critical_section
 from douk_manager.core.settings_tasks import EarliestRule, GeneratedTask, SettingsTaskService
 from douk_manager.core.task_order import TaskOrderService
+from douk_manager.core.result_history import ResultHistoryService
 from douk_manager.integrations.collector import CollectorService, MigrationResult
 from douk_manager.integrations.indexer import IndexResult, IndexService
 from douk_manager.integrations.screenshots import ScreenshotPreview, ScreenshotResult, ScreenshotService
@@ -49,6 +56,7 @@ class ManagerController:
         self.backup = BackupService(self.paths)
         self.tasks = SettingsTaskService(self.paths, self.backup)
         self.task_order = TaskOrderService(self.paths)
+        self.results = ResultHistoryService(self.paths.download_task_logs)
         self.engine = EngineService(self.paths, self.config, self.backup)
         self.engine_updates = EngineUpdateService(self.paths, self.backup)
         self.collector = CollectorService(self.config, self.paths)
@@ -67,6 +75,20 @@ class ManagerController:
                 self._last_engine_running = self.engine.current.running
         result["collector_running"] = self._last_collector_running
         result["engine_running"] = self._last_engine_running
+        current = self.engine.current
+        if current is not None and current.running:
+            result["engine_mode"] = current.mode
+        elif result["engine_running"] and self.paths.active_settings.is_file():
+            try:
+                command = read_json(self.paths.active_settings).get("run_command")
+            except Exception:
+                command = None
+            result["engine_mode"] = (
+                ENGINE_MODE_MONITOR if command == MONITOR_RUN_COMMAND else "batch"
+            )
+        else:
+            result["engine_mode"] = ""
+        result["monitor_running"] = result["engine_mode"] == ENGINE_MODE_MONITOR
         result["startup_backup"] = str(self.startup_backup or "")
         result["read_only_reason"] = self.read_only_reason
         if self.paths.master_settings.is_file():
@@ -106,6 +128,12 @@ class ManagerController:
             self.read_only_reason = "检测到下载引擎正在运行，未执行启动前备份。"
             return self.read_only_reason
         try:
+            if self.engine.recover_batch_command_if_idle():
+                self.logger.warning(
+                    "检测到上次后台监听遗留 run_command=%s，已恢复为 %s。",
+                    MONITOR_RUN_COMMAND,
+                    BATCH_RUN_COMMAND,
+                )
             with critical_section(self.paths.lock_file, timeout=5.0):
                 self.startup_backup = self.backup.create_critical_snapshot(
                     "Startup",
@@ -187,6 +215,17 @@ class ManagerController:
     def preview_selection(self, expression: str):
         return self.tasks.preview(expression)
 
+    def preview_private_skip(self, expression: str, validity_days: int):
+        if validity_days < 1 or validity_days > 3650:
+            raise ControllerError("私密账号参考期限必须是 1 到 3650 天的整数。")
+        requested = self.tasks.preview(expression)
+        matches = self.results.recent_private(
+            requested.selection.numbers, validity_days
+        )
+        return self.tasks.preview_with_private_filter(
+            expression, matches, validity_days
+        )
+
     def create_task(
         self,
         expression: str,
@@ -194,6 +233,7 @@ class ManagerController:
         persist_master: bool,
         task_name: str,
         activate: bool,
+        excluded_numbers: tuple[int, ...] = (),
     ) -> GeneratedTask:
         self.require_safe_write()
         result = self.tasks.create_task(
@@ -202,6 +242,7 @@ class ManagerController:
             persist_master_earliest=persist_master,
             task_name=task_name or None,
             activate=activate,
+            excluded_numbers=excluded_numbers,
         )
         self.logger.info(
             "任务已创建：%s；选择=%s；激活=%s；主档earliest=%s",
@@ -211,6 +252,20 @@ class ManagerController:
             persist_master,
         )
         return result
+
+    def delete_tasks(
+        self, paths: tuple[Path, ...], *, protected_paths: tuple[Path, ...] = ()
+    ) -> tuple[Path, ...]:
+        self.require_safe_write()
+        result = self.tasks.delete_tasks(paths, protected_paths=protected_paths)
+        self.logger.info("任务模板已删除：%s", [path.name for path in result])
+        return result
+
+    def result_runs(self, *, limit: int = 500):
+        return self.results.list_runs(limit=limit)
+
+    def result_rows(self, *, limit: int = 500):
+        return self.results.list_account_rows(limit=limit)
 
     def generate_batches(
         self, start: int, end: int, size: int, rule: EarliestRule
@@ -266,6 +321,30 @@ class ManagerController:
             result.task_log,
         )
         self._download_lifecycle_active = True
+        return result
+
+    def start_monitor(self) -> EngineRun:
+        self.require_safe_write()
+        if self.collector.health() or self.collector.running:
+            raise ControllerError("采集服务运行时不能启动后台监听。")
+        result = self.engine.start_monitor()
+        self._last_engine_running = True
+        self.logger.info(
+            "后台剪贴板监听已启动：PID=%s；run_command=%s；任务日志=%s",
+            result.process.pid,
+            MONITOR_RUN_COMMAND,
+            result.task_log,
+        )
+        return result
+
+    def stop_monitor(self) -> Path | None:
+        result = self.engine.stop_monitor()
+        self._last_engine_running = False
+        self.logger.info(
+            "后台剪贴板监听已停止；run_command 已恢复为 %s；配置=%s",
+            BATCH_RUN_COMMAND,
+            result,
+        )
         return result
 
     def summarize_download(

@@ -150,6 +150,17 @@ def format_summary_for_task_log(
     )
     if summary.reliable:
         lines.extend(_format_account_result_lines(summary))
+        # V0.1.4 keeps the UI concise, but records a complete account-to-status
+        # mapping in the existing task log.  The result history page and the
+        # optional private-account filter read these lines directly; no second
+        # database or cache is introduced.
+        lines.append("账号明细版本：1")
+        for label, status in (
+            ("有新作品下载", AccountStatus.DOWNLOADED),
+            ("作品均被引擎跳过", AccountStatus.ALL_SKIPPED),
+            ("无符合条件作品", AccountStatus.NO_ELIGIBLE_WORKS),
+        ):
+            _append_number_line(lines, label, summary.numbers_for(status))
     else:
         lines.append(f"账号结果：无法可靠汇总；原因：{_safe_failure_reason(summary)}")
     lines.extend(("【状态说明】", *_STATUS_DEFINITIONS))

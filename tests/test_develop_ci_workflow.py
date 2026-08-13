@@ -59,7 +59,7 @@ class DevelopCiWorkflowTests(unittest.TestCase):
         self.assertIn("steps.identity.outputs.ref", self.workflow)
         self.assertIn("steps.identity.outputs.sha", self.workflow)
         self.assertIn("retention-days: 30", self.workflow)
-        self.assertIn('"Version: 0.1.3"', self.workflow)
+        self.assertIn('"Version: 0.1.4"', self.workflow)
 
     def test_official_actions_do_not_use_node20_generations(self) -> None:
         self.assertIn("actions/checkout@v7", self.workflow)

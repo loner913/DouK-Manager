@@ -183,7 +183,7 @@ class IndexService:
             text=True,
             encoding="utf-8",
             errors="replace",
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         output = "\n".join(part for part in (completed.stdout, completed.stderr) if part)
         if completed.returncode != 0:
@@ -228,7 +228,7 @@ class IndexService:
             text=True,
             encoding="utf-8",
             errors="replace",
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         output = "\n".join(part for part in (completed.stdout, completed.stderr) if part)
         if completed.returncode != 0:
@@ -273,7 +273,7 @@ class IndexService:
             text=True,
             encoding="utf-8",
             errors="replace",
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             timeout=120,
         )
         output = "\n".join(

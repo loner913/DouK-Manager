@@ -97,6 +97,33 @@ class QueueInteractionSourceTests(unittest.TestCase):
             source,
         )
 
+    def test_new_gui_work_cancels_an_active_shutdown_countdown(self) -> None:
+        source = self._gui_source()
+        run_source = source[source.index("    def _run(") : source.index("    def _run_index_background")]
+        background_source = source[
+            source.index("    def _run_index_background") : source.index("    def refresh_all")
+        ]
+
+        self.assertIn("_cancel_shutdown_for_new_work", run_source)
+        self.assertIn("_cancel_shutdown_for_new_work", background_source)
+
+    def test_final_shutdown_tick_rechecks_all_activity_and_none_is_success(self) -> None:
+        source = self._gui_source()
+        tick_source = source[
+            source.index("    def _shutdown_tick") : source.index("    def _cancel_shutdown")
+        ]
+
+        for token in (
+            "collector",
+            "engine_running",
+            "monitor_running",
+            "queue_active",
+            "download_summary_thread",
+            "background_thread",
+        ):
+            self.assertIn(token, tick_source)
+        self.assertNotIn("if result is None", tick_source)
+
 
 class _FakeSignal:
     def __init__(self) -> None:
@@ -208,8 +235,10 @@ class ActionWorkerTests(unittest.TestCase):
         window.queue_active = True
         window.queue_current = run
         window.queue_pending = [Path("A3.json")]
+        window.queue_shutdown_requested = False
         window.queue_summaries_complete = True
         window.queue_summaries_reliable = True
+        window.task_smart_private = SimpleNamespace(isChecked=lambda: False)
         window.download_summary_thread = None
         window.download_summary_worker = None
         window.download_summary_run = None
