@@ -317,7 +317,7 @@ class V014CoreTests(unittest.TestCase):
                 ["clipboard:close", "terminate-tree", "clipboard:original"],
             )
             process.send_signal.assert_not_called()
-            terminate.assert_called_once_with(process, timeout=12.5, force=False)
+            terminate.assert_called_once_with(process, timeout=3.0, force=True)
 
     def test_windows_monitor_stop_returns_when_process_exits_after_close(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

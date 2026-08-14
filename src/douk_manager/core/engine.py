@@ -570,10 +570,15 @@ class EngineService:
                     run.process.wait(timeout=min(2.5, timeout))
                     return
                 except subprocess.TimeoutExpired:
+                    # At this point the documented ``close`` command has had
+                    # more than two clipboard polling intervals to return the
+                    # downloader to its idle main menu.  Do not leave that
+                    # menu waiting on console input: close only the process
+                    # tree that this manager launched.
                     self._terminate_process_tree(
                         run.process,
-                        timeout=max(1.0, timeout - 2.5),
-                        force=False,
+                        timeout=min(3.0, max(1.0, timeout - 2.5)),
+                        force=True,
                     )
             else:
                 run.process.terminate()
