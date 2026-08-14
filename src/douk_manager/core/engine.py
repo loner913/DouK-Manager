@@ -226,7 +226,10 @@ class EngineService:
                 popen_options = {}
                 completion_marker: Path | None = None
                 if os.name == "nt":
-                    creationflags = subprocess.CREATE_NEW_CONSOLE
+                    creationflags = (
+                        subprocess.CREATE_NEW_CONSOLE
+                        | subprocess.CREATE_NEW_PROCESS_GROUP
+                    )
                     # Always use the small wrapper on Windows.  It writes a
                     # marker immediately after main.exe exits and then waits
                     # for a key.  The manager can therefore decide at runtime
@@ -321,6 +324,7 @@ class EngineService:
                     [str(self.paths.engine_exe)],
                     cwd=str(self.paths.engine_root),
                     env=os.environ.copy(),
+                    stdin=subprocess.PIPE if os.name == "nt" else None,
                     creationflags=creationflags,
                     **popen_options,
                 )
@@ -426,6 +430,51 @@ class EngineService:
         self.current = None
         return self.paths.active_settings if changed else None
 
+    def dismiss_result_review(self, run: EngineRun, *, timeout: float = 5.0) -> None:
+        """Close only the completed download wrapper and its console tree."""
+
+        if run.completion_marker is None:
+            return
+        self._terminate_process_tree(run.process, timeout=timeout, force=True)
+
+    def cancel_batch(self, run: EngineRun | None = None, *, timeout: float = 15.0) -> Path:
+        """Cancel the current manager-owned batch process tree.
+
+        This is intentionally separate from queue pause: cancellation ends the
+        current downloader process and the GUI discards every pending template.
+        It never deletes a task template, result log, settings file or database.
+        """
+
+        target = run or self.current
+        if target is None or target.mode != ENGINE_MODE_BATCH:
+            raise EngineError("当前没有可取消的账号批量下载任务。")
+        if target.running:
+            if _is_windows():
+                try:
+                    target.process.send_signal(signal.CTRL_BREAK_EVENT)
+                    target.process.wait(timeout=min(2.0, timeout))
+                except (AttributeError, OSError, ValueError, subprocess.TimeoutExpired):
+                    self._terminate_process_tree(
+                        target.process, timeout=max(1.0, timeout - 2.0), force=True
+                    )
+            else:
+                self._terminate_process_tree(target.process, timeout=timeout, force=True)
+        try:
+            with target.task_log.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    format_information(
+                        "Cancelled",
+                        "User cancelled the current batch and all pending manager queue tasks",
+                        merge=True,
+                        include_date=True,
+                    )
+                    + "\n"
+                )
+        finally:
+            if self.current is target:
+                self.current = None
+        return target.task_log
+
     def recover_batch_command_if_idle(self) -> bool:
         """Repair a stale run_command=6 left by an earlier abnormal exit."""
 
@@ -481,37 +530,96 @@ class EngineService:
         """Stop monitor gracefully, using its documented clipboard sentinel."""
 
         previous_clipboard: str | None = None
+        clipboard_changed = False
         try:
-            if os.name == "nt":
-                # First try the console signal used by the downloader.  The
-                # monitor also documents the clipboard sentinel as a reliable
-                # graceful stop, so use it as a fallback without killing the
-                # downloader tree.
+            if _is_windows():
+                # The downloader documents clipboard text ``close`` as the
+                # monitor stop command.  It returns from the monitor to the
+                # outer menu, so a second stage must also close that menu and
+                # its console process.
+                previous_clipboard = _get_windows_clipboard_text()
+                _set_windows_clipboard_text("close")
+                clipboard_changed = True
+                # ``close`` stops the clipboard monitor and returns the
+                # downloader to its outer menu.  An empty Enter is the
+                # downloader's normal way to leave that menu.  Queue it
+                # immediately: the monitor does not consume stdin, so the
+                # outer menu receives it as soon as ``close`` takes effect.
+                stdin = getattr(run.process, "stdin", None)
+                if stdin is not None:
+                    try:
+                        payload = "\n" if getattr(stdin, "encoding", None) else b"\r\n"
+                        stdin.write(payload)
+                        stdin.flush()
+                    except (OSError, TypeError, ValueError):
+                        pass
+                try:
+                    run.process.wait(timeout=min(6.0, timeout))
+                    return
+                except subprocess.TimeoutExpired:
+                    pass
                 try:
                     run.process.send_signal(signal.CTRL_BREAK_EVENT)
                 except (AttributeError, OSError, ValueError):
                     pass
                 try:
-                    run.process.wait(timeout=min(2.0, timeout))
+                    run.process.wait(timeout=min(3.0, max(0.1, timeout - 6.0)))
                     return
                 except subprocess.TimeoutExpired:
-                    pass
-                previous_clipboard = _get_windows_clipboard_text()
-                _set_windows_clipboard_text("close")
+                    self._terminate_process_tree(
+                        run.process, timeout=max(1.0, timeout - 9.0), force=True
+                    )
             else:
                 run.process.terminate()
-            run.process.wait(timeout=timeout)
+                run.process.wait(timeout=timeout)
         except (OSError, subprocess.SubprocessError) as exc:
             raise EngineError(
-                "后台监听尚未正常停止；已尝试 Ctrl+Break 和剪贴板 close 信号，"
-                "请关闭下载器监听窗口后重试。"
+                "后台监听尚未正常停止；已依次尝试剪贴板 close、回车退出菜单、"
+                "Ctrl+Break 和关闭"
+                "该下载器进程树，请检查监听窗口后重试。"
             ) from exc
         finally:
-            if os.name == "nt" and previous_clipboard is not None:
+            if _is_windows() and clipboard_changed:
                 try:
-                    _set_windows_clipboard_text(previous_clipboard)
+                    _set_windows_clipboard_text(previous_clipboard or "")
                 except OSError:
                     pass
+
+    def _terminate_process_tree(
+        self,
+        process: subprocess.Popen,
+        *,
+        timeout: float,
+        force: bool,
+    ) -> None:
+        """Terminate only one manager-owned process tree and wait for exit."""
+
+        if process.poll() is not None:
+            return
+        if _is_windows():
+            command = ["taskkill", "/PID", str(process.pid), "/T"]
+            if force:
+                command.append("/F")
+            try:
+                subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=max(1.0, timeout),
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                process.terminate()
+        else:
+            process.terminate()
+        try:
+            process.wait(timeout=max(1.0, timeout))
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3.0)
 
     def _write_pause_wrapper(self, completion_marker: Path | None = None) -> Path:
         """Create a small ASCII-only launcher that keeps the native console open."""
@@ -553,6 +661,10 @@ class _SecurityAttributes(ctypes.Structure):
         ("lpSecurityDescriptor", wintypes.LPVOID),
         ("bInheritHandle", wintypes.BOOL),
     )
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
 
 
 def _get_windows_clipboard_text() -> str | None:

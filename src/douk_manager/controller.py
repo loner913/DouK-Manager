@@ -357,6 +357,15 @@ class ManagerController:
         )
         return result
 
+    def dismiss_result_review(self, run: EngineRun) -> None:
+        self.engine.dismiss_result_review(run)
+
+    def cancel_current_download(self, run: EngineRun | None = None) -> Path:
+        result = self.engine.cancel_batch(run)
+        self._last_engine_running = False
+        self.logger.info("用户取消当前下载及全部待执行队列任务：任务日志=%s", result)
+        return result
+
     def summarize_download(
         self, run: EngineRun, exit_code: int | None, ended_at: datetime
     ) -> DownloadSummary:

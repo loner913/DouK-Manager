@@ -93,8 +93,8 @@ class ResultHistoryService:
     def __init__(self, log_directory: Path) -> None:
         self.log_directory = log_directory
 
-    def list_runs(self, *, limit: int = 500) -> tuple[DownloadTaskHistory, ...]:
-        if limit < 1:
+    def list_runs(self, *, limit: int | None = 500) -> tuple[DownloadTaskHistory, ...]:
+        if limit is not None and limit < 1:
             return ()
         self.log_directory.mkdir(parents=True, exist_ok=True)
         paths_with_mtime: list[tuple[int, Path]] = []
@@ -103,7 +103,8 @@ class ResultHistoryService:
                 paths_with_mtime.append((path.stat().st_mtime_ns, path))
             except OSError:
                 continue
-        paths = [path for _, path in sorted(paths_with_mtime, reverse=True)[:limit]]
+        ordered_paths = [path for _, path in sorted(paths_with_mtime, reverse=True)]
+        paths = ordered_paths if limit is None else ordered_paths[:limit]
         result: list[DownloadTaskHistory] = []
         for path in paths:
             try:
@@ -154,9 +155,12 @@ class ResultHistoryService:
     ) -> tuple[PrivateReferenceDecision, ...]:
         """Classify every requested account without guessing missing results.
 
-        The newest parsed row wins.  A recent explicit private row is the only
-        category that is excluded.  Older, incomplete or missing history is
-        returned to the UI as an explanation and remains included.
+        Every task log in the requested time window is considered, not merely
+        the 500 rows shown by the result page.  An old-format sparse log may
+        safely contribute an account that it explicitly lists; accounts that
+        are absent from that log remain unknown.  Likewise, ``not_started``
+        and interrupted/error rows are uncertain evidence and cannot erase a
+        newer-or-older explicit private/healthy result in the same window.
         """
 
         if validity_days < 1:
@@ -166,45 +170,53 @@ class ResultHistoryService:
             return ()
         threshold = (now or datetime.now()) - timedelta(days=validity_days)
         requested_set = set(requested)
-        latest_any: dict[int, AccountHistoryRow] = {}
-        latest_recent: dict[int, AccountHistoryRow] = {}
-        blocked_recent: set[int] = set()
-        for run in self.list_runs():
-            if not run.details_complete:
-                if run.ended_at >= threshold:
-                    # A newer sparse log cannot prove that an omitted account
-                    # was normal.  Keep unresolved accounts out of automatic
-                    # skipping instead of falling back to an older private row.
-                    blocked_recent.update(
-                        requested_set - latest_recent.keys() - blocked_recent
-                    )
-                continue
+        recent_confirmed: dict[int, AccountHistoryRow] = {}
+        recent_uncertain: dict[int, AccountHistoryRow] = {}
+        expired_confirmed: dict[int, AccountHistoryRow] = {}
+        expired_uncertain: dict[int, AccountHistoryRow] = {}
+        confirmed_statuses = {
+            AccountStatus.DOWNLOADED,
+            AccountStatus.ALL_SKIPPED,
+            AccountStatus.NO_ELIGIBLE_WORKS,
+            AccountStatus.PRIVATE,
+        }
+        for run in self.list_runs(limit=None):
             for row in run.account_rows:
                 if row.a_number not in requested_set:
                     continue
-                latest_any.setdefault(row.a_number, row)
-                if row.ended_at >= threshold and row.a_number not in blocked_recent:
-                    latest_recent.setdefault(row.a_number, row)
+                confirmed = row.status in confirmed_statuses
+                if row.ended_at >= threshold:
+                    target = recent_confirmed if confirmed else recent_uncertain
+                else:
+                    target = expired_confirmed if confirmed else expired_uncertain
+                current = target.get(row.a_number)
+                if current is None or row.ended_at > current.ended_at:
+                    target[row.a_number] = row
 
         decisions: list[PrivateReferenceDecision] = []
         for number in requested:
-            recent = latest_recent.get(number)
-            any_row = latest_any.get(number)
-            if number in blocked_recent and recent is None:
-                category = "no_record"
-                row = None
-            elif recent is not None and recent.status is AccountStatus.PRIVATE:
+            recent = recent_confirmed.get(number)
+            uncertain = recent_uncertain.get(number)
+            expired = expired_confirmed.get(number)
+            old_uncertain = expired_uncertain.get(number)
+            if recent is not None and recent.status is AccountStatus.PRIVATE:
                 category = "recent_private"
                 row = recent
             elif recent is not None:
                 category = "recent_non_private"
                 row = recent
-            elif any_row is not None and any_row.status is AccountStatus.PRIVATE:
+            elif uncertain is not None:
+                category = "recent_uncertain"
+                row = uncertain
+            elif expired is not None and expired.status is AccountStatus.PRIVATE:
                 category = "expired_private"
-                row = any_row
-            elif any_row is not None:
+                row = expired
+            elif expired is not None:
                 category = "expired_non_private"
-                row = any_row
+                row = expired
+            elif old_uncertain is not None:
+                category = "expired_uncertain"
+                row = old_uncertain
             else:
                 category = "no_record"
                 row = None

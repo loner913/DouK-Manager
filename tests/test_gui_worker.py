@@ -18,8 +18,10 @@ else:
     import douk_manager.gui as gui_module
     from douk_manager.core.download_summary import SummaryWriteError
     from douk_manager.core.engine import assess_process_exit
-    from douk_manager.gui import ActionWorker, MainWindow
-    from PySide6.QtWidgets import QApplication, QMainWindow
+    from douk_manager.gui import ActionWorker, MainWindow, TaskTemplateList
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication, QListWidgetItem, QMainWindow
 
 
 class QueueInteractionSourceTests(unittest.TestCase):
@@ -97,6 +99,7 @@ class QueueInteractionSourceTests(unittest.TestCase):
         self.assertIn('QPushButton("应用为正式 setting")', source)
         self.assertIn('QPushButton("运行当前 setting")', source)
         self.assertIn('QPushButton("按顺序运行已选")', source)
+        self.assertIn('QPushButton("取消全部下载任务")', source)
         self.assertIn("cellDoubleClicked.connect(self._open_result_log)", source)
         self.assertIn("_schedule_result_refresh", source)
         self.assertIn("采集服务：", source)
@@ -111,6 +114,57 @@ class QueueInteractionSourceTests(unittest.TestCase):
             "        if self._queue_state_locked():",
             source,
         )
+
+    def test_drag_check_gesture_owns_mouse_events_instead_of_default_selection(self) -> None:
+        source = self._gui_source()
+        drag_source = source[
+            source.index("class TaskTemplateList") : source.index("class MainWindow")
+        ]
+
+        press = drag_source[
+            drag_source.index("    def mousePressEvent") : drag_source.index(
+                "    def mouseMoveEvent"
+            )
+        ]
+        move = drag_source[
+            drag_source.index("    def mouseMoveEvent") : drag_source.index(
+                "    def mouseReleaseEvent"
+            )
+        ]
+        release = drag_source[
+            drag_source.index("    def mouseReleaseEvent") : drag_source.index(
+                "    def _apply_drag_state"
+            )
+        ]
+        self.assertLess(press.index("event.accept()"), press.rindex("super().mousePressEvent"))
+        self.assertIn("event.accept()", move)
+        self.assertIn("event.accept()", release)
+
+    def test_result_review_is_run_state_and_can_change_during_download(self) -> None:
+        source = self._gui_source()
+        self.assertIn("def _result_view_option_changed", source)
+        self.assertIn("run.pause_after_exit = checked", source)
+        self.assertIn("self.task_pause_console.stateChanged.connect", source)
+        self.assertIn("self.queue_pause_console.stateChanged.connect", source)
+        self.assertIn("if getattr(run, \"pause_after_exit\", False):", source)
+        self.assertNotIn("if self._result_view_enabled():", source)
+
+    def test_cancel_all_downloads_clears_queue_and_skips_post_actions(self) -> None:
+        source = self._gui_source()
+        cancel_source = source[
+            source.index("    def _cancel_all_downloads") : source.index(
+                "    def _begin_shutdown_countdown_if_requested"
+            )
+        ]
+        finish_source = source[
+            source.index("    def _finish_run_after_summary") : source.index(
+                "    def _shutdown_option_changed"
+            )
+        ]
+        self.assertIn("queue_cancel_requested", cancel_source)
+        self.assertIn("queue_pending.clear()", cancel_source)
+        self.assertIn("cancel_current_download", cancel_source)
+        self.assertIn("if self.queue_cancel_requested:", finish_source)
 
     def test_new_gui_work_cancels_an_active_shutdown_countdown(self) -> None:
         source = self._gui_source()
@@ -244,7 +298,10 @@ class ActionWorkerTests(unittest.TestCase):
             run_post_actions=Mock(return_value=[]),
             create_task=Mock(),
             activate_task=Mock(),
+            activate_and_start=Mock(),
             release_download_lifecycle=Mock(),
+            dismiss_result_review=Mock(),
+            cancel_current_download=Mock(return_value=Path("cancel.log")),
         )
         window.queue_output = Mock()
         window.queue_active = True
@@ -253,8 +310,15 @@ class ActionWorkerTests(unittest.TestCase):
         window.queue_shutdown_requested = False
         window.queue_summaries_complete = True
         window.queue_summaries_reliable = True
+        window.queue_cancel_requested = False
+        window.queue_paused = False
+        window.queue_run_source = "queue"
         window.task_smart_private = SimpleNamespace(isChecked=lambda: False)
-        window.queue_shutdown = SimpleNamespace(isChecked=lambda: False)
+        window.queue_shutdown = SimpleNamespace(
+            isChecked=lambda: False,
+            setChecked=Mock(),
+        )
+        window.queue_pause_button = SimpleNamespace(setText=Mock())
         window.shutdown_timer = None
         window.download_summary_thread = None
         window.download_summary_worker = None
@@ -266,6 +330,98 @@ class ActionWorkerTests(unittest.TestCase):
         window._run = lambda action, _output=None: action()
         window.refresh_all = Mock()
         return window
+
+    def test_mouse_drag_checks_and_second_drag_unchecks_the_same_rows(self) -> None:
+        widget = TaskTemplateList()
+        widget.resize(360, 180)
+        for number in range(1, 5):
+            item = QListWidgetItem(f"A{number}.json")
+            item.setCheckState(Qt.CheckState.Unchecked)
+            item.setData(Qt.ItemDataRole.UserRole, str(Path(f"A{number}.json")))
+            widget.addItem(item)
+        widget.show()
+        self.app.processEvents()
+
+        def row_center(row: int) -> QPoint:
+            return widget.visualItemRect(widget.item(row)).center()
+
+        QTest.mousePress(
+            widget.viewport(), Qt.MouseButton.LeftButton, pos=row_center(0)
+        )
+        QTest.mouseMove(widget.viewport(), row_center(2), delay=10)
+        QTest.mouseRelease(
+            widget.viewport(), Qt.MouseButton.LeftButton, pos=row_center(2)
+        )
+        self.assertEqual(
+            [widget.item(row).checkState() for row in range(4)],
+            [
+                Qt.CheckState.Checked,
+                Qt.CheckState.Checked,
+                Qt.CheckState.Checked,
+                Qt.CheckState.Unchecked,
+            ],
+        )
+
+        QTest.mousePress(
+            widget.viewport(), Qt.MouseButton.LeftButton, pos=row_center(0)
+        )
+        QTest.mouseMove(widget.viewport(), row_center(2), delay=10)
+        QTest.mouseRelease(
+            widget.viewport(), Qt.MouseButton.LeftButton, pos=row_center(2)
+        )
+        self.assertEqual(
+            [widget.item(row).checkState() for row in range(4)],
+            [Qt.CheckState.Unchecked] * 4,
+        )
+        widget.close()
+
+    def test_unchecking_result_view_updates_current_run_without_resuming_queue(self) -> None:
+        window = self._window_harness()
+        window.queue_current.pause_after_exit = True
+        window.queue_current.result_review_waiting = False
+        window.queue_paused = True
+
+        MainWindow._result_view_option_changed(
+            window, "queue", Qt.CheckState.Unchecked.value
+        )
+
+        self.assertFalse(window.queue_current.pause_after_exit)
+        self.assertTrue(window.queue_paused)
+        window.controller.dismiss_result_review.assert_not_called()
+        window._start_next_queue_item.assert_not_called()
+
+    def test_unchecked_result_view_closes_wrapper_but_paused_queue_stays_paused(
+        self,
+    ) -> None:
+        window = self._window_harness()
+        run = window.queue_current
+        run.completion_marker = Path("download.exit")
+        run.running = True
+        run.pause_after_exit = False
+        window.queue_paused = True
+        window.download_summary_worker = SimpleNamespace(
+            error=None,
+            result=SimpleNamespace(complete=True, reliable=True),
+        )
+        window.download_summary_thread = object()
+        window.download_summary_run = run
+        window.download_summary_exit_code = 0
+        window.download_summary_assessment = assess_process_exit(0)
+        window.controller.dismiss_result_review.side_effect = lambda _run: setattr(
+            _run, "running", False
+        )
+        window._start_next_queue_item.side_effect = lambda: MainWindow._start_next_queue_item(
+            window
+        )
+
+        with patch.object(gui_module, "format_summary_for_ui", return_value=("汇总完成",)):
+            MainWindow._finish_download_summary(window)
+
+        window.controller.dismiss_result_review.assert_called_once_with(run)
+        self.assertTrue(window.queue_paused)
+        self.assertIsNone(window.queue_current)
+        self.assertEqual(window.queue_pending, [Path("A3.json")])
+        window.controller.activate_and_start.assert_not_called()
 
     def test_one_poll_starts_one_summary_worker_without_advancing_queue(self) -> None:
         window = self._window_harness()
