@@ -143,7 +143,7 @@ class QueueInteractionSourceTests(unittest.TestCase):
     def test_result_review_is_run_state_and_can_change_during_download(self) -> None:
         source = self._gui_source()
         self.assertIn("def _result_view_option_changed", source)
-        self.assertIn("run.pause_after_exit = checked", source)
+        self.assertIn("self.controller.set_result_review(run, checked)", source)
         self.assertIn("self.task_pause_console.stateChanged.connect", source)
         self.assertIn("self.queue_pause_console.stateChanged.connect", source)
         self.assertIn("if getattr(run, \"pause_after_exit\", False):", source)
@@ -301,6 +301,11 @@ class ActionWorkerTests(unittest.TestCase):
             activate_and_start=Mock(),
             release_download_lifecycle=Mock(),
             dismiss_result_review=Mock(),
+            set_result_review=Mock(
+                side_effect=lambda run, enabled: setattr(
+                    run, "pause_after_exit", bool(enabled)
+                )
+            ),
             cancel_current_download=Mock(return_value=Path("cancel.log")),
         )
         window.queue_output = Mock()
@@ -387,6 +392,9 @@ class ActionWorkerTests(unittest.TestCase):
 
         self.assertFalse(window.queue_current.pause_after_exit)
         self.assertTrue(window.queue_paused)
+        window.controller.set_result_review.assert_called_once_with(
+            window.queue_current, False
+        )
         window.controller.dismiss_result_review.assert_not_called()
         window._start_next_queue_item.assert_not_called()
 

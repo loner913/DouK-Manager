@@ -53,6 +53,7 @@ class EngineRun:
     pause_after_exit: bool = False
     task_template: str = "current settings.json"
     completion_marker: Path | None = None
+    review_control: Path | None = None
     engine_exit_code: int | None = None
     result_review_waiting: bool = False
     _summary_lock: Lock = field(
@@ -225,6 +226,7 @@ class EngineService:
                 command = [str(self.paths.engine_exe)]
                 popen_options = {}
                 completion_marker: Path | None = None
+                review_control: Path | None = None
                 if os.name == "nt":
                     creationflags = (
                         subprocess.CREATE_NEW_CONSOLE
@@ -234,16 +236,27 @@ class EngineService:
                     # marker immediately after main.exe exits and then waits
                     # for a key.  The manager can therefore decide at runtime
                     # whether the black window should remain visible.
+                    wrapper_stamp = f"download_{datetime.now():%Y%m%d_%H%M%S_%f}"
                     completion_marker = (
                         self.paths.data
                         / "RunWrappers"
-                        / f"download_{datetime.now():%Y%m%d_%H%M%S_%f}.exit"
+                        / f"{wrapper_stamp}.exit"
+                    )
+                    review_control = (
+                        self.paths.data / "RunWrappers" / f"{wrapper_stamp}.review"
+                    )
+                    self._write_result_review_control(
+                        review_control, pause_after_exit
                     )
                     command = [
                         "cmd.exe",
                         "/d",
                         "/c",
-                        str(self._write_pause_wrapper(completion_marker)),
+                        str(
+                            self._write_pause_wrapper(
+                                completion_marker, review_control
+                            )
+                        ),
                     ]
                     popen_options = engine_mutex.popen_options()
                 try:
@@ -296,6 +309,7 @@ class EngineService:
             pause_after_exit=pause_after_exit,
             task_template=display_template,
             completion_marker=completion_marker,
+            review_control=review_control,
         )
         return self.current
 
@@ -324,7 +338,6 @@ class EngineService:
                     [str(self.paths.engine_exe)],
                     cwd=str(self.paths.engine_root),
                     env=os.environ.copy(),
-                    stdin=subprocess.PIPE if os.name == "nt" else None,
                     creationflags=creationflags,
                     **popen_options,
                 )
@@ -437,6 +450,13 @@ class EngineService:
             return
         self._terminate_process_tree(run.process, timeout=timeout, force=True)
 
+    def set_result_review(self, run: EngineRun, enabled: bool) -> None:
+        """Persist the live result-review choice for the Windows wrapper."""
+
+        run.pause_after_exit = bool(enabled)
+        if run.review_control is not None:
+            self._write_result_review_control(run.review_control, enabled)
+
     def cancel_batch(self, run: EngineRun | None = None, *, timeout: float = 15.0) -> Path:
         """Cancel the current manager-owned batch process tree.
 
@@ -540,43 +560,28 @@ class EngineService:
                 previous_clipboard = _get_windows_clipboard_text()
                 _set_windows_clipboard_text("close")
                 clipboard_changed = True
-                # ``close`` stops the clipboard monitor and returns the
-                # downloader to its outer menu.  An empty Enter is the
-                # downloader's normal way to leave that menu.  Queue it
-                # immediately: the monitor does not consume stdin, so the
-                # outer menu receives it as soon as ``close`` takes effect.
-                stdin = getattr(run.process, "stdin", None)
-                if stdin is not None:
-                    try:
-                        payload = "\n" if getattr(stdin, "encoding", None) else b"\r\n"
-                        stdin.write(payload)
-                        stdin.flush()
-                    except (OSError, TypeError, ValueError):
-                        pass
+                # The original listener checks the clipboard once per second,
+                # then returns to its interactive outer menu.  Do not replace
+                # the console's stdin with a pipe: the packaged downloader
+                # expects a real console input handle and can otherwise exit
+                # immediately after launch.  Give ``close`` time to stop the
+                # listener, then close only this manager-owned process tree.
                 try:
-                    run.process.wait(timeout=min(6.0, timeout))
-                    return
-                except subprocess.TimeoutExpired:
-                    pass
-                try:
-                    run.process.send_signal(signal.CTRL_BREAK_EVENT)
-                except (AttributeError, OSError, ValueError):
-                    pass
-                try:
-                    run.process.wait(timeout=min(3.0, max(0.1, timeout - 6.0)))
+                    run.process.wait(timeout=min(2.5, timeout))
                     return
                 except subprocess.TimeoutExpired:
                     self._terminate_process_tree(
-                        run.process, timeout=max(1.0, timeout - 9.0), force=True
+                        run.process,
+                        timeout=max(1.0, timeout - 2.5),
+                        force=False,
                     )
             else:
                 run.process.terminate()
                 run.process.wait(timeout=timeout)
         except (OSError, subprocess.SubprocessError) as exc:
             raise EngineError(
-                "后台监听尚未正常停止；已依次尝试剪贴板 close、回车退出菜单、"
-                "Ctrl+Break 和关闭"
-                "该下载器进程树，请检查监听窗口后重试。"
+                "后台监听尚未正常停止；已尝试剪贴板 close 并关闭该管理器启动的"
+                "下载器进程树，请检查监听窗口后重试。"
             ) from exc
         finally:
             if _is_windows() and clipboard_changed:
@@ -621,8 +626,19 @@ class EngineService:
             process.kill()
             process.wait(timeout=3.0)
 
-    def _write_pause_wrapper(self, completion_marker: Path | None = None) -> Path:
-        """Create a small ASCII-only launcher that keeps the native console open."""
+    @staticmethod
+    def _write_result_review_control(path: Path, enabled: bool) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text("1\n" if enabled else "0\n", encoding="ascii")
+        os.replace(temporary, path)
+
+    def _write_pause_wrapper(
+        self,
+        completion_marker: Path | None = None,
+        review_control: Path | None = None,
+    ) -> Path:
+        """Create an ASCII launcher whose wait state follows a control file."""
 
         wrapper_dir = self.paths.data / "RunWrappers"
         wrapper_dir.mkdir(parents=True, exist_ok=True)
@@ -636,18 +652,23 @@ class EngineService:
         if completion_marker is not None:
             marker_path = str(completion_marker).replace("%", "%%")
             lines.append(f'echo %DOUK_ENGINE_EXIT%>"{marker_path}"')
-        lines.extend(
-            (
-                "echo.",
-                "echo ============================================================",
-                "echo DouK-Downloader finished. Exit code: %DOUK_ENGINE_EXIT%",
-                "echo Review the download, skip and failure statistics above.",
-                "echo Press any key to close this window...",
-                "pause >nul",
-                "exit /b %DOUK_ENGINE_EXIT%",
-                "",
+        if review_control is not None:
+            control_path = str(review_control).replace("%", "%%")
+            lines.extend(
+                (
+                    'set "DOUK_RESULT_REVIEW=0"',
+                    f'if exist "{control_path}" set /p DOUK_RESULT_REVIEW=<"{control_path}"',
+                    'if "%DOUK_RESULT_REVIEW%"=="1" (',
+                    "  echo.",
+                    "  echo ============================================================",
+                    "  echo DouK-Downloader finished. Exit code: %DOUK_ENGINE_EXIT%",
+                    "  echo Review the download, skip and failure statistics above.",
+                    "  echo Press any key to close this window...",
+                    "  pause >nul",
+                    ")",
+                )
             )
-        )
+        lines.extend(("exit /b %DOUK_ENGINE_EXIT%", ""))
         content = "\r\n".join(lines)
         temporary = wrapper_path.with_suffix(".tmp")
         temporary.write_text(content, encoding="ascii", newline="")

@@ -1547,7 +1547,15 @@ class MainWindow(QMainWindow):
         if source != expected_source:
             return
         checked = bool(state)
-        run.pause_after_exit = checked
+        try:
+            self.controller.set_result_review(run, checked)
+        except Exception as exc:
+            self.controller.logger.exception("更新结果查看状态失败：%s", exc)
+            self._append_info(
+                self.queue_output,
+                f"【失败】无法动态更新结果查看状态：{exc}",
+            )
+            return
         if not checked and getattr(run, "result_review_waiting", False):
             if self._close_result_wrapper(run):
                 self._append_info(
@@ -1587,13 +1595,14 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _cleanup_completion_marker(run) -> None:
-        marker = getattr(run, "completion_marker", None)
-        if marker is None:
-            return
-        try:
-            Path(marker).unlink(missing_ok=True)
-        except OSError:
-            pass
+        for attribute in ("completion_marker", "review_control"):
+            path = getattr(run, attribute, None)
+            if path is None:
+                continue
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _finish_run_after_summary(self, run, assessment) -> None:
         self._cleanup_completion_marker(run)

@@ -360,6 +360,9 @@ class ManagerController:
     def dismiss_result_review(self, run: EngineRun) -> None:
         self.engine.dismiss_result_review(run)
 
+    def set_result_review(self, run: EngineRun, enabled: bool) -> None:
+        self.engine.set_result_review(run, enabled)
+
     def cancel_current_download(self, run: EngineRun | None = None) -> Path:
         result = self.engine.cancel_batch(run)
         self._last_engine_running = False

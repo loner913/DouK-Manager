@@ -225,8 +225,9 @@ class V014CoreTests(unittest.TestCase):
             process = Mock()
             process.poll.return_value = None
             service.external_running = Mock(return_value=False)
-            with patch("douk_manager.core.engine.subprocess.Popen", return_value=process):
+            with patch("douk_manager.core.engine.subprocess.Popen", return_value=process) as popen:
                 run = service.start_monitor()
+            self.assertNotIn("stdin", popen.call_args.kwargs)
             self.assertEqual(run.mode, "monitor")
             self.assertEqual(
                 json.loads(paths.active_settings.read_text(encoding="utf-8"))["run_command"],
@@ -286,7 +287,7 @@ class V014CoreTests(unittest.TestCase):
             )
             self.assertIsNone(service.current)
 
-    def test_windows_monitor_stop_uses_close_then_enter_before_signals(self) -> None:
+    def test_windows_monitor_stop_uses_close_then_closes_owned_process_tree(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             paths = make_test_paths(Path(directory), 2)
             service = EngineService(
@@ -296,9 +297,7 @@ class V014CoreTests(unittest.TestCase):
             )
             events: list[str] = []
             process = Mock()
-            process.stdin = Mock(encoding=None)
-            process.wait.return_value = None
-            process.stdin.write.side_effect = lambda _value: events.append("enter")
+            process.wait.side_effect = subprocess.TimeoutExpired("engine", 2.5)
 
             with patch("douk_manager.core.engine._is_windows", return_value=True), patch(
                 "douk_manager.core.engine._get_windows_clipboard_text",
@@ -306,16 +305,21 @@ class V014CoreTests(unittest.TestCase):
             ), patch(
                 "douk_manager.core.engine._set_windows_clipboard_text",
                 side_effect=lambda value: events.append(f"clipboard:{value}"),
-            ):
+            ), patch.object(
+                service,
+                "_terminate_process_tree",
+                side_effect=lambda *_args, **_kwargs: events.append("terminate-tree"),
+            ) as terminate:
                 service._request_monitor_stop(Mock(process=process), timeout=15.0)
 
             self.assertEqual(
                 events,
-                ["clipboard:close", "enter", "clipboard:original"],
+                ["clipboard:close", "terminate-tree", "clipboard:original"],
             )
             process.send_signal.assert_not_called()
+            terminate.assert_called_once_with(process, timeout=12.5, force=False)
 
-    def test_windows_monitor_stop_falls_back_after_close_and_enter_timeout(self) -> None:
+    def test_windows_monitor_stop_returns_when_process_exits_after_close(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             paths = make_test_paths(Path(directory), 2)
             service = EngineService(
@@ -324,25 +328,19 @@ class V014CoreTests(unittest.TestCase):
                 BackupService(paths),
             )
             process = Mock()
-            process.stdin = Mock(encoding=None)
-            process.wait.side_effect = [
-                subprocess.TimeoutExpired("engine", 6),
-                subprocess.TimeoutExpired("engine", 3),
-            ]
+            process.wait.return_value = None
 
             with patch("douk_manager.core.engine._is_windows", return_value=True), patch(
                 "douk_manager.core.engine._get_windows_clipboard_text",
                 return_value="original",
             ), patch(
                 "douk_manager.core.engine._set_windows_clipboard_text"
-            ), patch(
-                "douk_manager.core.engine.signal.CTRL_BREAK_EVENT", 1, create=True
             ), patch.object(service, "_terminate_process_tree") as terminate:
                 service._request_monitor_stop(Mock(process=process), timeout=15.0)
 
-            process.stdin.write.assert_called_once_with(b"\r\n")
-            process.send_signal.assert_called_once_with(1)
-            terminate.assert_called_once_with(process, timeout=6.0, force=True)
+            process.wait.assert_called_once_with(timeout=2.5)
+            process.send_signal.assert_not_called()
+            terminate.assert_not_called()
 
 
 if __name__ == "__main__":
