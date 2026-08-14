@@ -69,6 +69,36 @@ def create_collector_workbook(path: Path) -> None:
 
 
 class ControllerRuntimeSafetyTests(unittest.TestCase):
+    def test_monitor_start_requires_successful_startup_backup_before_engine_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = make_controller(Path(directory), engine_running=False)
+            controller.startup_backup = None
+            controller.read_only_reason = "启动前备份失败：test failure"
+            controller.try_startup_backup = Mock(return_value=controller.read_only_reason)
+            controller.collector.health.return_value = False
+            controller.collector.running = False
+            active_before = controller.paths.active_settings.read_bytes()
+
+            with self.assertRaisesRegex(ControllerError, "启动前备份失败"):
+                controller.start_monitor()
+
+            controller.engine.start_monitor.assert_not_called()
+            self.assertEqual(controller.paths.active_settings.read_bytes(), active_before)
+
+    def test_monitor_start_honors_existing_read_only_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = make_controller(Path(directory), engine_running=False)
+            controller.read_only_reason = "只读保护仍然有效"
+            controller.collector.health.return_value = False
+            controller.collector.running = False
+            active_before = controller.paths.active_settings.read_bytes()
+
+            with self.assertRaisesRegex(ControllerError, "只读保护"):
+                controller.start_monitor()
+
+            controller.engine.start_monitor.assert_not_called()
+            self.assertEqual(controller.paths.active_settings.read_bytes(), active_before)
+
     def test_downloader_running_allows_collector_start_without_touching_active_or_db(
         self,
     ) -> None:

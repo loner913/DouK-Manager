@@ -11,6 +11,10 @@ from douk_manager.core.backup import BackupService
 from douk_manager.core.json_store import read_json, write_json_atomic
 from douk_manager.core.locks import critical_section
 from douk_manager.core.selector import Selection, compact_numbers, parse_selection, split_batches
+from douk_manager.core.result_history import (
+    PrivateReferenceDecision,
+    RecentPrivateMatch,
+)
 
 
 class SettingsTaskError(RuntimeError):
@@ -59,6 +63,26 @@ class GeneratedTask:
     backup_path: Path | None = None
 
 
+@dataclass(frozen=True)
+class SmartSelectionPreview:
+    requested: SelectionPreview
+    effective: SelectionPreview | None
+    private_matches: tuple[RecentPrivateMatch, ...]
+    validity_days: int
+    decisions: tuple[PrivateReferenceDecision, ...] = ()
+
+    @property
+    def skipped_numbers(self) -> tuple[int, ...]:
+        return tuple(match.a_number for match in self.private_matches)
+
+    @property
+    def included_numbers(self) -> tuple[int, ...]:
+        excluded = set(self.skipped_numbers)
+        return tuple(
+            number for number in self.requested.selection.numbers if number not in excluded
+        )
+
+
 class SettingsTaskService:
     def __init__(self, paths: ManagedPaths, backup: BackupService) -> None:
         self.paths = paths
@@ -83,6 +107,12 @@ class SettingsTaskService:
         master = self.load_master()
         accounts = self._accounts(master, "settings_master.json")
         selection = parse_selection(expression, len(accounts))
+        return self._preview_selection(accounts, selection)
+
+    @staticmethod
+    def _preview_selection(
+        accounts: list[dict[str, Any]], selection: Selection
+    ) -> SelectionPreview:
         valid = sum(
             1
             for number in selection.numbers
@@ -96,6 +126,37 @@ class SettingsTaskService:
             selected_blank_urls=len(selection.numbers) - valid,
             unselected_positions=len(accounts) - len(selection.numbers),
             compact=compact_numbers(selection.numbers),
+        )
+
+    def preview_with_private_filter(
+        self,
+        expression: str,
+        private_matches: tuple[RecentPrivateMatch, ...],
+        validity_days: int,
+        decisions: tuple[PrivateReferenceDecision, ...] = (),
+    ) -> SmartSelectionPreview:
+        master = self.load_master()
+        accounts = self._accounts(master, "settings_master.json")
+        requested_selection = parse_selection(expression, len(accounts))
+        requested = self._preview_selection(accounts, requested_selection)
+        excluded = {match.a_number for match in private_matches}
+        effective_numbers = tuple(
+            number for number in requested_selection.numbers if number not in excluded
+        )
+        effective: SelectionPreview | None = None
+        if effective_numbers:
+            selection = Selection(
+                effective_numbers,
+                requested_selection.duplicate_numbers,
+                compact_numbers(effective_numbers),
+            )
+            effective = self._preview_selection(accounts, selection)
+        return SmartSelectionPreview(
+            requested=requested,
+            effective=effective,
+            private_matches=private_matches,
+            validity_days=validity_days,
+            decisions=decisions,
         )
 
     def build_task_document(
@@ -122,13 +183,27 @@ class SettingsTaskService:
         persist_master_earliest: bool = False,
         task_name: str | None = None,
         activate: bool = False,
+        excluded_numbers: tuple[int, ...] = (),
     ) -> GeneratedTask:
         task_earliest = task_earliest or EarliestRule.keep()
         with critical_section(self.paths.lock_file):
             master = self.load_master()
             accounts = self._accounts(master, "settings_master.json")
-            selection = parse_selection(expression, len(accounts))
-            preview = self.preview(expression)
+            requested_selection = parse_selection(expression, len(accounts))
+            excluded = set(excluded_numbers)
+            effective_numbers = tuple(
+                number for number in requested_selection.numbers if number not in excluded
+            )
+            if not effective_numbers:
+                raise SettingsTaskError(
+                    "智能跳过后没有剩余账号；可以选择强制包含全部账号，或取消创建。"
+                )
+            selection = Selection(
+                effective_numbers,
+                requested_selection.duplicate_numbers,
+                compact_numbers(effective_numbers),
+            )
+            preview = self._preview_selection(accounts, selection)
 
             master_new = copy.deepcopy(master)
             if persist_master_earliest and task_earliest.change:
@@ -171,6 +246,28 @@ class SettingsTaskService:
                     )
                 raise
             return GeneratedTask(task_path, preview, active_path, backup_path)
+
+    def delete_tasks(
+        self, task_paths: tuple[Path, ...], *, protected_paths: tuple[Path, ...] = ()
+    ) -> tuple[Path, ...]:
+        """Delete only explicitly named JSON templates inside Data/Tasks."""
+
+        tasks_root = self.paths.tasks.resolve()
+        protected = {path.resolve() for path in protected_paths}
+        validated: list[Path] = []
+        for raw_path in task_paths:
+            path = raw_path.resolve()
+            if path.parent != tasks_root or path.suffix.casefold() != ".json":
+                raise SettingsTaskError(f"只能删除任务目录内的 JSON 模板：{raw_path}")
+            if path in protected:
+                raise SettingsTaskError(f"模板正在当前队列中使用，不能删除：{path.name}")
+            if not path.is_file():
+                raise SettingsTaskError(f"任务模板已不存在，请刷新列表：{path.name}")
+            validated.append(path)
+        with critical_section(self.paths.lock_file):
+            for path in validated:
+                path.unlink()
+        return tuple(validated)
 
     def activate_existing_task(self, task_path: Path) -> Path:
         with critical_section(self.paths.lock_file):
