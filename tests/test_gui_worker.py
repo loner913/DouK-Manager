@@ -86,6 +86,21 @@ class QueueInteractionSourceTests(unittest.TestCase):
             "        if self._queue_state_locked():",
             source,
         )
+
+    def test_queue_and_result_ui_expose_confirmed_v014_repairs(self) -> None:
+        source = self._gui_source()
+        self.assertIn("class TaskTemplateList", source)
+        self.assertIn("self._drag_target_state", source)
+        self.assertIn('QPushButton("全选模板")', source)
+        self.assertIn('QPushButton("取消全选")', source)
+        self.assertIn('QPushButton("删除已选模板")', source)
+        self.assertIn('QPushButton("应用为正式 setting")', source)
+        self.assertIn('QPushButton("运行当前 setting")', source)
+        self.assertIn('QPushButton("按顺序运行已选")', source)
+        self.assertIn("cellDoubleClicked.connect(self._open_result_log)", source)
+        self.assertIn("_schedule_result_refresh", source)
+        self.assertIn("采集服务：", source)
+        self.assertIn("下载进程：", source)
         self.assertIn(
             "def _start_current(self) -> None:\n"
             "        if self._queue_state_locked():",
@@ -239,6 +254,8 @@ class ActionWorkerTests(unittest.TestCase):
         window.queue_summaries_complete = True
         window.queue_summaries_reliable = True
         window.task_smart_private = SimpleNamespace(isChecked=lambda: False)
+        window.queue_shutdown = SimpleNamespace(isChecked=lambda: False)
+        window.shutdown_timer = None
         window.download_summary_thread = None
         window.download_summary_worker = None
         window.download_summary_run = None

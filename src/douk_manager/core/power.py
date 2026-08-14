@@ -8,7 +8,7 @@ class PowerError(RuntimeError):
     pass
 
 
-def request_normal_shutdown() -> bool:
+def request_normal_shutdown() -> None:
     """Ask Windows to perform a normal shutdown without force-closing apps.
 
     The manager owns the countdown and calls ``shutdown.exe /s /t 0`` only
@@ -33,4 +33,3 @@ def request_normal_shutdown() -> bool:
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "未知错误").strip()
         raise PowerError(f"Windows 拒绝关机请求：{detail}")
-    return True

@@ -11,7 +11,10 @@ from douk_manager.core.backup import BackupService
 from douk_manager.core.json_store import read_json, write_json_atomic
 from douk_manager.core.locks import critical_section
 from douk_manager.core.selector import Selection, compact_numbers, parse_selection, split_batches
-from douk_manager.core.result_history import RecentPrivateMatch
+from douk_manager.core.result_history import (
+    PrivateReferenceDecision,
+    RecentPrivateMatch,
+)
 
 
 class SettingsTaskError(RuntimeError):
@@ -66,10 +69,18 @@ class SmartSelectionPreview:
     effective: SelectionPreview | None
     private_matches: tuple[RecentPrivateMatch, ...]
     validity_days: int
+    decisions: tuple[PrivateReferenceDecision, ...] = ()
 
     @property
     def skipped_numbers(self) -> tuple[int, ...]:
         return tuple(match.a_number for match in self.private_matches)
+
+    @property
+    def included_numbers(self) -> tuple[int, ...]:
+        excluded = set(self.skipped_numbers)
+        return tuple(
+            number for number in self.requested.selection.numbers if number not in excluded
+        )
 
 
 class SettingsTaskService:
@@ -122,6 +133,7 @@ class SettingsTaskService:
         expression: str,
         private_matches: tuple[RecentPrivateMatch, ...],
         validity_days: int,
+        decisions: tuple[PrivateReferenceDecision, ...] = (),
     ) -> SmartSelectionPreview:
         master = self.load_master()
         accounts = self._accounts(master, "settings_master.json")
@@ -144,6 +156,7 @@ class SettingsTaskService:
             effective=effective,
             private_matches=private_matches,
             validity_days=validity_days,
+            decisions=decisions,
         )
 
     def build_task_document(

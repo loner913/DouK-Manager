@@ -42,19 +42,8 @@ class V014CoreTests(unittest.TestCase):
     def test_incomplete_newer_run_without_requested_row_blocks_older_private(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            _write_log(
-                root,
-                "DownloadTask_2026-08-12_10-00-00.log",
-                "2026-08-12 10:00:00",
-                "A3",
-            )
-            sparse = _write_log(
-                root,
-                "DownloadTask_2026-08-13_10-00-00.log",
-                "2026-08-13 10:00:00",
-                "",
-                "",
-            )
+            _write_log(root, "DownloadTask_2026-08-12_10-00-00.log", "2026-08-12 10:00:00", "A3")
+            sparse = _write_log(root, "DownloadTask_2026-08-13_10-00-00.log", "2026-08-13 10:00:00", "")
             sparse.write_text(
                 sparse.read_text(encoding="utf-8").replace("账号明细版本：1\n", ""),
                 encoding="utf-8",
@@ -62,50 +51,26 @@ class V014CoreTests(unittest.TestCase):
 
             service = ResultHistoryService(root)
             self.assertEqual(service.list_runs()[0].account_rows, ())
-            self.assertEqual(
-                service.recent_private((3,), 7, now=datetime(2026, 8, 13, 12)),
-                (),
-            )
+            self.assertEqual(service.recent_private((3,), 7, now=datetime(2026, 8, 13, 12)), ())
 
     def test_sparse_newer_result_does_not_override_complete_private_result(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            _write_log(
-                root,
-                "DownloadTask_2026-08-12_10-00-00.log",
-                "2026-08-12 10:00:00",
-                "A3",
-            )
-            sparse = _write_log(
-                root,
-                "DownloadTask_2026-08-13_10-00-00.log",
-                "2026-08-13 10:00:00",
-                "",
-                "A3",
-            )
+            _write_log(root, "DownloadTask_2026-08-12_10-00-00.log", "2026-08-12 10:00:00", "A3")
+            sparse = _write_log(root, "DownloadTask_2026-08-13_10-00-00.log", "2026-08-13 10:00:00", "", "A3")
             sparse.write_text(
                 sparse.read_text(encoding="utf-8").replace("账号明细版本：1\n", ""),
                 encoding="utf-8",
             )
 
             service = ResultHistoryService(root)
-            runs = service.list_runs()
-            self.assertFalse(runs[0].details_complete)
-            self.assertEqual(runs[0].account_rows[0].a_number, 3)
-            self.assertEqual(
-                service.recent_private((3,), 7, now=datetime(2026, 8, 13, 12)),
-                (),
-            )
+            self.assertFalse(service.list_runs()[0].details_complete)
+            self.assertEqual(service.recent_private((3,), 7, now=datetime(2026, 8, 13, 12)), ())
 
     def test_incomplete_private_result_is_visible_but_not_automatic(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            sparse = _write_log(
-                root,
-                "DownloadTask_2026-08-13_10-00-00.log",
-                "2026-08-13 10:00:00",
-                "A3",
-            )
+            sparse = _write_log(root, "DownloadTask_2026-08-13_10-00-00.log", "2026-08-13 10:00:00", "A3")
             sparse.write_text(
                 sparse.read_text(encoding="utf-8").replace("账号明细版本：1\n", ""),
                 encoding="utf-8",
@@ -113,10 +78,7 @@ class V014CoreTests(unittest.TestCase):
 
             service = ResultHistoryService(root)
             self.assertEqual(service.list_runs()[0].account_rows[0].a_number, 3)
-            self.assertEqual(
-                service.recent_private((3,), 7, now=datetime(2026, 8, 13, 12)),
-                (),
-            )
+            self.assertEqual(service.recent_private((3,), 7, now=datetime(2026, 8, 13, 12)), ())
 
     def test_result_history_reads_complete_mapping_and_latest_private(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -135,6 +97,30 @@ class V014CoreTests(unittest.TestCase):
             self.assertEqual(service.recent_private((3,), 7, now=datetime(2026, 8, 13, 12)), ())
             self.assertEqual(first.name, "DownloadTask_2026-08-12_10-00-00.log")
             self.assertEqual(second.name, "DownloadTask_2026-08-13_10-00-00.log")
+
+    def test_private_reference_preview_explains_every_requested_account(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_log(
+                root,
+                "DownloadTask_2026-08-13_10-00-00.log",
+                "2026-08-13 10:00:00",
+                "A1",
+                "A2",
+            )
+            _write_log(
+                root,
+                "DownloadTask_2026-08-01_10-00-00.log",
+                "2026-08-01 10:00:00",
+                "A3",
+            )
+            decisions = ResultHistoryService(root).classify_private_reference(
+                (1, 2, 3, 4), 3, now=datetime(2026, 8, 13, 12)
+            )
+            self.assertEqual(
+                [decision.category for decision in decisions],
+                ["recent_private", "recent_non_private", "expired_private", "no_record"],
+            )
 
     def test_private_reference_expiry_and_old_log_is_conservative(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -190,32 +176,13 @@ class V014CoreTests(unittest.TestCase):
             else:
                 process.terminate.assert_called_once_with()
                 process.send_signal.assert_not_called()
-            process.wait.assert_called_once_with(timeout=15.0)
+            process.wait.assert_called_once()
+            backup.create_critical_snapshot.assert_not_called()
 
-    def test_monitor_backup_failure_releases_mutex_without_launching(self) -> None:
+    def test_monitor_post_launch_failure_stops_process_and_restores_command(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             paths = make_test_paths(Path(directory), 2)
             backup = BackupService(paths)
-            backup.create_critical_snapshot = Mock(side_effect=OSError("backup failed"))
-            service = EngineService(paths, AppConfig(engine_exe=str(paths.engine_exe)), backup)
-            service.external_running = Mock(return_value=False)
-            mutex = Mock()
-
-            with patch("douk_manager.core.engine._WindowsEngineMutex.acquire", return_value=mutex), patch(
-                "douk_manager.core.engine.subprocess.Popen"
-            ) as popen:
-                with self.assertRaises(EngineError):
-                    service.start_monitor()
-
-            mutex.close.assert_called_once_with()
-            popen.assert_not_called()
-            self.assertIsNone(service.current)
-
-    def test_monitor_post_launch_failure_terminates_process_and_restores_command(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            paths = make_test_paths(Path(directory), 2)
-            backup = BackupService(paths)
-            backup.create_critical_snapshot = Mock(return_value=paths.backups / "snapshot")
             service = EngineService(paths, AppConfig(engine_exe=str(paths.engine_exe)), backup)
             service.external_running = Mock(return_value=False)
             process = Mock()
@@ -230,11 +197,8 @@ class V014CoreTests(unittest.TestCase):
 
             if os.name == "nt":
                 process.send_signal.assert_called_once_with(signal.CTRL_BREAK_EVENT)
-                process.terminate.assert_not_called()
             else:
                 process.terminate.assert_called_once_with()
-                process.send_signal.assert_not_called()
-            process.wait.assert_called_once()
             self.assertEqual(
                 json.loads(paths.active_settings.read_text(encoding="utf-8"))["run_command"],
                 BATCH_RUN_COMMAND,

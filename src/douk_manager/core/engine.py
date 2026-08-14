@@ -5,6 +5,7 @@ import signal
 import subprocess
 import ctypes
 import hashlib
+import time
 from ctypes import wintypes
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -51,6 +52,9 @@ class EngineRun:
     mode: str = ENGINE_MODE_BATCH
     pause_after_exit: bool = False
     task_template: str = "current settings.json"
+    completion_marker: Path | None = None
+    engine_exit_code: int | None = None
+    result_review_waiting: bool = False
     _summary_lock: Lock = field(
         default_factory=Lock, init=False, repr=False, compare=False
     )
@@ -220,15 +224,24 @@ class EngineService:
                 creationflags = 0
                 command = [str(self.paths.engine_exe)]
                 popen_options = {}
+                completion_marker: Path | None = None
                 if os.name == "nt":
                     creationflags = subprocess.CREATE_NEW_CONSOLE
-                    if pause_after_exit:
-                        command = [
-                            "cmd.exe",
-                            "/d",
-                            "/c",
-                            str(self._write_pause_wrapper()),
-                        ]
+                    # Always use the small wrapper on Windows.  It writes a
+                    # marker immediately after main.exe exits and then waits
+                    # for a key.  The manager can therefore decide at runtime
+                    # whether the black window should remain visible.
+                    completion_marker = (
+                        self.paths.data
+                        / "RunWrappers"
+                        / f"download_{datetime.now():%Y%m%d_%H%M%S_%f}.exit"
+                    )
+                    command = [
+                        "cmd.exe",
+                        "/d",
+                        "/c",
+                        str(self._write_pause_wrapper(completion_marker)),
+                    ]
                     popen_options = engine_mutex.popen_options()
                 try:
                     process = subprocess.Popen(
@@ -279,6 +292,7 @@ class EngineService:
             mode=ENGINE_MODE_BATCH,
             pause_after_exit=pause_after_exit,
             task_template=display_template,
+            completion_marker=completion_marker,
         )
         return self.current
 
@@ -287,8 +301,6 @@ class EngineService:
 
         if self.external_running():
             raise EngineError("下载引擎已经在运行，不能同时启动后台监听。")
-        process: subprocess.Popen | None = None
-        command_changed = False
         with critical_section(self.paths.lock_file):
             if self.external_running():
                 raise EngineError("下载引擎已经在运行，不能同时启动后台监听。")
@@ -296,19 +308,7 @@ class EngineService:
                 raise EngineError(f"下载引擎不存在：{self.paths.engine_exe}")
             engine_mutex = _WindowsEngineMutex.acquire(self.paths.engine_exe)
             try:
-                snapshot = self.backup.create_critical_snapshot(
-                    "BeforeMonitor",
-                    {
-                        "operation": "start_clipboard_monitor",
-                        "run_command_before": read_json(
-                            self.paths.active_settings
-                        ).get("run_command"),
-                        "run_command_after": MONITOR_RUN_COMMAND,
-                    },
-                    keep_latest=5,
-                )
                 self._set_run_command(MONITOR_RUN_COMMAND)
-                command_changed = True
                 creationflags = 0
                 popen_options = {}
                 if os.name == "nt":
@@ -325,23 +325,35 @@ class EngineService:
                     **popen_options,
                 )
             except Exception as exc:
-                if command_changed:
-                    try:
-                        self._set_run_command(BATCH_RUN_COMMAND)
-                    except Exception:
-                        pass
+                # Do not leave the official settings in menu 6 when launch or
+                # the atomic JSON write fails.  Best-effort restoration is
+                # deliberately attempted before the error is surfaced.
+                try:
+                    self._set_run_command(BATCH_RUN_COMMAND)
+                except Exception:
+                    pass
                 if isinstance(exc, EngineError):
                     raise
                 raise EngineError(f"无法启动下载后台监听：{exc}") from exc
             finally:
                 engine_mutex.close()
 
+        started_at = datetime.now()
+        task_log = (
+            self.paths.download_task_logs
+            / f"DownloadTask_{started_at:%Y-%m-%d_%H-%M-%S-%f}.log"
+        )
+        pending_run = EngineRun(
+            process=process,
+            started_at=started_at,
+            task_log=task_log,
+            planned_accounts=(),
+            native_log_snapshot=(),
+            native_log_dir=self.paths.volume / "Log",
+            mode=ENGINE_MODE_MONITOR,
+            task_template="后台剪贴板监听",
+        )
         try:
-            started_at = datetime.now()
-            task_log = (
-                self.paths.download_task_logs
-                / f"DownloadTask_{started_at:%Y-%m-%d_%H-%M-%S-%f}.log"
-            )
             task_log.write_text(
                 format_information(
                     "Started",
@@ -350,7 +362,7 @@ class EngineService:
                     f"Engine: {self.paths.engine_exe}",
                     f"Active settings: {self.paths.active_settings}",
                     f"run_command: {MONITOR_RUN_COMMAND}",
-                    f"Backup: {snapshot}",
+                    "Startup critical snapshot: already handled by manager startup",
                     at=started_at,
                     merge=True,
                     include_date=True,
@@ -358,33 +370,29 @@ class EngineService:
                 + "\n",
                 encoding="utf-8",
             )
-            self.current = EngineRun(
-                process=process,
-                started_at=started_at,
-                task_log=task_log,
-                planned_accounts=(),
-                native_log_snapshot=(),
-                native_log_dir=self.paths.volume / "Log",
-                mode=ENGINE_MODE_MONITOR,
-                task_template="后台剪贴板监听",
-            )
+            self.current = pending_run
         except Exception as exc:
             self.current = None
             try:
-                if os.name == "nt":
-                    process.send_signal(signal.CTRL_BREAK_EVENT)
-                else:
-                    process.terminate()
-                process.wait(timeout=15.0)
-            except (OSError, subprocess.SubprocessError) as cleanup_exc:
+                self._request_monitor_stop(pending_run, timeout=15.0)
+            except EngineError as cleanup_exc:
                 raise EngineError(
                     "后台监听启动收尾失败，且新进程尚未确认退出；run_command 未恢复。"
                 ) from cleanup_exc
+            if self.external_running():
+                raise EngineError(
+                    "后台监听启动收尾失败，且仍检测到下载进程；run_command 未恢复。"
+                ) from exc
             try:
-                self._set_run_command(BATCH_RUN_COMMAND)
+                with critical_section(self.paths.lock_file):
+                    if self.external_running():
+                        raise EngineError(
+                            "后台监听启动收尾失败，且仍检测到下载进程；run_command 未恢复。"
+                        )
+                    self._set_run_command(BATCH_RUN_COMMAND)
             except Exception as restore_exc:
                 raise EngineError(
-                    f"后台监听启动失败，新进程已退出但 run_command 恢复失败：{restore_exc}"
+                    "后台监听启动失败，新进程已退出但 run_command 恢复失败。"
                 ) from restore_exc
             raise EngineError(f"无法完成下载后台监听启动：{exc}") from exc
         return self.current
@@ -394,19 +402,13 @@ class EngineService:
         if run is not None and run.mode != ENGINE_MODE_MONITOR and run.running:
             raise EngineError("当前运行的是账号批量下载，不是后台监听。")
         if run is not None and run.running:
-            try:
-                if os.name == "nt":
-                    run.process.send_signal(signal.CTRL_BREAK_EVENT)
-                else:
-                    run.process.terminate()
-                run.process.wait(timeout=timeout)
-            except (OSError, subprocess.SubprocessError) as exc:
-                raise EngineError(
-                    "后台监听尚未正常停止，run_command 未恢复；请先关闭下载器监听窗口后重试。"
-                ) from exc
+            self._request_monitor_stop(run, timeout=timeout)
+        deadline = time.monotonic() + timeout
+        while self.external_running() and time.monotonic() < deadline:
+            time.sleep(0.1)
         if self.external_running():
             raise EngineError(
-                "仍检测到下载引擎进程，run_command 未恢复；请先关闭监听窗口后重试。"
+                "后台监听进程仍在运行，未恢复 run_command；请稍后重试或关闭监听窗口。"
             )
         with critical_section(self.paths.lock_file):
             changed = self._set_run_command(BATCH_RUN_COMMAND)
@@ -435,15 +437,6 @@ class EngineService:
         with critical_section(self.paths.lock_file):
             if self.external_running():
                 return False
-            self.backup.create_critical_snapshot(
-                "BeforeChange",
-                {
-                    "operation": "recover_stale_monitor_command",
-                    "run_command_before": MONITOR_RUN_COMMAND,
-                    "run_command_after": BATCH_RUN_COMMAND,
-                },
-                keep_latest=20,
-            )
             self._set_run_command(BATCH_RUN_COMMAND)
         return True
 
@@ -484,18 +477,59 @@ class EngineService:
             run._summary_result = summary
             return summary
 
-    def _write_pause_wrapper(self) -> Path:
+    def _request_monitor_stop(self, run: EngineRun, *, timeout: float) -> None:
+        """Stop monitor gracefully, using its documented clipboard sentinel."""
+
+        previous_clipboard: str | None = None
+        try:
+            if os.name == "nt":
+                # First try the console signal used by the downloader.  The
+                # monitor also documents the clipboard sentinel as a reliable
+                # graceful stop, so use it as a fallback without killing the
+                # downloader tree.
+                try:
+                    run.process.send_signal(signal.CTRL_BREAK_EVENT)
+                except (AttributeError, OSError, ValueError):
+                    pass
+                try:
+                    run.process.wait(timeout=min(2.0, timeout))
+                    return
+                except subprocess.TimeoutExpired:
+                    pass
+                previous_clipboard = _get_windows_clipboard_text()
+                _set_windows_clipboard_text("close")
+            else:
+                run.process.terminate()
+            run.process.wait(timeout=timeout)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise EngineError(
+                "后台监听尚未正常停止；已尝试 Ctrl+Break 和剪贴板 close 信号，"
+                "请关闭下载器监听窗口后重试。"
+            ) from exc
+        finally:
+            if os.name == "nt" and previous_clipboard is not None:
+                try:
+                    _set_windows_clipboard_text(previous_clipboard)
+                except OSError:
+                    pass
+
+    def _write_pause_wrapper(self, completion_marker: Path | None = None) -> Path:
         """Create a small ASCII-only launcher that keeps the native console open."""
 
         wrapper_dir = self.paths.data / "RunWrappers"
         wrapper_dir.mkdir(parents=True, exist_ok=True)
         wrapper_path = wrapper_dir / "run_downloader_and_pause.cmd"
         engine_path = str(self.paths.engine_exe).replace("%", "%%")
-        content = "\r\n".join(
-            (
+        lines = [
                 "@echo off",
                 f'call "{engine_path}"',
                 'set "DOUK_ENGINE_EXIT=%ERRORLEVEL%"',
+        ]
+        if completion_marker is not None:
+            marker_path = str(completion_marker).replace("%", "%%")
+            lines.append(f'echo %DOUK_ENGINE_EXIT%>"{marker_path}"')
+        lines.extend(
+            (
                 "echo.",
                 "echo ============================================================",
                 "echo DouK-Downloader finished. Exit code: %DOUK_ENGINE_EXIT%",
@@ -506,6 +540,7 @@ class EngineService:
                 "",
             )
         )
+        content = "\r\n".join(lines)
         temporary = wrapper_path.with_suffix(".tmp")
         temporary.write_text(content, encoding="ascii", newline="")
         os.replace(temporary, wrapper_path)
@@ -518,6 +553,79 @@ class _SecurityAttributes(ctypes.Structure):
         ("lpSecurityDescriptor", wintypes.LPVOID),
         ("bInheritHandle", wintypes.BOOL),
     )
+
+
+def _get_windows_clipboard_text() -> str | None:
+    if os.name != "nt":
+        return None
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    user32.OpenClipboard.argtypes = [wintypes.HWND]
+    user32.OpenClipboard.restype = wintypes.BOOL
+    user32.GetClipboardData.argtypes = [wintypes.UINT]
+    user32.GetClipboardData.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.restype = wintypes.BOOL
+    if not user32.OpenClipboard(None):
+        return None
+    try:
+        handle = user32.GetClipboardData(13)  # CF_UNICODETEXT
+        if not handle:
+            return None
+        pointer = kernel32.GlobalLock(handle)
+        if not pointer:
+            return None
+        try:
+            return ctypes.wstring_at(pointer)
+        finally:
+            kernel32.GlobalUnlock(handle)
+    finally:
+        user32.CloseClipboard()
+
+
+def _set_windows_clipboard_text(value: str) -> None:
+    if os.name != "nt":
+        return
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    user32.OpenClipboard.argtypes = [wintypes.HWND]
+    user32.OpenClipboard.restype = wintypes.BOOL
+    user32.EmptyClipboard.restype = wintypes.BOOL
+    user32.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
+    user32.SetClipboardData.restype = ctypes.c_void_p
+    kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.restype = wintypes.BOOL
+    kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalFree.restype = ctypes.c_void_p
+    if not user32.OpenClipboard(None):
+        raise OSError("无法打开 Windows 剪贴板")
+    handle = None
+    try:
+        encoded = (value + "\x00").encode("utf-16-le")
+        handle = kernel32.GlobalAlloc(0x0002, len(encoded))  # GMEM_MOVEABLE
+        if not handle:
+            raise OSError("无法分配剪贴板内存")
+        pointer = kernel32.GlobalLock(handle)
+        if not pointer:
+            raise OSError("无法锁定剪贴板内存")
+        try:
+            ctypes.memmove(pointer, encoded, len(encoded))
+        finally:
+            kernel32.GlobalUnlock(handle)
+        user32.EmptyClipboard()
+        if not user32.SetClipboardData(13, handle):  # CF_UNICODETEXT
+            raise OSError("无法写入 Windows 剪贴板")
+        handle = None  # ownership transferred to the clipboard
+    finally:
+        if handle:
+            kernel32.GlobalFree(handle)
+        user32.CloseClipboard()
 
 
 class _WindowsEngineMutex:

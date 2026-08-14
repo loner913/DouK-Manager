@@ -46,6 +46,24 @@ class RecentPrivateMatch:
         return f"{self.ended_at:%Y-%m-%d %H:%M:%S} / {self.task_template}"
 
 
+@dataclass(frozen=True)
+class PrivateReferenceDecision:
+    """Explain how a requested account was classified for smart skipping."""
+
+    a_number: int
+    category: str
+    row: AccountHistoryRow | None = None
+
+    @property
+    def source_text(self) -> str:
+        if self.row is None:
+            return "无可用历史记录"
+        return (
+            f"{self.row.ended_at:%Y-%m-%d %H:%M:%S} / "
+            f"{self.row.task_template} / {self.row.task_log.name}"
+        )
+
+
 _DATE_IN_FILENAME = re.compile(
     r"DownloadTask_(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})(?:-\d+)?\.log$",
     re.IGNORECASE,
@@ -112,35 +130,86 @@ class ResultHistoryService:
         requested = set(numbers)
         if not requested:
             return ()
-        threshold = (now or datetime.now()) - timedelta(days=validity_days)
-        latest: dict[int, tuple[AccountHistoryRow, bool]] = {}
-        unknown: set[int] = set()
-        for run in self.list_runs():
-            if run.ended_at < threshold:
-                continue
-            if not run.details_complete:
-                # Sparse legacy logs do not prove which requested accounts
-                # were outside the run, so they block older automatic results.
-                unknown.update(requested - latest.keys() - unknown)
-                continue
-            for row in run.account_rows:
-                if (
-                    row.a_number in requested
-                    and row.a_number not in latest
-                    and row.a_number not in unknown
-                ):
-                    latest[row.a_number] = (row, run.details_complete)
+        decisions = self.classify_private_reference(
+            tuple(sorted(requested)), validity_days, now=now
+        )
         matches = [
             RecentPrivateMatch(
-                a_number=number,
-                ended_at=row.ended_at,
-                task_template=row.task_template,
-                task_log=row.task_log,
+                a_number=decision.a_number,
+                ended_at=decision.row.ended_at,
+                task_template=decision.row.task_template,
+                task_log=decision.row.task_log,
             )
-            for number, (row, details_complete) in latest.items()
-            if details_complete and row.status is AccountStatus.PRIVATE
+            for decision in decisions
+            if decision.category == "recent_private" and decision.row is not None
         ]
         return tuple(sorted(matches, key=lambda item: item.a_number))
+
+    def classify_private_reference(
+        self,
+        numbers: tuple[int, ...],
+        validity_days: int,
+        *,
+        now: datetime | None = None,
+    ) -> tuple[PrivateReferenceDecision, ...]:
+        """Classify every requested account without guessing missing results.
+
+        The newest parsed row wins.  A recent explicit private row is the only
+        category that is excluded.  Older, incomplete or missing history is
+        returned to the UI as an explanation and remains included.
+        """
+
+        if validity_days < 1:
+            raise ResultHistoryError("私密账号参考期限必须至少为 1 天。")
+        requested = tuple(sorted(set(numbers)))
+        if not requested:
+            return ()
+        threshold = (now or datetime.now()) - timedelta(days=validity_days)
+        requested_set = set(requested)
+        latest_any: dict[int, AccountHistoryRow] = {}
+        latest_recent: dict[int, AccountHistoryRow] = {}
+        blocked_recent: set[int] = set()
+        for run in self.list_runs():
+            if not run.details_complete:
+                if run.ended_at >= threshold:
+                    # A newer sparse log cannot prove that an omitted account
+                    # was normal.  Keep unresolved accounts out of automatic
+                    # skipping instead of falling back to an older private row.
+                    blocked_recent.update(
+                        requested_set - latest_recent.keys() - blocked_recent
+                    )
+                continue
+            for row in run.account_rows:
+                if row.a_number not in requested_set:
+                    continue
+                latest_any.setdefault(row.a_number, row)
+                if row.ended_at >= threshold and row.a_number not in blocked_recent:
+                    latest_recent.setdefault(row.a_number, row)
+
+        decisions: list[PrivateReferenceDecision] = []
+        for number in requested:
+            recent = latest_recent.get(number)
+            any_row = latest_any.get(number)
+            if number in blocked_recent and recent is None:
+                category = "no_record"
+                row = None
+            elif recent is not None and recent.status is AccountStatus.PRIVATE:
+                category = "recent_private"
+                row = recent
+            elif recent is not None:
+                category = "recent_non_private"
+                row = recent
+            elif any_row is not None and any_row.status is AccountStatus.PRIVATE:
+                category = "expired_private"
+                row = any_row
+            elif any_row is not None:
+                category = "expired_non_private"
+                row = any_row
+            else:
+                category = "no_record"
+                row = None
+            decisions.append(PrivateReferenceDecision(number, category, row))
+        return tuple(decisions)
 
     @staticmethod
     def parse(path: Path) -> DownloadTaskHistory | None:

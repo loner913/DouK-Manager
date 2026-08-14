@@ -83,6 +83,73 @@ class ActionWorker(QObject):
             self.done.emit()
 
 
+class TaskTemplateList(QListWidget):
+    """A checklist whose left-drag gesture applies one state to a range."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._drag_anchor_row = -1
+        self._drag_target_state: Qt.CheckState | None = None
+        self._drag_press_position: tuple[int, int] | None = None
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        super().mousePressEvent(event)
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        position = event.position().toPoint()
+        item = self.itemAt(position)
+        if item is None:
+            return
+        rect = self.visualItemRect(item)
+        # Clicking the actual checkbox keeps Qt's normal single-row toggle.
+        if position.x() <= rect.left() + 28:
+            return
+        self._drag_anchor_row = self.row(item)
+        self._drag_target_state = (
+            Qt.CheckState.Unchecked
+            if item.checkState() == Qt.CheckState.Checked
+            else Qt.CheckState.Checked
+        )
+        self._drag_press_position = (position.x(), position.y())
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        super().mouseMoveEvent(event)
+        if self._drag_anchor_row < 0 or not (
+            event.buttons() & Qt.MouseButton.LeftButton
+        ):
+            return
+        if self._drag_press_position is not None:
+            x, y = self._drag_press_position
+            current = event.position().toPoint()
+            if abs(current.x() - x) < 4 and abs(current.y() - y) < 4:
+                return
+        item = self.itemAt(event.position().toPoint())
+        if item is not None:
+            self._apply_drag_state(self.row(item))
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        super().mouseReleaseEvent(event)
+        self._drag_anchor_row = -1
+        self._drag_target_state = None
+        self._drag_press_position = None
+
+    def _apply_drag_state(self, target_row: int) -> None:
+        if self._drag_anchor_row < 0 or self._drag_target_state is None:
+            return
+        first, last = sorted((self._drag_anchor_row, target_row))
+        signals_were_blocked = self.blockSignals(True)
+        try:
+            for row in range(first, last + 1):
+                self.item(row).setCheckState(self._drag_target_state)
+        finally:
+            self.blockSignals(signals_were_blocked)
+        for row in range(first, last + 1):
+            self.item(row).setText(
+                f"{'【已勾选】' if self.item(row).checkState() == Qt.CheckState.Checked else '【未勾选】'} "
+                f"{Path(self.item(row).data(Qt.ItemDataRole.UserRole)).name}"
+            )
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -106,6 +173,11 @@ class MainWindow(QMainWindow):
         self.download_summary_run = None
         self.download_summary_exit_code: int | None = None
         self.download_summary_assessment = None
+        self.queue_run_source = ""
+        self.result_refresh_timer = QTimer(self)
+        self.result_refresh_timer.setSingleShot(True)
+        self.result_refresh_timer.timeout.connect(self.refresh_results)
+        self.result_review_waiting = False
         self.setWindowTitle("DouK全流程一体化管理器")
         self.resize(1260, 820)
         self.setMinimumSize(1080, 700)
@@ -132,10 +204,20 @@ class MainWindow(QMainWindow):
         corner = QWidget()
         corner_layout = QHBoxLayout(corner)
         corner_layout.setContentsMargins(5, 0, 5, 0)
-        self.global_collector_label = QLabel("采集服务：检查中")
-        self.global_engine_label = QLabel("下载进程：检查中")
-        corner_layout.addWidget(self.global_collector_label)
-        corner_layout.addWidget(self.global_engine_label)
+        self.global_collector_title = QLabel("采集服务：")
+        self.global_collector_status = QLabel("检查中")
+        self.global_engine_title = QLabel("下载进程：")
+        self.global_engine_status = QLabel("检查中")
+        for label in (
+            self.global_collector_title,
+            self.global_engine_title,
+        ):
+            label.setStyleSheet("color: #111827; font-weight: 600;")
+        corner_layout.addWidget(self.global_collector_title)
+        corner_layout.addWidget(self.global_collector_status)
+        corner_layout.addSpacing(8)
+        corner_layout.addWidget(self.global_engine_title)
+        corner_layout.addWidget(self.global_engine_status)
         tabs.setCornerWidget(corner, Qt.Corner.TopRightCorner)
         self.statusBar().showMessage("管理器已启动")
 
@@ -227,6 +309,10 @@ class MainWindow(QMainWindow):
             "下载结束后保留黑框，查看统计后按任意键关闭"
         )
         self.task_pause_console.setChecked(True)
+        self.task_pause_console.setToolTip(
+            "当前任务完成后保留下载引擎黑框，需按任意键才会进入后续流程；"
+            "会影响暂停队列和完成后关机倒计时。完全无人值守时请取消勾选。"
+        )
         form.addRow("账号表达式", self.task_expression)
         form.addRow("任务名称", self.task_name)
         form.addRow("earliest 处理", self.task_earliest_mode)
@@ -300,7 +386,7 @@ class MainWindow(QMainWindow):
         label.setWordWrap(True)
         layout.addWidget(label)
         task_row = QHBoxLayout()
-        self.task_list = QListWidget()
+        self.task_list = TaskTemplateList()
         self.task_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.task_list.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
         self.task_list.setDragEnabled(False)
@@ -313,7 +399,6 @@ class MainWindow(QMainWindow):
             "或按 Alt+↑ / Alt+↓ 移动。列表拖放已完全关闭。"
         )
         self.task_list.itemChanged.connect(self._task_check_changed)
-        self.task_list.itemSelectionChanged.connect(self._selection_checks)
         task_row.addWidget(self.task_list, 1)
 
         order_box = QGroupBox("调整队列顺序")
@@ -356,8 +441,22 @@ class MainWindow(QMainWindow):
             lambda: self._move_highlighted_task_by_action("down")
         )
         restore_button = QPushButton("恢复按 A 编号排序")
+        restore_button.setToolTip("清除人工调整的槽位顺序，恢复按任务首个 A 编号自然排序。")
         restore_button.clicked.connect(self._restore_task_order)
         order_layout.addWidget(restore_button)
+        select_all = QPushButton("全选模板")
+        select_all.setToolTip("勾选下载队列中的全部模板。")
+        select_all.clicked.connect(lambda: self._set_all_task_checks(True))
+        clear_all = QPushButton("取消全选")
+        clear_all.setToolTip("取消下载队列中全部模板的勾选。")
+        clear_all.clicked.connect(lambda: self._set_all_task_checks(False))
+        delete = QPushButton("删除已选模板")
+        delete.setToolTip(
+            "只删除 Data/Tasks 中勾选的模板，不删除排队任务、历史日志或数据库。"
+        )
+        delete.clicked.connect(self._delete_selected_tasks)
+        for button in (select_all, clear_all, delete):
+            order_layout.addWidget(button)
         order_note = QLabel(
             "精确移动、Alt+↑ / Alt+↓ 和顺序执行共用同一顺序，重启后保留；"
             "列表不支持拖放。"
@@ -381,6 +480,10 @@ class MainWindow(QMainWindow):
             "下载结束后保留黑框，查看统计后按任意键关闭（手动检查推荐）"
         )
         self.queue_pause_console.setChecked(True)
+        self.queue_pause_console.setToolTip(
+            "当前任务完成后保留下载引擎黑框，按任意键才会进入后续队列；"
+            "会影响暂停队列和完成后关机倒计时。完全无人值守时请取消勾选。"
+        )
         self.queue_pause_button = QPushButton("暂停队列")
         self.queue_pause_button.setToolTip(
             "只暂停队列继续启动下一个模板，不会暂停当前已经运行的下载进程；"
@@ -390,8 +493,11 @@ class MainWindow(QMainWindow):
         self.queue_shutdown = QCheckBox("全部任务完成后正常关机（60秒倒计时，可取消）")
         self.queue_shutdown.setToolTip(
             "仅在所有任务、结果汇总和后续动作成功后执行；采集服务启用/运行时不可勾选。"
-            "使用 Windows 正常关机，不强制关闭其他应用。"
+            "完全无人值守下载并关机时，请取消结果查看；若同时勾选结果查看，"
+            "必须按任意键确认后才会进入关机倒计时。使用 Windows 正常关机，"
+            "不强制关闭其他应用。"
         )
+        self.queue_shutdown.stateChanged.connect(self._shutdown_option_changed)
         form.addRow("截图归档", self.queue_screenshot_mode)
         form.addRow("索引刷新", self.queue_index_mode)
         form.addRow("清理复查", self.queue_cleanup)
@@ -399,33 +505,35 @@ class MainWindow(QMainWindow):
         form.addRow("队列控制", self.queue_pause_button)
         form.addRow("完成后动作", self.queue_shutdown)
         layout.addWidget(options)
-        buttons = QHBoxLayout()
+        # Keep the action buttons in two predictable rows.  The queue page has
+        # enough actions that a single horizontal row becomes unreadable at
+        # the minimum window width.
+        buttons = QGridLayout()
         refresh = QPushButton("刷新任务列表")
         refresh.clicked.connect(self.refresh_tasks)
-        select_all = QPushButton("全选模板")
-        select_all.clicked.connect(lambda: self._set_all_task_checks(True))
-        clear_all = QPushButton("取消全选")
-        clear_all.clicked.connect(lambda: self._set_all_task_checks(False))
-        delete = QPushButton("删除已选模板")
-        delete.setToolTip("只删除 Data/Tasks 中勾选的模板，不删除排队任务和下载历史结果。")
-        delete.clicked.connect(self._delete_selected_tasks)
-        activate = QPushButton("将勾选任务设为正式 settings.json")
+        activate = QPushButton("应用为正式 setting")
+        activate.setToolTip("只能勾选一个模板；将模板复制为下载器唯一读取的正式 setting。")
         activate.clicked.connect(self._activate_selected_task)
-        run_current = QPushButton("运行当前正式 settings.json")
+        run_current = QPushButton("运行当前 setting")
+        run_current.setToolTip("直接运行当前正式 setting，不重新选择模板。")
         run_current.clicked.connect(self._start_current)
-        run_queue = QPushButton("按顺序运行勾选任务")
+        run_queue = QPushButton("按顺序运行已选")
+        run_queue.setToolTip("按列表当前顺序逐个激活并运行已勾选模板。")
         run_queue.clicked.connect(self._start_queue)
-        native_logs = QPushButton("打开下载器原生日志")
+        native_logs = QPushButton("打开下载器日志")
+        native_logs.setToolTip("打开下载引擎 Volume/Log 原生日志目录。")
         native_logs.clicked.connect(
             lambda: self._open_path(self.controller.paths.volume / "log")
         )
         open_tasks = QPushButton("打开任务目录")
+        open_tasks.setToolTip("打开 Data/Tasks 模板目录。")
         open_tasks.clicked.connect(lambda: self._open_path(self.controller.paths.tasks))
         open_logs = QPushButton("打开日志目录")
+        open_logs.setToolTip("打开管理器 Logs 目录，查看任务结果和管理器日志。")
         open_logs.clicked.connect(lambda: self._open_path(self.controller.paths.logs))
         self.monitor_start_button = QPushButton("启动后台监听")
         self.monitor_start_button.setToolTip(
-            "把正式 settings.json 的 run_command 原子切换为 6，启动下载引擎剪贴板监听；"
+            "把正式 setting 的 run_command 原子切换为 6，启动下载引擎剪贴板监听；"
             "停止监听后恢复为 5 1 1 Q。"
         )
         self.monitor_start_button.clicked.connect(self._start_monitor)
@@ -434,12 +542,14 @@ class MainWindow(QMainWindow):
             "向监听进程发送正常停止信号并等待退出；确认退出后才恢复批量下载命令。"
         )
         self.monitor_stop_button.clicked.connect(self._stop_monitor)
-        for button in (
-            refresh, select_all, clear_all, delete, activate, run_current, run_queue,
-            open_tasks, open_logs, native_logs, self.monitor_start_button, self.monitor_stop_button,
-        ):
-            buttons.addWidget(button)
-        buttons.addStretch()
+        queue_buttons = (
+            refresh, activate, run_current, run_queue, open_tasks, open_logs, native_logs,
+            self.monitor_start_button, self.monitor_stop_button,
+        )
+        for index, button in enumerate(queue_buttons):
+            buttons.addWidget(button, index // 5, index % 5)
+        for column in range(5):
+            buttons.setColumnStretch(column, 1)
         layout.addLayout(buttons)
         self.queue_output = QTextEdit()
         self.queue_output.setReadOnly(True)
@@ -616,13 +726,15 @@ class MainWindow(QMainWindow):
         self.result_account_filter.setPlaceholderText("A 编号，例如 55")
         self.result_task_filter = QLineEdit()
         self.result_task_filter.setPlaceholderText("任务名称关键字")
-        refresh = QPushButton("刷新结果")
-        refresh.clicked.connect(self.refresh_results)
+        self.result_status_filter.currentIndexChanged.connect(
+            self._schedule_result_refresh
+        )
+        self.result_account_filter.textChanged.connect(self._schedule_result_refresh)
+        self.result_task_filter.textChanged.connect(self._schedule_result_refresh)
         filters.addWidget(QLabel("状态"))
         filters.addWidget(self.result_status_filter)
         filters.addWidget(self.result_account_filter)
         filters.addWidget(self.result_task_filter)
-        filters.addWidget(refresh)
         layout.addLayout(filters)
         self.result_table = QTableWidget(0, 6)
         self.result_table.setHorizontalHeaderLabels(
@@ -631,6 +743,8 @@ class MainWindow(QMainWindow):
         self.result_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.result_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.result_table.horizontalHeader().setStretchLastSection(True)
+        self.result_table.cellDoubleClicked.connect(self._open_result_log)
+        self.result_table.setToolTip("双击“来源日志”单元格可直接打开对应任务日志。")
         layout.addWidget(self.result_table, 1)
         self.result_note = QLabel()
         self.result_note.setWordWrap(True)
@@ -786,25 +900,24 @@ class MainWindow(QMainWindow):
         collector_running = bool(health.get("collector_running"))
         engine_running = bool(health.get("engine_running"))
         mode = str(health.get("engine_mode") or "")
-        self.global_collector_label.setText(
-            "采集服务：运行中" if collector_running else "采集服务：未运行"
-        )
-        self.global_engine_label.setText(
-            "下载进程：后台监听" if mode == ENGINE_MODE_MONITOR
-            else ("下载进程：批量下载" if engine_running else "下载进程：未运行")
+        self.global_collector_status.setText("运行中" if collector_running else "未运行")
+        self.global_engine_status.setText(
+            "后台监听"
+            if mode == ENGINE_MODE_MONITOR
+            else ("批量下载" if engine_running else "未运行")
         )
         for label, value in (
-            (self.global_collector_label, collector_running),
-            (self.global_engine_label, engine_running),
+            (self.global_collector_status, collector_running),
+            (self.global_engine_status, engine_running),
         ):
             label.setProperty("ok", value)
             label.style().unpolish(label)
             label.style().polish(label)
         if hasattr(self, "queue_shutdown"):
             self.queue_shutdown.setEnabled(
-                not collector_running and not self.queue_active and mode != ENGINE_MODE_MONITOR
+                not collector_running and mode != ENGINE_MODE_MONITOR
             )
-            if collector_running and self.queue_shutdown.isChecked() and not self.queue_active:
+            if collector_running and self.queue_shutdown.isChecked():
                 self.queue_shutdown.setChecked(False)
         if hasattr(self, "queue_pause_button"):
             self.queue_pause_button.setEnabled(
@@ -813,7 +926,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "monitor_start_button"):
             monitor_running = mode == ENGINE_MODE_MONITOR
             self.monitor_start_button.setEnabled(not engine_running and not collector_running)
-            self.monitor_stop_button.setEnabled(monitor_running or bool(health.get("active_settings")))
+            self.monitor_stop_button.setEnabled(monitor_running)
         self.collector_path_label.setText(
             f"正式主档：{self.controller.paths.master_settings}\n"
             f"Excel：{self.controller.paths.collector_excel}\n"
@@ -919,6 +1032,25 @@ class MainWindow(QMainWindow):
             self._append_info(self.queue_output, f"已删除 {len(result)} 个任务模板；历史结果日志未删除。")
             self.refresh_tasks()
 
+    def _schedule_result_refresh(self, *_args) -> None:
+        if hasattr(self, "result_refresh_timer"):
+            self.result_refresh_timer.start(150)
+        else:
+            self.refresh_results()
+
+    def _open_result_log(self, row: int, column: int) -> None:
+        if column != 5 or not hasattr(self, "result_table"):
+            return
+        item = self.result_table.item(row, column)
+        if item is None:
+            return
+        path = Path(item.text().strip())
+        if not path.is_file():
+            QMessageBox.information(self, "日志不存在", f"来源日志不存在：\n{path}")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+            QMessageBox.information(self, "无法打开日志", f"无法打开来源日志：\n{path}")
+
     def refresh_results(self) -> None:
         if not hasattr(self, "result_table"):
             return
@@ -948,7 +1080,10 @@ class MainWindow(QMainWindow):
                 str(row.task_log),
             )
             for column, value in enumerate(values):
-                self.result_table.setItem(index, column, QTableWidgetItem(value))
+                item = QTableWidgetItem(value)
+                if column == 5:
+                    item.setToolTip("双击打开来源日志")
+                self.result_table.setItem(index, column, item)
         runs = self.controller.result_runs(limit=500)
         incomplete_old = sum(1 for run in runs if run.account_rows and not run.details_complete)
         self.result_note.setText(
@@ -1073,6 +1208,16 @@ class MainWindow(QMainWindow):
             self.task_list.blockSignals(signals_were_blocked)
 
     def _preview_task(self) -> None:
+        if self.task_smart_private.isChecked():
+            preview = self._run(
+                lambda: self.controller.preview_private_skip(
+                    self.task_expression.text(), self.task_private_days.value()
+                ),
+                self.task_output,
+            )
+            if preview:
+                self._replace_info(self.task_output, *self._smart_preview_lines(preview))
+            return
         preview = self._run(
             lambda: self.controller.preview_selection(self.task_expression.text()),
             self.task_output,
@@ -1089,6 +1234,38 @@ class MainWindow(QMainWindow):
                 f"重复编号：{len(preview.selection.duplicate_numbers)}",
                 "主档 enable：不会修改",
             )
+
+    @staticmethod
+    def _smart_preview_lines(preview) -> tuple[str, ...]:
+        category_labels = {
+            "recent_private": "近期明确私密（将跳过）",
+            "recent_non_private": "近期明确非私密（纳入）",
+            "expired_private": "历史私密但已过期（纳入）",
+            "expired_non_private": "历史非私密但已过期（纳入）",
+            "no_record": "没有可靠历史记录（纳入）",
+        }
+        grouped: dict[str, list[str]] = {key: [] for key in category_labels}
+        sources: list[str] = []
+        for decision in getattr(preview, "decisions", ()):
+            grouped.setdefault(decision.category, []).append(f"A{decision.a_number}")
+            if decision.category == "recent_private":
+                sources.append(f"A{decision.a_number}：{decision.source_text}")
+        skipped = tuple(match.a_number for match in preview.private_matches)
+        effective = preview.effective.compact if preview.effective else "（跳过后为空）"
+        lines: list[str] = [
+            f"智能跳过已启用：参考最近 {preview.validity_days} 天",
+            f"输入账号：{preview.requested.compact}（共 {preview.requested.selected_positions} 个，"
+            f"有效URL {preview.requested.selected_valid_urls} 个）",
+            f"最终纳入：{effective}",
+        ]
+        for category, label in category_labels.items():
+            values = grouped.get(category) or []
+            lines.append(f"{label}：{'、'.join(values) if values else '无'}")
+        if sources:
+            lines.append("近期私密依据：")
+            lines.extend(sources)
+        lines.append("创建时可选择：按预览跳过、强制包含全部或取消创建。")
+        return tuple(lines)
 
     def _queue_state_locked(self) -> bool:
         health_fn = getattr(self.controller, "health", None)
@@ -1126,21 +1303,9 @@ class MainWindow(QMainWindow):
                 return
             matches = private_preview.private_matches
             if matches:
-                skipped_text = "、".join(f"A{match.a_number}" for match in matches)
-                source_text = "\n".join(
-                    f"A{match.a_number}：{match.source_text}" for match in matches
-                )
-                effective_text = (
-                    private_preview.effective.compact
-                    if private_preview.effective is not None
-                    else "（全部命中私密，跳过后为空）"
-                )
                 box = QMessageBox(self)
                 box.setWindowTitle("智能跳过预览")
-                box.setText(
-                    f"最近 {private_preview.validity_days} 天明确记录为私密的账号：{skipped_text}\n"
-                    f"跳过后将执行：{effective_text}\n\n来源：\n{source_text}"
-                )
+                box.setText("\n".join(self._smart_preview_lines(private_preview)))
                 skip_button = box.addButton("按预览跳过", QMessageBox.ButtonRole.AcceptRole)
                 force_button = box.addButton("强制包含全部", QMessageBox.ButtonRole.DestructiveRole)
                 cancel_button = box.addButton("取消创建", QMessageBox.ButtonRole.RejectRole)
@@ -1170,10 +1335,14 @@ class MainWindow(QMainWindow):
                 f"任务文件：{result.task_path}",
                 f"账号范围：{result.preview.compact}",
             ]
-            if private_preview is not None and private_preview.private_matches:
+            if private_preview is not None:
                 messages.append(
-                    "智能跳过私密账号："
-                    + ("、".join(f"A{number}" for number in excluded_numbers) if excluded_numbers else "未跳过（强制包含）")
+                    "智能跳过预览："
+                    + (
+                        "、".join(f"A{number}" for number in excluded_numbers)
+                        if excluded_numbers
+                        else "没有跳过账号或已选择强制包含"
+                    )
                 )
             if result.backup_path:
                 messages.append(f"修改前关键文件备份：{result.backup_path}")
@@ -1191,6 +1360,7 @@ class MainWindow(QMainWindow):
                 if run:
                     self.queue_active = True
                     self.queue_current = run
+                    self.queue_run_source = "task"
                     self.queue_pending = []
                     self.queue_summaries_complete = True
                     self.queue_summaries_reliable = True
@@ -1273,6 +1443,7 @@ class MainWindow(QMainWindow):
             self.queue_shutdown.setChecked(False)
             return
         self.queue_shutdown_requested = self.queue_shutdown.isChecked()
+        self.queue_run_source = "current"
         run = self._run(
             lambda: self.controller.start_current_download(
                 self.queue_pause_console.isChecked()
@@ -1310,6 +1481,7 @@ class MainWindow(QMainWindow):
             self.queue_shutdown.setChecked(False)
             return
         self.queue_shutdown_requested = self.queue_shutdown.isChecked()
+        self.queue_run_source = "queue"
         self.queue_paused = False
         self.queue_pause_button.setText("暂停队列")
         self.queue_pending = paths
@@ -1330,6 +1502,85 @@ class MainWindow(QMainWindow):
         )
         self._start_next_queue_item()
         self.refresh_all()
+
+    def _result_view_enabled(self) -> bool:
+        if self.queue_run_source == "task":
+            return bool(self.task_pause_console.isChecked())
+        return bool(self.queue_pause_console.isChecked())
+
+    @staticmethod
+    def _completion_marker_code(run) -> int | None:
+        marker = getattr(run, "completion_marker", None)
+        if marker is None or not Path(marker).is_file():
+            return None
+        try:
+            return int(Path(marker).read_text(encoding="ascii").strip().splitlines()[0])
+        except (OSError, UnicodeError, ValueError, IndexError):
+            return None
+
+    @staticmethod
+    def _close_result_wrapper(run) -> None:
+        marker = getattr(run, "completion_marker", None)
+        if marker is None or not run.running:
+            return
+        try:
+            run.process.terminate()
+            run.process.wait(timeout=3)
+        except Exception:
+            # The engine has already written its completion marker; a stale
+            # wrapper must not be allowed to block the next queue item forever.
+            pass
+
+    @staticmethod
+    def _cleanup_completion_marker(run) -> None:
+        marker = getattr(run, "completion_marker", None)
+        if marker is None:
+            return
+        try:
+            Path(marker).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _finish_run_after_summary(self, run, assessment) -> None:
+        self._cleanup_completion_marker(run)
+        if not assessment.normal_exit:
+            self.queue_pending.clear()
+            self.queue_current = None
+            self.queue_active = False
+            self._release_download_lifecycle()
+            return
+
+        summary = getattr(run, "_summary_result", None)
+        if summary is not None:
+            self.queue_summaries_complete = (
+                self.queue_summaries_complete and summary.complete
+            )
+            self.queue_summaries_reliable = (
+                self.queue_summaries_reliable and summary.reliable
+            )
+        messages = self._run(
+            lambda: self.controller.run_post_actions("batch"), self.queue_output
+        )
+        if messages is None:
+            self._append_info(
+                self.queue_output,
+                "【失败】本批后续动作失败；队列已停止，剩余任务不会启动。",
+            )
+            self.queue_pending.clear()
+            self.queue_current = None
+            self.queue_active = False
+            self._release_download_lifecycle()
+            return
+        if messages:
+            self._append_info(self.queue_output, *messages)
+        self.queue_current = None
+        self._start_next_queue_item()
+
+    def _shutdown_option_changed(self, state: int) -> None:
+        checked = bool(state)
+        self.queue_shutdown_requested = checked
+        if not checked and self.shutdown_timer is not None and self.shutdown_timer.isActive():
+            self._cancel_shutdown()
 
     def _start_next_queue_item(self) -> None:
         if self.queue_pending and self.queue_paused:
@@ -1438,6 +1689,7 @@ class MainWindow(QMainWindow):
                     f"【失败】账号结果汇总失败：{message}",
                     "队列已停止；剩余任务不会启动。",
                 )
+                self._cleanup_completion_marker(self.download_summary_run)
                 self.queue_pending.clear()
                 self.queue_current = None
                 self.queue_active = False
@@ -1446,36 +1698,19 @@ class MainWindow(QMainWindow):
 
             summary = worker.result
             self._append_info(self.queue_output, *format_summary_for_ui(summary))
-            if not assessment.normal_exit:
-                self.queue_pending.clear()
-                self.queue_current = None
-                self.queue_active = False
-                self._release_download_lifecycle()
+            run = self.download_summary_run
+            if run is None:
                 return
-
-            self.queue_summaries_complete = (
-                self.queue_summaries_complete and summary.complete
-            )
-            self.queue_summaries_reliable = (
-                self.queue_summaries_reliable and summary.reliable
-            )
-            messages = self._run(
-                lambda: self.controller.run_post_actions("batch"), self.queue_output
-            )
-            if messages is None:
-                self._append_info(
-                    self.queue_output,
-                    "【失败】本批后续动作失败；队列已停止，剩余任务不会启动。",
-                )
-                self.queue_pending.clear()
-                self.queue_current = None
-                self.queue_active = False
-                self._release_download_lifecycle()
-                return
-            if messages:
-                self._append_info(self.queue_output, *messages)
-            self.queue_current = None
-            self._start_next_queue_item()
+            if getattr(run, "completion_marker", None) is not None and run.running:
+                if self._result_view_enabled():
+                    run.result_review_waiting = True
+                    self._append_info(
+                        self.queue_output,
+                        "本任务结果已汇总；黑框保留等待人工查看，查看完成后请按任意键继续。",
+                    )
+                    return
+                self._close_result_wrapper(run)
+            self._finish_run_after_summary(run, assessment)
         finally:
             self.download_summary_thread = None
             self.download_summary_worker = None
@@ -1506,6 +1741,9 @@ class MainWindow(QMainWindow):
             self._start_next_queue_item()
 
     def _begin_shutdown_countdown_if_requested(self) -> None:
+        # Read the checkbox at finalization time so changes made while a
+        # download is running take effect for the current queue.
+        self.queue_shutdown_requested = self.queue_shutdown.isChecked()
         if not self.queue_shutdown_requested:
             return
         if not self.queue_summaries_complete or not self.queue_summaries_reliable:
@@ -1627,14 +1865,60 @@ class MainWindow(QMainWindow):
             release()
 
     def _poll_processes(self) -> None:
+        monitor = getattr(getattr(self.controller, "engine", None), "current", None)
+        if (
+            monitor is not None
+            and getattr(monitor, "mode", "") == ENGINE_MODE_MONITOR
+            and not monitor.running
+        ):
+            try:
+                self.controller.stop_monitor()
+                self._append_info(
+                    self.queue_output,
+                    "检测到后台监听窗口已退出，已自动恢复 run_command=5 1 1 Q。",
+                )
+            except Exception as exc:
+                self.controller.logger.exception("后台监听退出后的自动恢复失败：%s", exc)
+                self._append_info(self.queue_output, f"【失败】后台监听退出后恢复设置失败：{exc}")
+            self.refresh_all(check_processes=True)
+            return
         if not self.queue_active or self.queue_current is None:
             return
         if self.download_summary_thread is not None:
             return
-        if self.queue_current.running:
-            return
         run = self.queue_current
-        code = run.process.returncode
+        if getattr(run, "result_review_waiting", False):
+            if not run.running:
+                run.result_review_waiting = False
+                self._finish_run_after_summary(
+                    run,
+                    assess_process_exit(getattr(run, "engine_exit_code", None)),
+                )
+            return
+        marker_code = self._completion_marker_code(run)
+        if marker_code is not None and getattr(run, "engine_exit_code", None) is None:
+            run.engine_exit_code = marker_code
+            assessment = assess_process_exit(marker_code)
+            self._append_info(
+                self.queue_output,
+                assessment.headline,
+                assessment.detail,
+                "正在汇总账号结果，请等待。",
+                merge=True,
+            )
+            self.controller.logger.info(
+                "下载器主进程已退出，黑框包装器仍在等待：模板=%s；PID=%s；退出码=%s",
+                run.task_template,
+                run.process.pid,
+                marker_code,
+            )
+            self._start_download_summary(run, marker_code, assessment)
+            return
+        if run.running:
+            return
+        code = getattr(run, "engine_exit_code", None)
+        if code is None:
+            code = run.process.returncode
         assessment = assess_process_exit(code)
         self._append_info(
             self.queue_output,

@@ -25,7 +25,7 @@ from douk_manager.core.json_store import read_json
 from douk_manager.core.locks import critical_section
 from douk_manager.core.settings_tasks import EarliestRule, GeneratedTask, SettingsTaskService
 from douk_manager.core.task_order import TaskOrderService
-from douk_manager.core.result_history import ResultHistoryService
+from douk_manager.core.result_history import RecentPrivateMatch, ResultHistoryService
 from douk_manager.integrations.collector import CollectorService, MigrationResult
 from douk_manager.integrations.indexer import IndexResult, IndexService
 from douk_manager.integrations.screenshots import ScreenshotPreview, ScreenshotResult, ScreenshotService
@@ -128,17 +128,17 @@ class ManagerController:
             self.read_only_reason = "检测到下载引擎正在运行，未执行启动前备份。"
             return self.read_only_reason
         try:
-            if self.engine.recover_batch_command_if_idle():
-                self.logger.warning(
-                    "检测到上次后台监听遗留 run_command=%s，已恢复为 %s。",
-                    MONITOR_RUN_COMMAND,
-                    BATCH_RUN_COMMAND,
-                )
             with critical_section(self.paths.lock_file, timeout=5.0):
                 self.startup_backup = self.backup.create_critical_snapshot(
                     "Startup",
                     {"operation": "application_start"},
                     keep_latest=3,
+                )
+            if self.engine.recover_batch_command_if_idle():
+                self.logger.warning(
+                    "检测到上次后台监听遗留 run_command=%s，已恢复为 %s。",
+                    MONITOR_RUN_COMMAND,
+                    BATCH_RUN_COMMAND,
                 )
             self.read_only_reason = ""
             self.logger.info("启动前关键文件备份完成：%s", self.startup_backup)
@@ -219,11 +219,21 @@ class ManagerController:
         if validity_days < 1 or validity_days > 3650:
             raise ControllerError("私密账号参考期限必须是 1 到 3650 天的整数。")
         requested = self.tasks.preview(expression)
-        matches = self.results.recent_private(
+        decisions = self.results.classify_private_reference(
             requested.selection.numbers, validity_days
         )
+        matches = tuple(
+            RecentPrivateMatch(
+                a_number=decision.a_number,
+                ended_at=decision.row.ended_at,
+                task_template=decision.row.task_template,
+                task_log=decision.row.task_log,
+            )
+            for decision in decisions
+            if decision.category == "recent_private" and decision.row is not None
+        )
         return self.tasks.preview_with_private_filter(
-            expression, matches, validity_days
+            expression, matches, validity_days, decisions
         )
 
     def create_task(
