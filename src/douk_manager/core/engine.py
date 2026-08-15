@@ -56,6 +56,7 @@ class EngineRun:
     review_control: Path | None = None
     engine_exit_code: int | None = None
     result_review_waiting: bool = False
+    interruption_detected: bool = False
     _summary_lock: Lock = field(
         default_factory=Lock, init=False, repr=False, compare=False
     )
@@ -115,6 +116,27 @@ def assess_process_exit(exit_code: int | None) -> EngineExitAssessment:
 
 
 class EngineService:
+    # These markers mean that the user explicitly stopped the downloader.
+    # Generic network warnings such as “下载中断，正在重试” are deliberately
+    # excluded so a transient retry cannot stop a healthy batch.
+    _EXPLICIT_INTERRUPTION_MARKERS = (
+        "用户主动中断",
+        "用户中断",
+        "手动中断",
+        "用户主动退出",
+        "手动退出",
+        "用户主动终止",
+        "用户终止",
+        "手动终止",
+        "主动终止",
+        "用户取消",
+        "手动取消",
+        "用户退出",
+        "keyboardinterrupt",
+        "ctrl+c",
+        "ctrl+break",
+    )
+
     def __init__(
         self, paths: ManagedPaths, config: AppConfig, backup: BackupService
     ) -> None:
@@ -495,6 +517,45 @@ class EngineService:
                 self.current = None
         return target.task_log
 
+    def detect_interruption(self, run: EngineRun) -> bool:
+        """Detect an explicit user-stop line in the native log delta.
+
+        The manager still waits for the wrapper process to exit before it
+        parses the final summary.  This lightweight probe only makes the
+        native interruption evidence visible while that exit is pending; it
+        never treats a generic retry/warning as a user cancellation.
+        """
+
+        if run.mode != ENGINE_MODE_BATCH:
+            return False
+        before_by_path = {
+            str(state.path.resolve()).casefold(): state
+            for state in run.native_log_snapshot
+        }
+        if not run.native_log_dir.is_dir():
+            return False
+        for path in run.native_log_dir.glob("*.log"):
+            try:
+                resolved = path.resolve()
+                size = resolved.stat().st_size
+            except OSError:
+                continue
+            previous = before_by_path.get(str(resolved).casefold())
+            offset = previous.size if previous is not None else 0
+            if size <= offset:
+                continue
+            try:
+                with resolved.open("rb") as handle:
+                    handle.seek(offset)
+                    text = handle.read(size - offset).decode(
+                        "utf-8-sig", errors="replace"
+                    ).casefold()
+            except OSError:
+                continue
+            if any(marker in text for marker in self._EXPLICIT_INTERRUPTION_MARKERS):
+                return True
+        return False
+
     def recover_batch_command_if_idle(self) -> bool:
         """Repair a stale run_command=6 left by an earlier abnormal exit."""
 
@@ -526,14 +587,31 @@ class EngineService:
             if run._summary_write_error is not None:
                 raise run._summary_write_error
 
-            located = locate_native_logs(
-                run.native_log_snapshot,
-                run.native_log_dir,
-                run.started_at,
-                ended_at,
-                len(run.planned_accounts),
-                run.planned_accounts,
-            )
+            located = None
+            # A console close can return before the downloader flushes its
+            # final native-log bytes.  Retry only the “not found yet” case,
+            # and extend the observation end time on each attempt so the
+            # freshly-written file is not rejected by its mtime window.
+            retry_delays = (0.0, 0.15, 0.5, 1.0)
+            for attempt, delay in enumerate(retry_delays):
+                if delay:
+                    time.sleep(delay)
+                observation_end = max(ended_at, datetime.now())
+                located = locate_native_logs(
+                    run.native_log_snapshot,
+                    run.native_log_dir,
+                    run.started_at,
+                    observation_end,
+                    len(run.planned_accounts),
+                    run.planned_accounts,
+                )
+                if (
+                    located.reliable
+                    or "未找到" not in located.reason
+                    or attempt == len(retry_delays) - 1
+                ):
+                    break
+            assert located is not None
             summary = parse_download_summary(run.planned_accounts, located, exit_code)
             block = format_summary_for_task_log(summary, ended_at)
             try:

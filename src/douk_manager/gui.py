@@ -184,6 +184,8 @@ class MainWindow(QMainWindow):
         self.download_summary_exit_code: int | None = None
         self.download_summary_assessment = None
         self.queue_run_source = ""
+        self.queue_started_at: datetime | None = None
+        self.current_task_started_at: datetime | None = None
         self.result_refresh_timer = QTimer(self)
         self.result_refresh_timer.setSingleShot(True)
         self.result_refresh_timer.timeout.connect(self.refresh_results)
@@ -201,6 +203,7 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         tabs = QTabWidget()
+        self.tabs = tabs
         self.setCentralWidget(tabs)
         tabs.addTab(self._overview_tab(), "总览")
         tabs.addTab(self._task_tab(), "账号任务")
@@ -209,7 +212,10 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._collector_tab(), "账号采集")
         tabs.addTab(self._post_tab(), "截图与索引")
         tabs.addTab(self._settings_tab(), "路径与安全设置")
-        tabs.addTab(self._result_tab(), "下载结果")
+        self.result_page = self._result_tab()
+        tabs.addTab(self.result_page, "下载结果")
+        self.result_tab_index = tabs.indexOf(self.result_page)
+        tabs.currentChanged.connect(self._tab_changed)
         corner = QWidget()
         corner_layout = QHBoxLayout(corner)
         corner_layout.setContentsMargins(5, 0, 5, 0)
@@ -229,6 +235,10 @@ class MainWindow(QMainWindow):
         corner_layout.addWidget(self.global_engine_status)
         tabs.setCornerWidget(corner, Qt.Corner.TopRightCorner)
         self.statusBar().showMessage("管理器已启动")
+
+    def _tab_changed(self, index: int) -> None:
+        if index == getattr(self, "result_tab_index", -1):
+            self.refresh_results()
 
     def _overview_tab(self) -> QWidget:
         page = QWidget()
@@ -526,6 +536,10 @@ class MainWindow(QMainWindow):
         form.addRow("结果查看", self.queue_pause_console)
         form.addRow("队列控制", self.queue_pause_button)
         form.addRow("终止任务", self.queue_cancel_button)
+        self.queue_elapsed_label = QLabel("本次队列耗时：未开始")
+        self.task_elapsed_label = QLabel("当前任务耗时：未开始")
+        form.addRow("耗时统计", self.queue_elapsed_label)
+        form.addRow("", self.task_elapsed_label)
         form.addRow("完成后动作", self.queue_shutdown)
         layout.addWidget(options)
         # Keep the action buttons in two predictable rows.  The queue page has
@@ -758,6 +772,10 @@ class MainWindow(QMainWindow):
         filters.addWidget(self.result_status_filter)
         filters.addWidget(self.result_account_filter)
         filters.addWidget(self.result_task_filter)
+        refresh_button = QPushButton("立即刷新结果")
+        refresh_button.setToolTip("立即重新读取 Logs\\DownloadTasks 中的最新任务结果。")
+        refresh_button.clicked.connect(self.refresh_results)
+        filters.addWidget(refresh_button)
         layout.addLayout(filters)
         self.result_table = QTableWidget(0, 6)
         self.result_table.setHorizontalHeaderLabels(
@@ -772,6 +790,8 @@ class MainWindow(QMainWindow):
         self.result_note = QLabel()
         self.result_note.setWordWrap(True)
         layout.addWidget(self.result_note)
+        self.result_last_refresh = QLabel("最近刷新：未刷新")
+        layout.addWidget(self.result_last_refresh)
         return page
 
     @staticmethod
@@ -1121,6 +1141,9 @@ class MainWindow(QMainWindow):
             f"共读取 {len(runs)} 次任务日志，显示 {len(filtered)} 条账号结果。"
             + (f"其中 {incomplete_old} 次旧日志没有完整列出正常账号，页面不会猜测缺失状态。" if incomplete_old else "")
         )
+        self.result_last_refresh.setText(
+            f"最近刷新：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
 
     def _update_move_targets(self, count: int) -> None:
         previous_action = str(self.queue_move_target.currentData() or "")
@@ -1319,6 +1342,55 @@ class MainWindow(QMainWindow):
         )
         return True
 
+    @staticmethod
+    def _format_elapsed(seconds: float) -> str:
+        total = max(0, int(seconds))
+        hours, remainder = divmod(total, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+    def _update_elapsed_labels(self) -> None:
+        now = datetime.now()
+        if self.queue_started_at is not None:
+            elapsed = self._format_elapsed((now - self.queue_started_at).total_seconds())
+            self.queue_elapsed_label.setText(f"本次队列耗时：{elapsed}（运行中）")
+        if self.current_task_started_at is not None:
+            elapsed = self._format_elapsed(
+                (now - self.current_task_started_at).total_seconds()
+            )
+            self.task_elapsed_label.setText(f"当前任务耗时：{elapsed}（运行中）")
+
+    def _mark_download_started(self, run) -> None:
+        now = datetime.now()
+        if self.queue_started_at is None:
+            self.queue_started_at = now
+            self.queue_elapsed_label.setText("本次队列耗时：00:00:00（运行中）")
+        self.current_task_started_at = now
+        self.task_elapsed_label.setText("当前任务耗时：00:00:00（运行中）")
+
+    def _record_task_elapsed(self, run, reason: str) -> None:
+        started = self.current_task_started_at
+        if started is None:
+            return
+        elapsed = self._format_elapsed((datetime.now() - started).total_seconds())
+        self.current_task_started_at = None
+        template = getattr(run, "task_template", None) or "当前 settings.json"
+        text = f"本次下载任务耗时：{elapsed}；模板={template}；结果={reason}"
+        self.task_elapsed_label.setText(f"当前任务耗时：{elapsed}（{reason}）")
+        self._append_info(self.queue_output, text)
+        self.controller.logger.info(text)
+
+    def _record_queue_elapsed(self, reason: str) -> None:
+        started = self.queue_started_at
+        if started is None:
+            return
+        elapsed = self._format_elapsed((datetime.now() - started).total_seconds())
+        self.queue_started_at = None
+        text = f"本次批量下载队列耗时：{elapsed}；结果={reason}"
+        self.queue_elapsed_label.setText(f"本次队列耗时：{elapsed}（{reason}）")
+        self._append_info(self.queue_output, text)
+        self.controller.logger.info(text)
+
     def _create_task(self, activate: bool, start: bool) -> None:
         if activate and self._queue_state_locked():
             return
@@ -1391,6 +1463,7 @@ class MainWindow(QMainWindow):
                     self.task_output,
                 )
                 if run:
+                    self._mark_download_started(run)
                     self.queue_active = True
                     self.queue_current = run
                     self.queue_run_source = "task"
@@ -1486,6 +1559,7 @@ class MainWindow(QMainWindow):
             self.queue_output,
         )
         if run:
+            self._mark_download_started(run)
             self.queue_active = True
             self.queue_current = run
             self.queue_pending = []
@@ -1522,6 +1596,10 @@ class MainWindow(QMainWindow):
         self.queue_pause_button.setText("暂停队列")
         self.queue_pending = paths
         self.queue_active = True
+        self.queue_started_at = None
+        self.current_task_started_at = None
+        self.queue_elapsed_label.setText("本次队列耗时：未开始")
+        self.task_elapsed_label.setText("当前任务耗时：未开始")
         self.queue_summaries_complete = True
         self.queue_summaries_reliable = True
         order_text = " → ".join(path.name for path in paths)
@@ -1587,6 +1665,8 @@ class MainWindow(QMainWindow):
                 f"【失败】结果查看黑框无法自动关闭：{exc}",
                 "队列已停止，剩余任务不会启动。",
             )
+            self._record_task_elapsed(run, "结果查看关闭失败")
+            self._record_queue_elapsed("结果查看关闭失败")
             self.queue_pending.clear()
             self.queue_current = None
             self.queue_active = False
@@ -1610,6 +1690,8 @@ class MainWindow(QMainWindow):
             self._finish_cancelled_queue(run)
             return
         if not assessment.normal_exit:
+            self._record_task_elapsed(run, "异常中止")
+            self._record_queue_elapsed("异常中止")
             self.queue_pending.clear()
             self.queue_current = None
             self.queue_active = False
@@ -1624,10 +1706,12 @@ class MainWindow(QMainWindow):
             self.queue_summaries_reliable = (
                 self.queue_summaries_reliable and summary.reliable
             )
+        self._record_task_elapsed(run, "已完成")
         messages = self._run(
             lambda: self.controller.run_post_actions("batch"), self.queue_output
         )
         if messages is None:
+            self._record_queue_elapsed("后续动作失败")
             self._append_info(
                 self.queue_output,
                 "【失败】本批后续动作失败；队列已停止，剩余任务不会启动。",
@@ -1660,6 +1744,7 @@ class MainWindow(QMainWindow):
                 lambda: self.controller.run_post_actions("queue"), self.queue_output
             )
             if messages is None:
+                self._record_queue_elapsed("后续动作失败")
                 self._append_info(
                     self.queue_output,
                     "【失败】队列后续动作失败；队列已停止，请检查上方错误。",
@@ -1690,6 +1775,7 @@ class MainWindow(QMainWindow):
                 self.controller.logger.info("队列后续动作：无")
             final_message = f"队列执行结束。{summary_conclusion}"
             self._append_info(self.queue_output, *(messages or []), final_message)
+            self._record_queue_elapsed("已完成")
             self.queue_active = False
             self.queue_current = None
             self._release_download_lifecycle()
@@ -1705,11 +1791,13 @@ class MainWindow(QMainWindow):
             self.queue_output,
         )
         if run is None:
+            self._record_queue_elapsed("启动任务失败")
             self.queue_active = False
             self.queue_pending.clear()
             self._release_download_lifecycle()
             return
         self.queue_current = run
+        self._mark_download_started(run)
         self._append_info(
             self.queue_output,
             f"正在运行：{path.name}；PID={run.process.pid}；剩余={len(self.queue_pending)}"
@@ -1762,6 +1850,8 @@ class MainWindow(QMainWindow):
                     f"【失败】账号结果汇总失败：{message}",
                     "队列已停止；剩余任务不会启动。",
                 )
+                self._record_task_elapsed(self.download_summary_run, "汇总失败")
+                self._record_queue_elapsed("汇总失败")
                 self._cleanup_completion_marker(self.download_summary_run)
                 self.queue_pending.clear()
                 self.queue_current = None
@@ -1792,6 +1882,7 @@ class MainWindow(QMainWindow):
             self.download_summary_exit_code = None
             self.download_summary_assessment = None
             self.refresh_all()
+            self.refresh_results()
 
     def _collector_is_enabled(self) -> bool:
         return bool(self.controller.collector.running or self.controller.collector.health())
@@ -1856,6 +1947,8 @@ class MainWindow(QMainWindow):
             )
 
     def _finish_cancelled_queue(self, run) -> None:
+        self._record_task_elapsed(run, "已取消")
+        self._record_queue_elapsed("已取消")
         if run is not None:
             self._cleanup_completion_marker(run)
         self.queue_pending.clear()
@@ -1995,6 +2088,7 @@ class MainWindow(QMainWindow):
             release()
 
     def _poll_processes(self) -> None:
+        self._update_elapsed_labels()
         monitor = getattr(getattr(self.controller, "engine", None), "current", None)
         if (
             monitor is not None
@@ -2017,6 +2111,22 @@ class MainWindow(QMainWindow):
         if self.download_summary_thread is not None:
             return
         run = self.queue_current
+        if not getattr(run, "interruption_detected", False):
+            try:
+                if self.controller.engine.detect_interruption(run):
+                    run.interruption_detected = True
+                    message = (
+                        "检测到下载引擎日志记录了用户主动中止；"
+                        "等待进程退出后仍会执行最终账号结果汇总。"
+                    )
+                    self._append_info(self.queue_output, message)
+                    self.controller.logger.info(
+                        "检测到下载引擎主动中止：模板=%s；PID=%s",
+                        run.task_template,
+                        run.process.pid,
+                    )
+            except Exception as exc:
+                self.controller.logger.exception("检测下载引擎中止日志失败：%s", exc)
         if getattr(run, "result_review_waiting", False):
             if not run.running:
                 run.result_review_waiting = False
