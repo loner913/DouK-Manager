@@ -113,7 +113,15 @@ _STATUS_DEFINITIONS = (
 def format_summary_for_ui(summary: DownloadSummary) -> tuple[str, ...]:
     lines = [_format_process_outcome(summary.exit_code)]
     if not summary.reliable:
-        lines.append(f"账号结果：无法可靠汇总；原因：{_safe_failure_reason(summary)}")
+        if _has_traceable_partial_details(summary):
+            lines.append(
+                "账号结果：结果不完整；已保留可追溯部分明细；"
+                "未开始、处理中断和身份不明部分不会作为智能跳过依据。"
+                f"原因：{_safe_failure_reason(summary)}"
+            )
+            lines.extend(_format_account_result_lines(summary))
+        else:
+            lines.append(f"账号结果：无法可靠汇总；原因：{_safe_failure_reason(summary)}")
         return tuple(lines)
 
     lines.extend(_format_account_result_lines(summary))
@@ -162,7 +170,22 @@ def format_summary_for_task_log(
         ):
             _append_number_line(lines, label, summary.numbers_for(status))
     else:
-        lines.append(f"账号结果：无法可靠汇总；原因：{_safe_failure_reason(summary)}")
+        if _has_traceable_partial_details(summary):
+            lines.append(
+                "账号结果：无法可靠汇总；已写入可追溯部分明细；"
+                "未开始、处理中断和身份不明部分不会作为智能跳过依据。"
+                f"原因：{_safe_failure_reason(summary)}"
+            )
+            lines.extend(_format_account_result_lines(summary))
+            lines.append("账号明细版本：1")
+            for label, status in (
+                ("有新作品下载", AccountStatus.DOWNLOADED),
+                ("作品均被引擎跳过", AccountStatus.ALL_SKIPPED),
+                ("无符合条件作品", AccountStatus.NO_ELIGIBLE_WORKS),
+            ):
+                _append_number_line(lines, label, summary.numbers_for(status))
+        else:
+            lines.append(f"账号结果：无法可靠汇总；原因：{_safe_failure_reason(summary)}")
     lines.extend(("【状态说明】", *_STATUS_DEFINITIONS))
     return "\n".join(lines) + "\n"
 
@@ -173,6 +196,27 @@ def _format_process_outcome(exit_code: int | None) -> str:
     if exit_code is None:
         return "下载进程：退出状态未知"
     return f"下载进程：异常退出（退出码 {exit_code}）"
+
+
+def _has_traceable_partial_details(summary: DownloadSummary) -> bool:
+    """Return whether an incomplete run has safe, attributable account evidence.
+
+    A non-empty parsed outcome is not sufficient on its own: the native log
+    segment must have passed the strict locator checks, otherwise rows from a
+    different run could be exposed as this task's results.  The explicit
+    pre-start/not-started sets are also evidence that the frozen plan was
+    actually compared with the located run, even when no account completed.
+    """
+
+    return bool(
+        summary.located.reliable
+        and summary.located.segments
+        and (
+            summary.started_outcomes
+            or summary.pre_start_errors
+            or summary.not_started
+        )
+    )
 
 
 def _format_account_result_lines(summary: DownloadSummary) -> list[str]:
