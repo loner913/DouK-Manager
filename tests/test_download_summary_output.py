@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from datetime import datetime
 from pathlib import Path
+import tempfile
 
 from douk_manager.core.download_summary import (
     AccountOutcome,
@@ -13,13 +14,19 @@ from douk_manager.core.download_summary import (
     format_summary_for_task_log,
     format_summary_for_ui,
 )
+from douk_manager.core.result_history import ResultHistoryService
 
 
 ENDED_AT = datetime(2026, 8, 13, 11, 22, 33)
 NATIVE_LOG = Path(r"F:\Downloader\Volume\Log\2026-08-13 10.00.00.log")
 
 
-def make_summary(*, reliable: bool = True, reasons: tuple[str, ...] = ()) -> DownloadSummary:
+def make_summary(
+    *,
+    reliable: bool = True,
+    reasons: tuple[str, ...] = (),
+    traceable: bool = False,
+) -> DownloadSummary:
     outcomes = (
         AccountOutcome(1, 50, AccountStatus.DOWNLOADED),
         AccountOutcome(2, 51, AccountStatus.ALL_SKIPPED),
@@ -34,9 +41,9 @@ def make_summary(*, reliable: bool = True, reasons: tuple[str, ...] = ()) -> Dow
     for outcome in outcomes:
         counts[outcome.status] += 1
     located = LocatedNativeLogs(
-        (NativeLogSegment(NATIVE_LOG, 128, 4096),) if reliable else (),
+        (NativeLogSegment(NATIVE_LOG, 128, 4096),) if reliable or traceable else (),
         "size-delta",
-        reliable,
+        reliable or traceable,
         reasons[0] if reasons else "",
     )
     return DownloadSummary(
@@ -156,6 +163,41 @@ class DownloadSummaryOutputTests(unittest.TestCase):
         for forbidden in ("https://", "Cookie", "Response Headers", "Authorization"):
             self.assertNotIn(forbidden, ui_text)
             self.assertNotIn(forbidden, task_text)
+
+    def test_unreliable_summary_keeps_safe_partial_details_for_history(self) -> None:
+        summary = make_summary(
+            reliable=False,
+            traceable=True,
+            reasons=("下载进程非零退出：3221225786。",),
+        )
+
+        ui_lines = format_summary_for_ui(summary)
+        self.assertIn(
+            "账号结果：结果不完整；已保留可追溯部分明细；"
+            "未开始、处理中断和身份不明部分不会作为智能跳过依据。"
+            "原因：汇总证据不可靠。",
+            ui_lines,
+        )
+        self.assertIn("计划账号：12", ui_lines)
+        self.assertIn("实际开始：8", ui_lines)
+        self.assertIn("私密账号（1）：A55", ui_lines)
+        self.assertIn("处理中断（1）：A81", ui_lines)
+
+        with tempfile.TemporaryDirectory() as directory:
+            task_directory = Path(directory)
+            path = task_directory / "DownloadTask_2026-08-13_11-22-33.log"
+            path.write_text(
+                "[2026-08-13 10:00:00] Started；Task template: A50-A84.json\n"
+                + format_summary_for_task_log(summary, ENDED_AT),
+                encoding="utf-8",
+            )
+            run = ResultHistoryService(task_directory).list_runs(limit=None)[0]
+            self.assertFalse(run.reliable)
+            self.assertTrue(run.details_complete)
+            rows = {row.a_number: row.status for row in run.account_rows}
+            self.assertEqual(rows[55], AccountStatus.PRIVATE)
+            self.assertEqual(rows[50], AccountStatus.DOWNLOADED)
+            self.assertEqual(rows[81], AccountStatus.INTERRUPTED)
 
     def test_task_log_formats_every_located_segment_path_and_offset(self) -> None:
         summary = make_summary()

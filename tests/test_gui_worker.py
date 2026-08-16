@@ -115,6 +115,19 @@ class QueueInteractionSourceTests(unittest.TestCase):
             source,
         )
 
+    def test_v014_result_refresh_interrupt_and_elapsed_ui_hooks_exist(self) -> None:
+        source = self._gui_source()
+        self.assertIn('QPushButton("立即刷新结果")', source)
+        self.assertIn("tabs.currentChanged.connect(self._tab_changed)", source)
+        self.assertIn("def _tab_changed", source)
+        self.assertIn("def _update_elapsed_labels", source)
+        self.assertIn("本次队列耗时", source)
+        self.assertIn("当前任务耗时", source)
+        self.assertIn("_record_task_elapsed", source)
+        self.assertIn("_record_queue_elapsed", source)
+        self.assertIn("self.refresh_results()", source)
+        self.assertIn("detect_interruption", source)
+
     def test_drag_check_gesture_owns_mouse_events_instead_of_default_selection(self) -> None:
         source = self._gui_source()
         drag_source = source[
@@ -294,6 +307,10 @@ class ActionWorkerTests(unittest.TestCase):
         QMainWindow.__init__(window)
         window.controller = SimpleNamespace(
             logger=Mock(),
+            engine=SimpleNamespace(
+                current=None,
+                detect_interruption=Mock(return_value=False),
+            ),
             summarize_download=Mock(return_value=object()),
             run_post_actions=Mock(return_value=[]),
             create_task=Mock(),
@@ -318,6 +335,10 @@ class ActionWorkerTests(unittest.TestCase):
         window.queue_cancel_requested = False
         window.queue_paused = False
         window.queue_run_source = "queue"
+        window.queue_started_at = None
+        window.current_task_started_at = None
+        window.queue_elapsed_label = SimpleNamespace(setText=Mock())
+        window.task_elapsed_label = SimpleNamespace(setText=Mock())
         window.task_smart_private = SimpleNamespace(isChecked=lambda: False)
         window.queue_shutdown = SimpleNamespace(
             isChecked=lambda: False,
@@ -334,6 +355,7 @@ class ActionWorkerTests(unittest.TestCase):
         window._start_next_queue_item = Mock()
         window._run = lambda action, _output=None: action()
         window.refresh_all = Mock()
+        window.refresh_results = Mock()
         return window
 
     def test_mouse_drag_checks_and_second_drag_unchecks_the_same_rows(self) -> None:

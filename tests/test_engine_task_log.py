@@ -12,7 +12,11 @@ from unittest.mock import Mock, patch
 from douk_manager.config import AppConfig
 from douk_manager.controller import ManagerController
 from douk_manager.core.backup import BackupService
-from douk_manager.core.download_summary import PlannedAccount, SummaryWriteError
+from douk_manager.core.download_summary import (
+    LocatedNativeLogs,
+    PlannedAccount,
+    SummaryWriteError,
+)
 from douk_manager.core.engine import EngineRun, EngineService
 from tests.helpers import make_test_paths
 
@@ -27,6 +31,69 @@ class _RunningProcess:
 
 
 class EngineTaskLogTests(unittest.TestCase):
+    def test_summary_retries_after_native_log_flush_before_declaring_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_test_paths(Path(directory), 0)
+            native_log_dir = paths.volume / "Log"
+            native_log_dir.mkdir()
+            service = EngineService(paths, AppConfig(), BackupService(paths))
+            started_at = datetime.now()
+            task_log = paths.download_task_logs / "DownloadTask_retry.log"
+            task_log.write_text("existing task log\n", encoding="utf-8")
+            run = EngineRun(
+                process=_RunningProcess(),
+                started_at=started_at,
+                task_log=task_log,
+                planned_accounts=(),
+                native_log_snapshot=(),
+                native_log_dir=native_log_dir,
+            )
+            missing = LocatedNativeLogs(
+                (), "size-delta", False, "未找到本次新增或增长的原生日志。"
+            )
+            ready = LocatedNativeLogs((), "size-delta", True)
+            with patch(
+                "douk_manager.core.engine.locate_native_logs",
+                side_effect=(missing, ready),
+            ) as locate, patch("douk_manager.core.engine.time.sleep"):
+                result = service.summarize_finished_run(
+                    run, 0, started_at + timedelta(seconds=1)
+                )
+
+            self.assertEqual(locate.call_count, 2)
+            self.assertTrue(result.reliable)
+            self.assertEqual(
+                task_log.read_text(encoding="utf-8").count("【下载账号汇总】"), 1
+            )
+
+    def test_native_interruption_detection_requires_explicit_user_stop_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_test_paths(Path(directory), 1)
+            native_log_dir = paths.volume / "Log"
+            native_log_dir.mkdir()
+            native_log = native_log_dir / "native.log"
+            native_log.write_text(
+                "共有 1 个账号的作品等待下载\n"
+                "用户主动中断下载，程序即将退出\n",
+                encoding="utf-8",
+            )
+            service = EngineService(paths, AppConfig(), BackupService(paths))
+            run = EngineRun(
+                process=_RunningProcess(),
+                started_at=datetime.now(),
+                task_log=paths.download_task_logs / "DownloadTask_interrupt.log",
+                planned_accounts=(),
+                native_log_snapshot=(),
+                native_log_dir=native_log_dir,
+            )
+            self.assertTrue(service.detect_interruption(run))
+
+            native_log.write_text(
+                "共有 1 个账号的作品等待下载\n下载中断，正在重试\n",
+                encoding="utf-8",
+            )
+            self.assertFalse(service.detect_interruption(run))
+
     def test_task_log_names_template_and_explains_pause_fields(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             paths = make_test_paths(Path(directory), 3)

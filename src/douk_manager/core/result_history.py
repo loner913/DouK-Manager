@@ -233,6 +233,7 @@ class ResultHistoryService:
         exit_code: int | None = None
         complete: bool | None = None
         reliable = False
+        explicit_unreliable_marker = False
         details_complete_marker = False
         number_map: dict[int, AccountStatus | str] = {}
         anomaly_numbers: set[int] = set()
@@ -250,6 +251,7 @@ class ResultHistoryService:
                     number_map.clear()
                     anomaly_numbers.clear()
                     reliable = False
+                    explicit_unreliable_marker = False
                     complete = None
                     continue
                 if not in_summary:
@@ -260,9 +262,15 @@ class ResultHistoryService:
                     exit_code = _parse_exit_code(line.split("：", 1)[1])
                 elif line.startswith("账号汇总："):
                     complete = line.endswith("完整") and not line.endswith("结果不完整")
-                    reliable = True
+                    # An incomplete partial-detail block is intentionally
+                    # still parseable for traceability, but it must never
+                    # regain the reliable flag merely because its account
+                    # count section appears after the explicit warning.
+                    if not explicit_unreliable_marker:
+                        reliable = True
                 elif line.startswith("账号结果：无法可靠汇总"):
                     reliable = False
+                    explicit_unreliable_marker = True
                 elif line.startswith("账号明细版本："):
                     details_complete_marker = line.endswith("1")
                 elif line.startswith("附加状态：异常后完成（"):
