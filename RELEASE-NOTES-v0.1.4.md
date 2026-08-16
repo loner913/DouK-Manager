@@ -68,3 +68,11 @@
 - 智能跳过是有效期内日志证据辅助，账号状态可能变化，创建前仍应查看预览并可选择强制包含。
 - 如需回滚，先停止管理器、采集器和下载引擎，再恢复上一版管理器便携包；不迁移、不覆盖正式 Volume。
 - v0.1.4 仍是 `develop` 开发版本，不移动或覆盖既有 `v0.1.0` Tag/Release。
+
+## 最终收官记录（2026-08-16）
+
+- PR #6 已使用普通 Merge 合并到 develop；
+- 合并提交：28fa65998db2cde1a4a637b0ad0f1bb611cd0b7a；
+- Develop CI Run #62：Test 成功，Windows portable package 成功；
+- Windows 实机验收通过；
+- main、v0.1.0 Tag 和 v0.1.0 Release 保持不变。
