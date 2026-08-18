@@ -103,6 +103,7 @@ class ControllerRuntimeSafetyTests(unittest.TestCase):
         controller.read_only_reason = "synthetic startup safety failure"
         controller.collector.running = False
         controller.collector.health.return_value = False
+        controller.engine.current = None
         controller.engine.external_running.return_value = False
         return controller
 
@@ -184,6 +185,23 @@ class ControllerRuntimeSafetyTests(unittest.TestCase):
                 controller.reconfigure({"engine_exe": str(root / "replacement" / "main.exe")})
 
             controller.collector.stop.assert_not_called()
+            controller._build_services.assert_not_called()
+
+    def test_degraded_path_reconfiguration_rejects_managed_engine_work(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            controller = self._degraded_controller(root)
+            controller._build_services = Mock()
+            managed_runtime = SimpleNamespace(running=True, mode="batch")
+            controller.engine.current = managed_runtime
+            original_engine_exe = controller.config.engine_exe
+
+            with self.assertRaises(ControllerError):
+                controller.reconfigure({"engine_exe": str(root / "replacement" / "main.exe")})
+
+            self.assertIs(controller.engine.current, managed_runtime)
+            self.assertEqual(controller.config.engine_exe, original_engine_exe)
+            controller.engine.external_running.assert_not_called()
             controller._build_services.assert_not_called()
 
     def test_degraded_path_reconfiguration_skips_uncertain_process_probe(self) -> None:

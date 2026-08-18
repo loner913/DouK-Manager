@@ -265,6 +265,13 @@ class ManagerController:
                 names = "、".join(sorted(invalid_fields))
                 raise ControllerError(f"只读修复状态只能修改正式路径：{names}")
         self.require_download_lifecycle_idle()
+        current_engine = self.engine.current
+        if (
+            state is StartupState.DEGRADED_READ_ONLY
+            and current_engine is not None
+            and current_engine.running
+        ):
+            raise ControllerError("下载引擎仍由管理器持有，请先在就绪状态停止后再修复路径。")
         if state is not StartupState.DEGRADED_READ_ONLY and self.engine.external_running():
             raise ControllerError("下载引擎正在运行，禁止切换正式路径或重建服务。")
         if self.collector.running:
