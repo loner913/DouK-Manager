@@ -34,12 +34,26 @@ from PySide6.QtWidgets import (
 )
 
 from douk_manager.controller import ManagerController
+from douk_manager.background import (
+    BackgroundTaskCoordinator,
+    ClosePolicy,
+    TaskFailure,
+    TaskRejectedError,
+    TaskSpec,
+    TaskState,
+)
 from douk_manager.core.download_summary import AccountStatus, format_summary_for_ui
 from douk_manager.core.engine import ENGINE_MODE_MONITOR, assess_process_exit
 from douk_manager.core.power import request_normal_shutdown
 from douk_manager.core.settings_tasks import EarliestRule
 from douk_manager.core.task_order import move_to_index
 from douk_manager.ui_messages import format_information
+from douk_manager.startup import (
+    StartupSafetyResult,
+    StartupSafetyService,
+    StartupStage,
+    StartupState,
+)
 
 
 T = TypeVar("T")
@@ -163,6 +177,14 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.controller = ManagerController()
+        self.coordinator = BackgroundTaskCoordinator(self)
+        self.coordinator.task_settled.connect(self._on_startup_task_settled)
+        self.startup_generation = 0
+        self._startup_task_id: str | None = None
+        self._startup_result: StartupSafetyResult | None = None
+        self._safe_widgets: list[QWidget] = []
+        self._path_widgets: list[QWidget] = []
+        self._dangerous_widgets: list[QWidget] = []
         self.queue_pending: list[Path] = []
         self.queue_active = False
         self.queue_current = None
@@ -194,12 +216,176 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1080, 700)
         self._build_ui()
         self._apply_style()
-        startup_message = self.controller.try_startup_backup()
-        self._replace_info(self.overview_output, startup_message)
-        self.refresh_all()
+        self._finalize_action_gates()
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self._poll_processes)
         self.poll_timer.start(500)
+
+    def _mark_safe_widget(self, widget: QWidget) -> QWidget:
+        if widget not in self._safe_widgets:
+            self._safe_widgets.append(widget)
+        return widget
+
+    def _mark_path_widget(self, widget: QWidget) -> QWidget:
+        if widget not in self._path_widgets:
+            self._path_widgets.append(widget)
+        return widget
+
+    def _finalize_action_gates(self) -> None:
+        controls = (
+            QPushButton,
+            QCheckBox,
+            QComboBox,
+            QSpinBox,
+            QLineEdit,
+            QListWidget,
+        )
+        self._dangerous_widgets = [
+            widget
+            for widget in self.findChildren(QWidget)
+            if isinstance(widget, controls)
+            and widget not in self._safe_widgets
+            and widget not in self._path_widgets
+        ]
+        self._apply_action_gate()
+
+    def _apply_action_gate(self) -> None:
+        state = self.controller.startup_state
+        dangerous_enabled = state is StartupState.READY
+        path_enabled = state in (StartupState.READY, StartupState.DEGRADED_READ_ONLY)
+        safe_enabled = state is not StartupState.CLOSING
+        for widget in self._dangerous_widgets:
+            widget.setEnabled(dangerous_enabled)
+        for widget in self._path_widgets:
+            widget.setEnabled(path_enabled)
+        for widget in self._safe_widgets:
+            widget.setEnabled(safe_enabled)
+
+    def begin_startup_check(self) -> bool:
+        if self.controller.startup_state is StartupState.CLOSING:
+            return False
+        generation = max(
+            self.startup_generation,
+            getattr(self.controller, "startup_generation", 0),
+        ) + 1
+        if not self.controller.begin_startup_check(generation):
+            return False
+        self.startup_generation = generation
+        self.startup_state_label.setText(StartupState.SAFETY_CHECKING.value)
+        self.startup_stage_label.setText("启动安全检查")
+        self.startup_summary_label.setText("检查中")
+        self.startup_details.setPlainText("")
+        self._apply_action_gate()
+        service = StartupSafetyService(
+            paths=self.controller.paths,
+            engine=self.controller.engine,
+            backup=self.controller.backup,
+        )
+        spec = TaskSpec(
+            task_type="startup_safety",
+            display_name="启动安全检查",
+            resource_keys=frozenset({"startup_safety"}),
+            deduplicate_key="startup_safety",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            refresh_targets=("runtime_status",),
+        )
+        try:
+            self._startup_task_id = self.coordinator.start(
+                spec,
+                generation,
+                lambda token: service.run(generation, token),
+            )
+        except TaskRejectedError as exc:
+            self.startup_details.setPlainText(str(exc))
+            self.statusBar().showMessage("启动安全检查未能排队")
+            return False
+        self.statusBar().showMessage("正在执行启动安全检查……")
+        return True
+
+    @Slot(str, int, object, object)
+    def _on_startup_task_settled(
+        self,
+        task_id: str,
+        generation: int,
+        outcome: object,
+        payload: object,
+    ) -> None:
+        if task_id != self._startup_task_id:
+            return
+        if outcome is TaskState.SUCCEEDED and isinstance(payload, StartupSafetyResult):
+            self.apply_startup_result(payload)
+            return
+        if generation != self.startup_generation:
+            return
+        if isinstance(payload, TaskFailure):
+            details = payload.message or payload.traceback_text
+        else:
+            details = str(payload)
+        result = StartupSafetyResult(
+            generation=generation,
+            success=False,
+            state=StartupState.DEGRADED_READ_ONLY,
+            stage=StartupStage.SNAPSHOT,
+            summary="启动安全检查后台任务失败，已进入只读保护。",
+            details=details,
+            health={},
+        )
+        self.apply_startup_result(result)
+
+    def apply_startup_result(self, result: StartupSafetyResult) -> bool:
+        if not self.controller.apply_startup_result(result):
+            return False
+        self._startup_result = result
+        self.startup_state_label.setText(self.controller.startup_state.value)
+        self.startup_stage_label.setText(result.stage.value)
+        self.startup_summary_label.setText(result.summary)
+        self.startup_details.setPlainText(result.details or "无额外技术详情。")
+        self._apply_action_gate()
+        self._render_health_snapshot(result.health_snapshot)
+        if self.controller.startup_state is not StartupState.READY:
+            self._apply_action_gate()
+        self.statusBar().showMessage(
+            "启动安全检查通过" if result.success else "启动安全检查失败，已进入只读保护"
+        )
+        QTimer.singleShot(0, self._refresh_noncritical_after_startup)
+        return True
+
+    def _refresh_noncritical_after_startup(self) -> None:
+        if self.controller.startup_state is StartupState.CLOSING:
+            return
+        self.refresh_tasks()
+        if hasattr(self, "result_table"):
+            self.refresh_results()
+
+    def _copy_startup_error(self) -> None:
+        summary = self.startup_summary_label.text()
+        details = self.startup_details.toPlainText()
+        QApplication.clipboard().setText("\n".join(part for part in (summary, details) if part))
+        self.statusBar().showMessage("启动诊断已复制")
+
+    def _open_manager_log(self) -> None:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.controller.log_path)))
+
+    def _save_paths(self) -> None:
+        values = {
+            "engine_exe": self.engine_edit.text().strip(),
+            "video_root": self.video_edit.text().strip(),
+            "index_root": self.index_edit.text().strip(),
+            "old_screenshot_dir": self.old_screenshot_edit.text().strip(),
+        }
+        try:
+            result = self.controller.reconfigure(values)
+        except Exception as exc:
+            self._replace_info(self.settings_output, "【失败】", str(exc))
+            self.statusBar().showMessage("路径修复失败")
+            return
+        self._replace_info(
+            self.settings_output,
+            result or "路径修复配置已保存，正在重新执行启动安全检查。",
+        )
+        self.statusBar().showMessage("路径已保存，等待重新检查")
+        QTimer.singleShot(0, self.begin_startup_check)
 
     def _build_ui(self) -> None:
         tabs = QTabWidget()
@@ -237,7 +423,11 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("管理器已启动")
 
     def _tab_changed(self, index: int) -> None:
-        if index == getattr(self, "result_tab_index", -1):
+        if (
+            index == getattr(self, "result_tab_index", -1)
+            and self.controller.startup_state
+            in (StartupState.READY, StartupState.DEGRADED_READ_ONLY)
+        ):
             self.refresh_results()
 
     def _overview_tab(self) -> QWidget:
@@ -251,6 +441,40 @@ class MainWindow(QMainWindow):
         subtitle.setWordWrap(True)
         layout.addWidget(title)
         layout.addWidget(subtitle)
+
+        startup_box = QGroupBox("启动安全状态")
+        startup_layout = QGridLayout(startup_box)
+        self.startup_state_label = QLabel(StartupState.BOOTSTRAPPING.value)
+        self.startup_stage_label = QLabel("尚未开始")
+        self.startup_summary_label = QLabel("检查中")
+        self.startup_summary_label.setWordWrap(True)
+        startup_layout.addWidget(QLabel("当前状态"), 0, 0)
+        startup_layout.addWidget(self.startup_state_label, 0, 1)
+        startup_layout.addWidget(QLabel("阶段"), 1, 0)
+        startup_layout.addWidget(self.startup_stage_label, 1, 1)
+        startup_layout.addWidget(QLabel("用户摘要"), 2, 0)
+        startup_layout.addWidget(self.startup_summary_label, 2, 1)
+        self.startup_details = QTextEdit()
+        self.startup_details.setReadOnly(True)
+        self.startup_details.setMaximumHeight(82)
+        startup_layout.addWidget(QLabel("技术详情"), 3, 0, Qt.AlignmentFlag.AlignTop)
+        startup_layout.addWidget(self.startup_details, 3, 1)
+        startup_buttons = QHBoxLayout()
+        self.startup_copy_button = self._mark_safe_widget(QPushButton("复制错误"))
+        self.startup_copy_button.clicked.connect(self._copy_startup_error)
+        self.startup_log_button = self._mark_safe_widget(QPushButton("打开管理器日志"))
+        self.startup_log_button.clicked.connect(self._open_manager_log)
+        self.startup_recheck_button = self._mark_safe_widget(QPushButton("重新检查"))
+        self.startup_recheck_button.clicked.connect(self.begin_startup_check)
+        for button in (
+            self.startup_copy_button,
+            self.startup_log_button,
+            self.startup_recheck_button,
+        ):
+            startup_buttons.addWidget(button)
+        startup_buttons.addStretch()
+        startup_layout.addLayout(startup_buttons, 4, 1)
+        layout.addWidget(startup_box)
 
         status_box = QGroupBox("正式数据与服务状态")
         grid = QGridLayout(status_box)
@@ -286,6 +510,8 @@ class MainWindow(QMainWindow):
         ):
             button = QPushButton(text)
             button.clicked.connect(callback)
+            if text == "刷新状态":
+                self._mark_safe_widget(button)
             buttons.addWidget(button)
         buttons.addStretch()
         layout.addLayout(buttons)
@@ -684,6 +910,13 @@ class MainWindow(QMainWindow):
         self.video_edit = QLineEdit(self.controller.config.video_root)
         self.index_edit = QLineEdit(self.controller.config.index_root)
         self.old_screenshot_edit = QLineEdit(self.controller.config.old_screenshot_dir)
+        for edit in (
+            self.engine_edit,
+            self.video_edit,
+            self.index_edit,
+            self.old_screenshot_edit,
+        ):
+            self._mark_path_widget(edit)
         entries = (
             ("下载引擎 main.exe", self.engine_edit, self._browse_engine),
             ("视频账号目录", self.video_edit, lambda: self._browse_dir(self.video_edit)),
@@ -695,6 +928,7 @@ class MainWindow(QMainWindow):
             grid.addWidget(edit, row, 1)
             button = QPushButton("选择")
             button.clicked.connect(callback)
+            self._mark_path_widget(button)
             grid.addWidget(button, row, 2)
         layout.addWidget(box)
 
@@ -720,9 +954,14 @@ class MainWindow(QMainWindow):
         )
         note.setWordWrap(True)
         layout.addWidget(note)
-        save = QPushButton("保存设置并重新验证正式数据")
-        save.clicked.connect(self._save_settings)
-        layout.addWidget(save)
+        self.path_save_button = self._mark_path_widget(
+            QPushButton("仅保存正式路径并重新检查")
+        )
+        self.path_save_button.clicked.connect(self._save_paths)
+        layout.addWidget(self.path_save_button)
+        self.settings_save_button = QPushButton("保存全部设置并重新验证正式数据")
+        self.settings_save_button.clicked.connect(self._save_settings)
+        layout.addWidget(self.settings_save_button)
 
         update_box = QGroupBox("下载引擎安全更新（永久保留唯一正式 Volume）")
         update_grid = QGridLayout(update_box)
@@ -756,12 +995,15 @@ class MainWindow(QMainWindow):
         layout.addWidget(intro)
         filters = QHBoxLayout()
         self.result_status_filter = QComboBox()
+        self._mark_safe_widget(self.result_status_filter)
         self.result_status_filter.addItem("全部状态", "")
         for status in AccountStatus:
             self.result_status_filter.addItem(_status_label(status), status.value)
         self.result_account_filter = QLineEdit()
+        self._mark_safe_widget(self.result_account_filter)
         self.result_account_filter.setPlaceholderText("A 编号，例如 55")
         self.result_task_filter = QLineEdit()
+        self._mark_safe_widget(self.result_task_filter)
         self.result_task_filter.setPlaceholderText("任务名称关键字")
         self.result_status_filter.currentIndexChanged.connect(
             self._schedule_result_refresh
@@ -775,6 +1017,7 @@ class MainWindow(QMainWindow):
         refresh_button = QPushButton("立即刷新结果")
         refresh_button.setToolTip("立即重新读取 Logs\\DownloadTasks 中的最新任务结果。")
         refresh_button.clicked.connect(self.refresh_results)
+        self._mark_safe_widget(refresh_button)
         filters.addWidget(refresh_button)
         layout.addLayout(filters)
         self.result_table = QTableWidget(0, 6)
@@ -928,6 +1171,15 @@ class MainWindow(QMainWindow):
 
     def refresh_all(self, *, check_processes: bool = False) -> None:
         health = self.controller.health(check_processes=check_processes)
+        self._apply_action_gate()
+        self._render_health_snapshot(health)
+        if self.controller.startup_state is not StartupState.READY:
+            self._apply_action_gate()
+        self.refresh_tasks()
+        if hasattr(self, "result_table"):
+            self.refresh_results()
+
+    def _render_health_snapshot(self, health: dict[str, object]) -> None:
         for key, label in self.status_labels.items():
             value = bool(health.get(key, False))
             if key.endswith("_running"):
@@ -990,9 +1242,6 @@ class MainWindow(QMainWindow):
             self.batch_end.setMaximum(int(health["master_positions"]))
             if self.batch_end.value() > int(health["master_positions"]):
                 self.batch_end.setValue(int(health["master_positions"]))
-        self.refresh_tasks()
-        if hasattr(self, "result_table"):
-            self.refresh_results()
 
     def refresh_tasks(self) -> None:
         checked_paths = {
@@ -2310,11 +2559,12 @@ class MainWindow(QMainWindow):
             "cleanup_after_index": self.setting_cleanup.isChecked(),
         }
         result = self._run(lambda: self.controller.reconfigure(values), self.settings_output)
-        if result:
-            self._replace_info(self.settings_output, result)
+        if result is not None:
+            self._replace_info(self.settings_output, result or "设置已保存，正在重新验证正式数据。")
             self.queue_screenshot_mode.setCurrentIndex(self.setting_screenshot_mode.currentIndex())
             self.queue_index_mode.setCurrentIndex(self.setting_index_mode.currentIndex())
             self.queue_cleanup.setChecked(self.setting_cleanup.isChecked())
+            QTimer.singleShot(0, self.begin_startup_check)
 
     def _browse_engine(self) -> None:
         selected, _ = QFileDialog.getOpenFileName(

@@ -11,6 +11,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.argv = [sys.argv[0], *[item for item in arguments if item != "--collector-worker"]]
         return collector_main()
 
+    from PySide6.QtCore import QTimer
     from PySide6.QtWidgets import QApplication
 
     from douk_manager.gui import MainWindow
@@ -20,4 +21,5 @@ def main(argv: list[str] | None = None) -> int:
     app.setOrganizationName("loner913")
     window = MainWindow()
     window.show()
+    QTimer.singleShot(0, window.begin_startup_check)
     return app.exec()
