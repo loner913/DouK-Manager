@@ -38,7 +38,6 @@ from douk_manager.background import (
     BackgroundTaskCoordinator,
     ClosePolicy,
     TaskFailure,
-    TaskRejectedError,
     TaskSpec,
     TaskState,
 )
@@ -210,7 +209,7 @@ class MainWindow(QMainWindow):
         self.current_task_started_at: datetime | None = None
         self.result_refresh_timer = QTimer(self)
         self.result_refresh_timer.setSingleShot(True)
-        self.result_refresh_timer.timeout.connect(self.refresh_results)
+        self.result_refresh_timer.timeout.connect(self._refresh_results_if_startup_applied)
         self.setWindowTitle("DouK全流程一体化管理器")
         self.resize(1260, 820)
         self.setMinimumSize(1080, 700)
@@ -276,29 +275,34 @@ class MainWindow(QMainWindow):
         self.startup_summary_label.setText("检查中")
         self.startup_details.setPlainText("")
         self._apply_action_gate()
-        service = StartupSafetyService(
-            paths=self.controller.paths,
-            engine=self.controller.engine,
-            backup=self.controller.backup,
-        )
-        spec = TaskSpec(
-            task_type="startup_safety",
-            display_name="启动安全检查",
-            resource_keys=frozenset({"startup_safety"}),
-            deduplicate_key="startup_safety",
-            cancellable=True,
-            close_policy=ClosePolicy.CANCEL,
-            refresh_targets=("runtime_status",),
-        )
         try:
+            service = StartupSafetyService(
+                paths=self.controller.paths,
+                engine=self.controller.engine,
+                backup=self.controller.backup,
+            )
+            spec = TaskSpec(
+                task_type="startup_safety",
+                display_name="启动安全检查",
+                resource_keys=frozenset({"startup_safety"}),
+                deduplicate_key="startup_safety",
+                cancellable=True,
+                close_policy=ClosePolicy.CANCEL,
+                refresh_targets=("runtime_status",),
+            )
             self._startup_task_id = self.coordinator.start(
                 spec,
                 generation,
                 lambda token: service.run(generation, token),
             )
-        except TaskRejectedError as exc:
-            self.startup_details.setPlainText(str(exc))
-            self.statusBar().showMessage("启动安全检查未能排队")
+        except Exception as exc:
+            self._startup_task_id = None
+            self.controller.logger.exception("启动安全检查排队失败：%s", exc)
+            self._apply_startup_failure(
+                generation,
+                "启动安全检查无法启动，已进入只读保护。",
+                f"{type(exc).__name__}: {exc}",
+            )
             return False
         self.statusBar().showMessage("正在执行启动安全检查……")
         return True
@@ -319,19 +323,35 @@ class MainWindow(QMainWindow):
         if generation != self.startup_generation:
             return
         if isinstance(payload, TaskFailure):
-            details = payload.message or payload.traceback_text
+            details = "\n\n".join(
+                part for part in (payload.message, payload.traceback_text) if part
+            )[-4000:]
         else:
             details = str(payload)
+        self._apply_startup_failure(
+            generation,
+            "启动安全检查后台任务失败，已进入只读保护。",
+            details,
+        )
+
+    def _apply_startup_failure(
+        self,
+        generation: int,
+        summary: str,
+        details: str,
+        *,
+        stage: StartupStage = StartupStage.SNAPSHOT,
+    ) -> bool:
         result = StartupSafetyResult(
             generation=generation,
             success=False,
             state=StartupState.DEGRADED_READ_ONLY,
-            stage=StartupStage.SNAPSHOT,
-            summary="启动安全检查后台任务失败，已进入只读保护。",
+            stage=stage,
+            summary=summary,
             details=details,
             health={},
         )
-        self.apply_startup_result(result)
+        return self.apply_startup_result(result)
 
     def apply_startup_result(self, result: StartupSafetyResult) -> bool:
         if not self.controller.apply_startup_result(result):
@@ -356,6 +376,13 @@ class MainWindow(QMainWindow):
             return
         self.refresh_tasks()
         if hasattr(self, "result_table"):
+            self.refresh_results()
+
+    def _refresh_results_if_startup_applied(self) -> None:
+        if self.controller.startup_state in (
+            StartupState.READY,
+            StartupState.DEGRADED_READ_ONLY,
+        ):
             self.refresh_results()
 
     def _copy_startup_error(self) -> None:
@@ -511,7 +538,7 @@ class MainWindow(QMainWindow):
             button = QPushButton(text)
             button.clicked.connect(callback)
             if text == "刷新状态":
-                self._mark_safe_widget(button)
+                self.refresh_status_button = button
             buttons.addWidget(button)
         buttons.addStretch()
         layout.addLayout(buttons)
@@ -1167,6 +1194,8 @@ class MainWindow(QMainWindow):
             self.refresh_all()
 
     def _refresh_status(self, _checked: bool = False) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
         self.refresh_all(check_processes=True)
 
     def refresh_all(self, *, check_processes: bool = False) -> None:
@@ -1333,6 +1362,11 @@ class MainWindow(QMainWindow):
             self.refresh_tasks()
 
     def _schedule_result_refresh(self, *_args) -> None:
+        if self.controller.startup_state not in (
+            StartupState.READY,
+            StartupState.DEGRADED_READ_ONLY,
+        ):
+            return
         if hasattr(self, "result_refresh_timer"):
             self.result_refresh_timer.start(150)
         else:

@@ -16,6 +16,7 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QApplication, QPushButton
 
 from douk_manager import app as app_module
+from douk_manager.background import TaskFailure, TaskRejectedError, TaskState
 from douk_manager.gui import MainWindow
 from douk_manager.startup import StartupSafetyResult, StartupStage, StartupState
 
@@ -175,12 +176,80 @@ class StartupGuiTests(unittest.TestCase):
             window.refresh_results = Mock()
 
             window.tabs.setCurrentIndex(window.result_tab_index)
+            window._schedule_result_refresh()
             self.app.processEvents()
 
             window.refresh_results.assert_not_called()
+            self.assertFalse(window.result_refresh_timer.isActive())
+            window.controller.startup_state = StartupState.READY
+            window._schedule_result_refresh()
+            self.assertTrue(window.result_refresh_timer.isActive())
+            window.result_refresh_timer.stop()
+            window.controller.startup_state = StartupState.SAFETY_CHECKING
+            window._refresh_results_if_startup_applied()
+            window.refresh_results.assert_not_called()
+            window.controller.startup_state = StartupState.BOOTSTRAPPING
             self.assertTrue(window.controller.begin_startup_check(1))
             window.apply_startup_result(make_result(1))
             self._run_until(lambda: window.refresh_results.called)
+            self._dispose_window(window)
+
+    def test_startup_submission_failure_enters_degraded_and_can_recheck(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window = self._window(Path(directory))
+            window.coordinator.start = Mock(side_effect=TaskRejectedError("synthetic reject"))
+
+            self.assertFalse(window.begin_startup_check())
+
+            self.assertIs(
+                window.controller.startup_state,
+                StartupState.DEGRADED_READ_ONLY,
+            )
+            self.assertIn("synthetic reject", window.startup_details.toPlainText())
+            self.assertTrue(window.startup_recheck_button.isEnabled())
+
+            window.coordinator.start = Mock(return_value="retry-task")
+            self.assertTrue(window.begin_startup_check())
+            self.assertEqual(window.startup_generation, 2)
+            self.assertIs(window.controller.startup_state, StartupState.SAFETY_CHECKING)
+            self._dispose_window(window)
+
+    def test_background_failure_keeps_message_and_traceback_in_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window = self._window(Path(directory))
+            self.assertTrue(window.controller.begin_startup_check(1))
+            window.startup_generation = 1
+            window._startup_task_id = "startup-task"
+
+            window._on_startup_task_settled(
+                "startup-task",
+                1,
+                TaskState.FAILED,
+                TaskFailure("RuntimeError", "synthetic failure", "synthetic traceback"),
+            )
+
+            self.assertIs(
+                window.controller.startup_state,
+                StartupState.DEGRADED_READ_ONLY,
+            )
+            details = window.startup_details.toPlainText()
+            self.assertIn("synthetic failure", details)
+            self.assertIn("synthetic traceback", details)
+            self._dispose_window(window)
+
+    def test_refresh_status_is_blocked_until_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window = self._window(Path(directory))
+            window.refresh_all = Mock()
+
+            self.assertFalse(window.refresh_status_button.isEnabled())
+            window._refresh_status()
+            window.refresh_all.assert_not_called()
+
+            self.assertTrue(window.controller.begin_startup_check(1))
+            window.apply_startup_result(make_result(1))
+            window._refresh_status()
+            window.refresh_all.assert_called_once_with(check_processes=True)
             self._dispose_window(window)
 
     def test_degraded_result_disables_dangerous_controls_but_keeps_path_repair_and_diagnostics(self) -> None:
