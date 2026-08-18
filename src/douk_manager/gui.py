@@ -212,6 +212,9 @@ class MainWindow(QMainWindow):
         self.result_refresh_timer = QTimer(self)
         self.result_refresh_timer.setSingleShot(True)
         self.result_refresh_timer.timeout.connect(self._refresh_results_if_startup_applied)
+        self.startup_recheck_timer = QTimer(self)
+        self.startup_recheck_timer.setSingleShot(True)
+        self.startup_recheck_timer.timeout.connect(self._run_startup_recheck)
         self.setWindowTitle("DouK全流程一体化管理器")
         self.resize(1260, 820)
         self.setMinimumSize(1080, 700)
@@ -406,6 +409,10 @@ class MainWindow(QMainWindow):
     def _open_manager_log(self) -> None:
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.controller.log_path)))
 
+    def _run_startup_recheck(self) -> None:
+        if self.isVisible():
+            self.begin_startup_check()
+
     @Slot()
     def _on_background_tasks_idle(self) -> None:
         if not self._close_pending:
@@ -435,7 +442,7 @@ class MainWindow(QMainWindow):
             result or "路径修复配置已保存，正在重新执行启动安全检查。",
         )
         self.statusBar().showMessage("路径已保存，等待重新检查")
-        QTimer.singleShot(0, self.begin_startup_check)
+        self.startup_recheck_timer.start(0)
 
     def _build_ui(self) -> None:
         tabs = QTabWidget()
@@ -2621,7 +2628,7 @@ class MainWindow(QMainWindow):
             self.queue_screenshot_mode.setCurrentIndex(self.setting_screenshot_mode.currentIndex())
             self.queue_index_mode.setCurrentIndex(self.setting_index_mode.currentIndex())
             self.queue_cleanup.setChecked(self.setting_cleanup.isChecked())
-            QTimer.singleShot(0, self.begin_startup_check)
+            self.startup_recheck_timer.start(0)
 
     def _browse_engine(self) -> None:
         selected, _ = QFileDialog.getOpenFileName(
