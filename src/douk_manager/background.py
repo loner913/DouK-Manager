@@ -9,9 +9,14 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum
 from pathlib import Path
 from types import TracebackType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot
+
+from .operation import TaskCancelled
+
+if TYPE_CHECKING:
+    from .operation import OperationContext, OperationProgress
 
 
 class TaskState(Enum):
@@ -33,10 +38,6 @@ class TaskRejectedError(RuntimeError):
     pass
 
 
-class TaskCancelled(RuntimeError):
-    pass
-
-
 @dataclass(frozen=True)
 class TaskSpec:
     task_type: str
@@ -47,6 +48,7 @@ class TaskSpec:
     close_policy: ClosePolicy = ClosePolicy.CANCEL
     refresh_targets: tuple[str, ...] = ()
     critical_write_started: bool = False
+    dynamic_cancellation: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "resource_keys", frozenset(self.resource_keys))
@@ -134,6 +136,7 @@ def _assert_ordinary_data(
 
 class TaskWorker(QObject):
     settled = Signal(str, int, object, object)
+    progress = Signal(str, int, object)
 
     def __init__(
         self,
@@ -141,12 +144,17 @@ class TaskWorker(QObject):
         generation: int,
         action: Callable[[CancellationToken], Any],
         token: CancellationToken,
+        operation_context: OperationContext | None = None,
     ) -> None:
         super().__init__()
         self._task_id = task_id
         self._generation = generation
         self._action = action
         self._token = token
+        self._operation_context = operation_context
+
+    def _emit_progress(self, progress: OperationProgress) -> None:
+        self.progress.emit(self._task_id, self._generation, progress)
 
     @Slot()
     def run(self) -> None:
@@ -157,15 +165,22 @@ class TaskWorker(QObject):
             traceback_text="",
         )
         try:
-            self._token.raise_if_cancelled()
-            payload = self._action(self._token)
-            self._token.raise_if_cancelled()
+            if self._operation_context is None:
+                self._token.raise_if_cancelled()
+                payload = self._action(self._token)
+                self._token.raise_if_cancelled()
+            else:
+                self._operation_context.raise_if_cancelled()
+                payload = self._action(self._operation_context)  # type: ignore[arg-type]
+                self._operation_context.seal_terminal()
             _assert_ordinary_data(payload)
             outcome = TaskState.SUCCEEDED
         except TaskCancelled as exc:
             outcome = TaskState.CANCELLED
             payload = str(exc)
         except Exception as exc:
+            if self._operation_context is not None:
+                self._operation_context.seal_failure()
             outcome = TaskState.FAILED
             payload = TaskFailure(
                 error_type=type(exc).__name__,
@@ -184,6 +199,7 @@ class TaskRecord:
     token: CancellationToken
     thread: QThread | None
     worker: TaskWorker | None
+    operation_context: OperationContext | None = None
     state: TaskState = TaskState.QUEUED
     terminal_seen: bool = False
     thread_finished_seen: bool = False
@@ -216,6 +232,7 @@ class TaskRecord:
 
 class BackgroundTaskCoordinator(QObject):
     task_settled = Signal(str, int, object, object)
+    task_progress = Signal(str, int, object)
     task_removed = Signal(str)
     idle = Signal()
     internal_error = Signal(str)
@@ -261,7 +278,14 @@ class BackgroundTaskCoordinator(QObject):
         task_id = uuid.uuid4().hex
         token = CancellationToken()
         thread = QThread(self)
-        worker = TaskWorker(task_id, generation, action, token)
+        operation_context: OperationContext | None = None
+        if spec.dynamic_cancellation:
+            from .operation import OperationContext as _OperationContext
+
+            operation_context = _OperationContext()
+        worker = TaskWorker(task_id, generation, action, token, operation_context)
+        if operation_context is not None:
+            operation_context.set_progress_callback(worker._emit_progress)
         record = TaskRecord(
             task_id=task_id,
             spec=spec,
@@ -269,6 +293,7 @@ class BackgroundTaskCoordinator(QObject):
             token=token,
             thread=thread,
             worker=worker,
+            operation_context=operation_context,
         )
         self._records[task_id] = record
         self._idle_emitted = False
@@ -277,6 +302,7 @@ class BackgroundTaskCoordinator(QObject):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.settled.connect(self._on_worker_settled)
+        worker.progress.connect(self._on_worker_progress)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(self._on_thread_finished)
         thread.finished.connect(thread.deleteLater)
@@ -291,7 +317,11 @@ class BackgroundTaskCoordinator(QObject):
             return False
         if not record.spec.cancellable or record.spec.critical_write_started:
             return False
-        record.token.cancel()
+        if record.operation_context is not None:
+            if not record.operation_context.request_cancel():
+                return False
+        else:
+            record.token.cancel()
         if record.state in (TaskState.QUEUED, TaskState.RUNNING):
             record.state = TaskState.CANCELLING
         return True
@@ -309,6 +339,23 @@ class BackgroundTaskCoordinator(QObject):
             if record.spec.close_policy is ClosePolicy.CANCEL:
                 self.request_cancel(task_id)
         return not self.has_active_tasks()
+
+    @Slot(str, int, object)
+    def _on_worker_progress(
+        self,
+        task_id: str,
+        generation: int,
+        progress: object,
+    ) -> None:
+        record = self._records.get(task_id)
+        if record is None or record.terminal_seen or generation != record.generation:
+            return
+        try:
+            _assert_ordinary_data(progress)
+        except TypeError as exc:
+            self.internal_error.emit(f"invalid task progress for {task_id}: {exc}")
+            return
+        self.task_progress.emit(task_id, generation, progress)
 
     @Slot(str, int, object, object)
     def _on_worker_settled(

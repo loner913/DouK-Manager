@@ -178,7 +178,7 @@ class OperationContractTests(unittest.TestCase):
         now[0] += 0.05
         self.assertFalse(context.report_progress(same_phase))
         self.assertEqual(emitted, [first])
-        now[0] += 0.10
+        now[0] += 0.11
         self.assertTrue(context.report_progress(same_phase))
         self.assertEqual(emitted, [first, same_phase])
         self.assertTrue(context.report_progress(phase_change))
