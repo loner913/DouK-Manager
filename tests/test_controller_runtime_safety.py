@@ -29,6 +29,11 @@ from douk_manager.core.settings_tasks import EarliestRule, SettingsTaskService
 from douk_manager.vendor import collector_server
 from tests.helpers import make_test_paths
 
+try:
+    from douk_manager import startup as startup_module
+except ImportError:
+    startup_module = None
+
 
 def file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -69,6 +74,91 @@ def create_collector_workbook(path: Path) -> None:
 
 
 class ControllerRuntimeSafetyTests(unittest.TestCase):
+    def _startup_state(self):
+        self.assertIsNotNone(
+            startup_module,
+            "Phase 1 must provide the douk_manager.startup state contracts.",
+        )
+        assert startup_module is not None
+        self.assertTrue(
+            hasattr(startup_module, "StartupState"),
+            "Phase 1 must expose douk_manager.startup.StartupState.",
+        )
+        return startup_module.StartupState
+
+    def _degraded_controller(self, root: Path) -> ManagerController:
+        state = self._startup_state()
+        controller = make_controller(root, engine_running=False)
+        controller.root = controller.paths.root
+        controller.config = AppConfig(
+            engine_exe=str(controller.paths.engine_exe),
+            video_root=str(controller.paths.video_root),
+            index_root=str(controller.paths.index_root),
+        )
+        controller.task_order = Mock()
+        controller.screenshots = Mock()
+        controller.indexer = Mock()
+        controller.startup_state = state.DEGRADED_READ_ONLY
+        controller.startup_generation = 4
+        controller.read_only_reason = "synthetic startup safety failure"
+        controller.collector.running = False
+        controller.collector.health.return_value = False
+        controller.engine.external_running.return_value = False
+        return controller
+
+    def test_degraded_read_only_rejects_every_dangerous_entry_point(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            controller = self._degraded_controller(root)
+            controller.config.screenshot_post_mode = "batch"
+            blocked_operations = (
+                lambda: controller.update_post_options({"cleanup_after_index": True}),
+                lambda: controller.create_task(
+                    "A1", EarliestRule.keep(), False, "blocked", True
+                ),
+                lambda: controller.delete_tasks((controller.paths.tasks / "task.json",)),
+                lambda: controller.generate_batches(1, 3, 1, EarliestRule.keep()),
+                lambda: controller.save_task_order([]),
+                lambda: controller.restore_task_order(),
+                lambda: controller.activate_task(controller.paths.tasks / "task.json"),
+                lambda: controller.start_current_download(),
+                lambda: controller.start_monitor(),
+                lambda: controller.activate_and_start(controller.paths.tasks / "task.json"),
+                lambda: controller.backup_now(),
+                lambda: controller.apply_engine_update(root / "engine.zip"),
+                lambda: controller.start_collector(),
+                lambda: controller.migrate_collector(),
+                lambda: controller.organize_screenshots(),
+                lambda: controller.refresh_index(),
+                lambda: controller.cleanup_index(),
+                lambda: controller.cleanup_index_self_test(),
+                lambda: controller.run_post_actions("batch"),
+            )
+
+            for operation in blocked_operations:
+                with self.subTest(operation=operation):
+                    with self.assertRaises(ControllerError):
+                        operation()
+
+    def test_degraded_read_only_accepts_path_reconfiguration_without_ready_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            controller = self._degraded_controller(root)
+            controller._build_services = Mock()
+            controller.try_startup_backup = Mock(
+                side_effect=AssertionError("reconfiguration must wait for a new startup result")
+            )
+
+            result = controller.reconfigure(
+                {"engine_exe": str(root / "replacement" / "main.exe")}
+            )
+
+            self.assertEqual(result, "")
+            self.assertNotEqual(controller.startup_state, self._startup_state().READY)
+            self.assertIsNone(controller.startup_backup)
+            controller._build_services.assert_called_once_with()
+            controller.try_startup_backup.assert_not_called()
+
     def test_monitor_start_requires_successful_startup_backup_before_engine_launch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             controller = make_controller(Path(directory), engine_running=False)
