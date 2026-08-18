@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import subprocess
 import tempfile
+from contextlib import contextmanager
+from threading import Event
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -99,18 +101,33 @@ class StartupSafetyServiceTests(unittest.TestCase):
         return SimpleNamespace(state=state, details=details)
 
     def test_missing_critical_path_returns_paths_failure_without_backup(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            service, engine, backup, probe_state, paths = self._service(Path(directory))
-            paths.database.unlink()
-            engine.probe_external_running.return_value = self._probe(probe_state.SAFE)
+        for path_name in (
+            "engine_exe",
+            "volume",
+            "master_settings",
+            "active_settings",
+            "database",
+        ):
+            with self.subTest(path=path_name), tempfile.TemporaryDirectory() as directory:
+                service, engine, backup, probe_state, paths = self._service(
+                    Path(directory)
+                )
+                missing_path = getattr(paths, path_name)
+                if path_name == "volume":
+                    missing_path.rename(missing_path.with_name("missing-Volume"))
+                else:
+                    missing_path.unlink()
+                engine.probe_external_running.return_value = self._probe(probe_state.SAFE)
 
-            result = service.run(generation=7, token=None)
+                result = service.run(generation=7, token=None)
 
-            self.assertFalse(result.success)
-            self.assertEqual(result.state, startup_module.StartupState.DEGRADED_READ_ONLY)
-            self.assertEqual(result.stage, startup_module.StartupStage.PATHS)
-            self.assertIsNone(result.startup_backup)
-            backup.create_critical_snapshot.assert_not_called()
+                self.assertFalse(result.success)
+                self.assertEqual(
+                    result.state, startup_module.StartupState.DEGRADED_READ_ONLY
+                )
+                self.assertEqual(result.stage, startup_module.StartupStage.PATHS)
+                self.assertIsNone(result.startup_backup)
+                backup.create_critical_snapshot.assert_not_called()
 
     def test_running_process_returns_process_failure_without_backup(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -172,17 +189,45 @@ class StartupSafetyServiceTests(unittest.TestCase):
     def test_lock_recheck_stops_backup_when_process_becomes_running(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             service, engine, backup, probe_state, _ = self._service(Path(directory))
-            engine.probe_external_running.side_effect = (
-                self._probe(probe_state.SAFE, "before lock"),
-                self._probe(probe_state.RUNNING, "inside lock"),
-            )
+            lock_held = Event()
+            probe_count = 0
 
-            result = service.run(generation=12, token=None)
+            @contextmanager
+            def synthetic_critical_section(*_args, **_kwargs):
+                self.assertFalse(lock_held.is_set(), "startup safety must acquire one lock")
+                lock_held.set()
+                try:
+                    yield
+                finally:
+                    lock_held.clear()
+
+            def probe_external_running():
+                nonlocal probe_count
+                probe_count += 1
+                if probe_count == 1:
+                    self.assertFalse(
+                        lock_held.is_set(), "the initial process probe precedes lock entry"
+                    )
+                    return self._probe(probe_state.SAFE, "before lock")
+                self.assertEqual(probe_count, 2, "startup safety must probe exactly twice")
+                self.assertTrue(
+                    lock_held.is_set(),
+                    "the second process probe must occur while critical_section is held",
+                )
+                return self._probe(probe_state.RUNNING, "inside lock")
+
+            engine.probe_external_running.side_effect = probe_external_running
+            with patch(
+                "douk_manager.startup.critical_section",
+                side_effect=synthetic_critical_section,
+            ):
+                result = service.run(generation=12, token=None)
 
             self.assertFalse(result.success)
             self.assertEqual(result.state, startup_module.StartupState.DEGRADED_READ_ONLY)
             self.assertEqual(result.stage, startup_module.StartupStage.PROCESS)
-            self.assertEqual(engine.probe_external_running.call_count, 2)
+            self.assertEqual(probe_count, 2)
+            self.assertFalse(lock_held.is_set(), "startup safety must release the lock")
             backup.create_critical_snapshot.assert_not_called()
 
 
