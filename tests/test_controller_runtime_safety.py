@@ -233,6 +233,51 @@ class ControllerRuntimeSafetyTests(unittest.TestCase):
             self.assertEqual(controller.startup_generation, 1)
             self.assertEqual(controller.startup_state, self._startup_state().SAFETY_CHECKING)
 
+    def test_degraded_path_repair_requires_new_generation_before_ready(self) -> None:
+        assert startup_module is not None
+        state = self._startup_state()
+        with tempfile.TemporaryDirectory() as directory:
+            controller = self._degraded_controller(Path(directory))
+            controller.startup_state = state.BOOTSTRAPPING
+            controller.startup_generation = 0
+            controller._build_services = Mock()
+            failed = startup_module.StartupSafetyResult(
+                generation=4,
+                success=False,
+                state=state.DEGRADED_READ_ONLY,
+                stage=startup_module.StartupStage.PATHS,
+                summary="synthetic path failure",
+                details="repair is required",
+                health={},
+            )
+            ready = startup_module.StartupSafetyResult(
+                generation=5,
+                success=True,
+                state=state.READY,
+                stage=startup_module.StartupStage.SNAPSHOT,
+                summary="ready",
+                details="",
+                health={},
+            )
+
+            self.assertTrue(controller.begin_startup_check(4))
+            self.assertTrue(controller.apply_startup_result(failed))
+            self.assertIs(controller.startup_state, state.DEGRADED_READ_ONLY)
+            controller.reconfigure(
+                {
+                    "engine_exe": str(controller.paths.engine_exe),
+                    "video_root": str(controller.paths.video_root),
+                    "index_root": str(controller.paths.index_root),
+                    "old_screenshot_dir": str(controller.config.old_screenshot_dir),
+                }
+            )
+
+            self.assertTrue(controller.begin_startup_check(5))
+            self.assertFalse(controller.apply_startup_result(failed))
+            self.assertIs(controller.startup_state, state.SAFETY_CHECKING)
+            self.assertTrue(controller.apply_startup_result(ready))
+            self.assertIs(controller.startup_state, state.READY)
+
     def test_runtime_stop_and_cancel_reject_non_operational_states(self) -> None:
         state = self._startup_state()
         for blocked_state in (

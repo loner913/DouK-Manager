@@ -16,9 +16,18 @@ except (ImportError, ModuleNotFoundError):
     MainWindow = None  # type: ignore[assignment,misc]
 else:
     import douk_manager.gui as gui_module
+    from douk_manager.background import (
+        BackgroundTaskCoordinator,
+        CancellationToken,
+        TaskRecord,
+        TaskSpec,
+        TaskState,
+    )
+    from douk_manager.controller import ManagerController
     from douk_manager.core.download_summary import SummaryWriteError
     from douk_manager.core.engine import assess_process_exit
     from douk_manager.gui import ActionWorker, MainWindow, TaskTemplateList
+    from douk_manager.startup import StartupSafetyResult, StartupStage, StartupState
     from PySide6.QtCore import QPoint, Qt
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication, QListWidgetItem, QMainWindow
@@ -351,6 +360,8 @@ class ActionWorkerTests(unittest.TestCase):
         window.download_summary_run = None
         window.download_summary_exit_code = None
         window.download_summary_assessment = None
+        window.coordinator = BackgroundTaskCoordinator(window)
+        window._close_pending = False
         window._append_info = Mock()
         window._start_next_queue_item = Mock()
         window._run = lambda action, _output=None: action()
@@ -669,6 +680,133 @@ class ActionWorkerTests(unittest.TestCase):
         event.ignore.assert_not_called()
         event.accept.assert_called_once_with()
         window.controller.stop_collector.assert_called_once_with()
+
+    def test_close_in_closing_state_skips_unmanaged_collector(self) -> None:
+        window = self._window_harness()
+        window.queue_current = None
+        window.download_summary_thread = None
+        window.background_thread = None
+        controller = ManagerController.__new__(ManagerController)
+        controller.startup_state = StartupState.CLOSING
+        controller.engine = SimpleNamespace(current=None)
+        controller.collector = SimpleNamespace(process=None)
+        window.controller = controller
+        window.coordinator = BackgroundTaskCoordinator(window)
+        self.assertTrue(window.coordinator.begin_closing())
+        event = SimpleNamespace(ignore=Mock(), accept=Mock())
+
+        try:
+            MainWindow.closeEvent(window, event)
+        except Exception as exc:  # pragma: no cover - converted into an assertion below
+            self.fail(f"unmanaged collector blocked normal close: {exc}")
+
+        event.ignore.assert_not_called()
+        event.accept.assert_called_once_with()
+        window.deleteLater()
+
+    def test_close_during_startup_requests_cooperative_cancel_without_waiting(self) -> None:
+        window = self._window_harness()
+        window.queue_current = None
+        window.download_summary_thread = None
+        window.background_thread = None
+        controller = ManagerController.__new__(ManagerController)
+        controller.startup_state = StartupState.SAFETY_CHECKING
+        controller.startup_generation = 1
+        controller.engine = SimpleNamespace(current=None)
+        controller.stop_collector = Mock()
+        window.controller = controller
+        window._safe_widgets = []
+        window._path_widgets = []
+        window._dangerous_widgets = []
+        window._close_pending = False
+        coordinator = BackgroundTaskCoordinator(window)
+        token = CancellationToken()
+        record = TaskRecord(
+            task_id="startup-task",
+            spec=TaskSpec(task_type="startup_safety", display_name="启动安全检查"),
+            generation=1,
+            token=token,
+            thread=None,
+            worker=None,
+            state=TaskState.RUNNING,
+        )
+        coordinator._records[record.task_id] = record
+        coordinator._idle_emitted = False
+        window.coordinator = coordinator
+        event = SimpleNamespace(ignore=Mock(), accept=Mock())
+
+        with patch.object(gui_module.QMessageBox, "information") as information:
+            MainWindow.closeEvent(window, event)
+
+        self.assertIs(controller.startup_state, StartupState.CLOSING)
+        self.assertTrue(coordinator.is_closing)
+        self.assertTrue(token.is_cancelled())
+        self.assertTrue(window._close_pending)
+        event.ignore.assert_called_once_with()
+        event.accept.assert_not_called()
+        controller.stop_collector.assert_not_called()
+        message = " ".join(str(value) for value in information.call_args.args[1:])
+        self.assertIn("启动安全检查", message)
+        window.deleteLater()
+
+    def test_coordinator_idle_schedules_one_new_close_attempt(self) -> None:
+        window = self._window_harness()
+        controller = ManagerController.__new__(ManagerController)
+        controller.startup_state = StartupState.CLOSING
+        window.controller = controller
+        window.coordinator = BackgroundTaskCoordinator(window)
+        self.assertTrue(window.coordinator.begin_closing())
+        window._close_pending = True
+        close_attempts: list[str] = []
+        window.close = lambda: close_attempts.append("close")
+
+        callback = getattr(window, "_on_background_tasks_idle", lambda: None)
+        callback()
+        self.app.processEvents()
+
+        self.assertEqual(close_attempts, ["close"])
+        self.assertFalse(window._close_pending)
+        window.deleteLater()
+
+    def test_late_startup_result_after_closing_cannot_mutate_gui(self) -> None:
+        window = self._window_harness()
+        controller = ManagerController.__new__(ManagerController)
+        controller.startup_state = StartupState.CLOSING
+        controller.startup_generation = 8
+        window.controller = controller
+        original_result = object()
+        window._startup_result = original_result
+        mutations: list[str] = []
+        window.startup_state_label = SimpleNamespace(
+            setText=lambda _value: mutations.append("state")
+        )
+        window.startup_stage_label = SimpleNamespace(
+            setText=lambda _value: mutations.append("stage")
+        )
+        window.startup_summary_label = SimpleNamespace(
+            setText=lambda _value: mutations.append("summary")
+        )
+        window.startup_details = SimpleNamespace(
+            setPlainText=lambda _value: mutations.append("details")
+        )
+
+        accepted = MainWindow.apply_startup_result(
+            window,
+            StartupSafetyResult(
+                generation=8,
+                success=True,
+                state=StartupState.READY,
+                stage=StartupStage.SNAPSHOT,
+                summary="late ready",
+                details="must be ignored",
+                health={},
+            ),
+        )
+
+        self.assertFalse(accepted)
+        self.assertIs(window._startup_result, original_result)
+        self.assertEqual(mutations, [])
+        window.deleteLater()
 
     def test_final_queue_conclusion_flags_incomplete_or_unreliable_summary(self) -> None:
         window = self._window_harness()

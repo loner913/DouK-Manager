@@ -178,9 +178,11 @@ class MainWindow(QMainWindow):
         self.controller = ManagerController()
         self.coordinator = BackgroundTaskCoordinator(self)
         self.coordinator.task_settled.connect(self._on_startup_task_settled)
+        self.coordinator.idle.connect(self._on_background_tasks_idle)
         self.startup_generation = 0
         self._startup_task_id: str | None = None
         self._startup_result: StartupSafetyResult | None = None
+        self._close_pending = False
         self._safe_widgets: list[QWidget] = []
         self._path_widgets: list[QWidget] = []
         self._dangerous_widgets: list[QWidget] = []
@@ -403,6 +405,17 @@ class MainWindow(QMainWindow):
 
     def _open_manager_log(self) -> None:
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.controller.log_path)))
+
+    @Slot()
+    def _on_background_tasks_idle(self) -> None:
+        if not self._close_pending:
+            return
+        if not self.coordinator.is_closing:
+            return
+        if self.controller.startup_state is not StartupState.CLOSING:
+            return
+        self._close_pending = False
+        QTimer.singleShot(0, self.close)
 
     def _save_paths(self) -> None:
         values = {
@@ -2715,8 +2728,22 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "索引任务运行中", "请等待索引任务完成后再关闭管理器。")
             event.ignore()
             return
+        if self.coordinator.has_active_tasks():
+            self._close_pending = True
+            self.controller.begin_closing()
+            self.coordinator.begin_closing()
+            self._apply_action_gate()
+            QMessageBox.information(
+                self,
+                "启动安全检查正在结束",
+                "已请求取消启动安全检查；后台线程安全退出后管理器将自动关闭。",
+            )
+            event.ignore()
+            return
         try:
-            self.controller.stop_collector()
+            collector = getattr(self.controller, "collector", None)
+            if collector is None or getattr(collector, "process", None) is not None:
+                self.controller.stop_collector()
         finally:
             event.accept()
 
