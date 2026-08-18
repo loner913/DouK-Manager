@@ -323,9 +323,19 @@ class MainWindow(QMainWindow):
         if generation != self.startup_generation:
             return
         if isinstance(payload, TaskFailure):
-            details = "\n\n".join(
-                part for part in (payload.message, payload.traceback_text) if part
-            )[-4000:]
+            message = (
+                payload.message[:2000]
+                if payload.traceback_text
+                else payload.message[:4000]
+            )
+            separator = "\n\n" if message and payload.traceback_text else ""
+            traceback_budget = 4000 - len(message) - len(separator)
+            traceback_text = (
+                payload.traceback_text[-traceback_budget:]
+                if traceback_budget > 0
+                else ""
+            )
+            details = f"{message}{separator}{traceback_text}"
         else:
             details = str(payload)
         self._apply_startup_failure(

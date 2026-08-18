@@ -235,6 +235,24 @@ class StartupGuiTests(unittest.TestCase):
             details = window.startup_details.toPlainText()
             self.assertIn("synthetic failure", details)
             self.assertIn("synthetic traceback", details)
+
+            self.assertTrue(window.controller.begin_startup_check(2))
+            window.startup_generation = 2
+            window._startup_task_id = "long-failure-task"
+            window._on_startup_task_settled(
+                "long-failure-task",
+                2,
+                TaskState.FAILED,
+                TaskFailure(
+                    "RuntimeError",
+                    "message-head:" + ("m" * 5000),
+                    ("t" * 5000) + ":traceback-tail",
+                ),
+            )
+            long_details = window.startup_details.toPlainText()
+            self.assertIn("message-head:", long_details)
+            self.assertIn(":traceback-tail", long_details)
+            self.assertLessEqual(len(long_details), 4000)
             self._dispose_window(window)
 
     def test_refresh_status_is_blocked_until_ready(self) -> None:
