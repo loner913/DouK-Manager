@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import os
+import sqlite3
+import sys
 import threading
 import unittest
-from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEventLoop, QTimer
+from PySide6.QtCore import QEventLoop, QObject, QTimer
 from PySide6.QtWidgets import QApplication
 
 from douk_manager.background import (
@@ -19,6 +20,7 @@ from douk_manager.background import (
     TaskRejectedError,
     TaskSpec,
     TaskState,
+    TaskWorker,
 )
 
 
@@ -79,6 +81,91 @@ class CoordinatorStateTests(unittest.TestCase):
         self.assertTrue(record.observe_thread_finished())
         self.assertFalse(record.observe_thread_finished())
         self.assertTrue(record.ready_for_removal)
+
+    def test_nonterminal_settlement_becomes_protocol_failure(self) -> None:
+        coordinator = BackgroundTaskCoordinator()
+        record = make_record()
+        coordinator._records[record.task_id] = record
+        internal_errors: list[str] = []
+        settlements: list[tuple[object, ...]] = []
+        coordinator.internal_error.connect(internal_errors.append)
+        coordinator.task_settled.connect(lambda *args: settlements.append(args))
+
+        coordinator._on_worker_settled(
+            record.task_id,
+            record.generation,
+            TaskState.RUNNING,
+            {"invalid": True},
+        )
+
+        self.assertEqual(record.state, TaskState.FAILED)
+        self.assertTrue(record.terminal_seen)
+        self.assertEqual(len(internal_errors), 1)
+        self.assertEqual(len(settlements), 1)
+        self.assertEqual(settlements[0][0:3], (record.task_id, 7, TaskState.FAILED))
+        self.assertIsInstance(settlements[0][3], TaskFailure)
+
+    def test_finished_without_settled_is_internal_only_and_removes_once(self) -> None:
+        coordinator = BackgroundTaskCoordinator()
+        record = make_record()
+        thread_marker = object()
+        record.thread = thread_marker  # type: ignore[assignment]
+        coordinator._records[record.task_id] = record
+        internal_errors: list[str] = []
+        settlements: list[tuple[object, ...]] = []
+        removals: list[str] = []
+        idle_events: list[bool] = []
+        coordinator.internal_error.connect(internal_errors.append)
+        coordinator.task_settled.connect(lambda *args: settlements.append(args))
+        coordinator.task_removed.connect(removals.append)
+        coordinator.idle.connect(lambda: idle_events.append(True))
+        coordinator._idle_emitted = False
+
+        coordinator._observe_thread_finished(record.task_id, thread_marker)
+        coordinator._observe_thread_finished(record.task_id, thread_marker)
+
+        self.assertEqual(record.state, TaskState.FAILED)
+        self.assertTrue(record.ready_for_removal)
+        self.assertEqual(len(internal_errors), 1)
+        self.assertEqual(settlements, [])
+        self.assertEqual(removals, [record.task_id])
+        self.assertEqual(idle_events, [True])
+        self.assertFalse(coordinator.has_active_tasks())
+
+    def test_worker_rejects_unsafe_payloads_as_ordinary_failure(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        try:
+            try:
+                raise RuntimeError("traceback payload")
+            except RuntimeError:
+                live_traceback = sys.exc_info()[2]
+            unsafe_payloads = (QObject(), connection, live_traceback)
+
+            for index, unsafe_payload in enumerate(unsafe_payloads):
+                with self.subTest(payload_type=type(unsafe_payload).__name__):
+                    settlements: list[tuple[object, ...]] = []
+                    worker = TaskWorker(
+                        f"unsafe-{index}",
+                        9,
+                        lambda _token, value=unsafe_payload: value,
+                        CancellationToken(),
+                    )
+                    worker.settled.connect(lambda *args: settlements.append(args))
+
+                    worker.run()
+
+                    self.assertEqual(len(settlements), 1)
+                    self.assertEqual(settlements[0][2], TaskState.FAILED)
+                    self.assertIsInstance(settlements[0][3], TaskFailure)
+        finally:
+            connection.close()
+
+    def test_task_failure_bounds_traceback_and_requires_strings(self) -> None:
+        failure = TaskFailure("ExampleError", "failure", "x" * 5000)
+
+        self.assertEqual(len(failure.traceback_text), 4000)
+        with self.assertRaises(TypeError):
+            TaskFailure("ExampleError", "failure", QObject())  # type: ignore[arg-type]
 
     def test_resource_conflict_and_deduplicate_key_are_rejected_separately(self) -> None:
         coordinator = BackgroundTaskCoordinator()

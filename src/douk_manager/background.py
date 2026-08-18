@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import sqlite3
 import threading
 import traceback
 import uuid
-from collections.abc import Callable
-from dataclasses import dataclass, field
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum
+from pathlib import Path
+from types import TracebackType
 from typing import Any
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot
@@ -71,6 +74,63 @@ class TaskFailure:
     message: str
     traceback_text: str
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.error_type, str):
+            raise TypeError("TaskFailure.error_type must be a string")
+        if not isinstance(self.message, str):
+            raise TypeError("TaskFailure.message must be a string")
+        if not isinstance(self.traceback_text, str):
+            raise TypeError("TaskFailure.traceback_text must be a string")
+        object.__setattr__(self, "message", self.message[:4000])
+        object.__setattr__(self, "traceback_text", self.traceback_text[-4000:])
+
+
+def _assert_ordinary_data(
+    value: Any,
+    *,
+    seen: set[int] | None = None,
+    depth: int = 0,
+) -> None:
+    if depth > 32:
+        raise TypeError("task payload is nested too deeply")
+    if isinstance(value, QObject):
+        raise TypeError("task payload cannot contain a QObject")
+    if isinstance(value, sqlite3.Connection):
+        raise TypeError("task payload cannot contain a SQLite connection")
+    if isinstance(value, TracebackType):
+        raise TypeError("task payload cannot contain a live traceback")
+    if value is None or isinstance(value, (bool, int, float, str, bytes, Path, Enum)):
+        return
+    if isinstance(value, TaskFailure):
+        return
+
+    seen = seen if seen is not None else set()
+    marker = id(value)
+    if marker in seen:
+        raise TypeError("task payload cannot contain a cycle")
+    seen.add(marker)
+    try:
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                _assert_ordinary_data(key, seen=seen, depth=depth + 1)
+                _assert_ordinary_data(item, seen=seen, depth=depth + 1)
+            return
+        if isinstance(value, (list, tuple, set, frozenset)):
+            for item in value:
+                _assert_ordinary_data(item, seen=seen, depth=depth + 1)
+            return
+        if is_dataclass(value) and not isinstance(value, type):
+            for field_info in fields(value):
+                _assert_ordinary_data(
+                    getattr(value, field_info.name),
+                    seen=seen,
+                    depth=depth + 1,
+                )
+            return
+    finally:
+        seen.remove(marker)
+    raise TypeError(f"unsupported task payload type: {type(value).__name__}")
+
 
 class TaskWorker(QObject):
     settled = Signal(str, int, object, object)
@@ -100,6 +160,7 @@ class TaskWorker(QObject):
             self._token.raise_if_cancelled()
             payload = self._action(self._token)
             self._token.raise_if_cancelled()
+            _assert_ordinary_data(payload)
             outcome = TaskState.SUCCEEDED
         except TaskCancelled as exc:
             outcome = TaskState.CANCELLED
@@ -259,11 +320,27 @@ class BackgroundTaskCoordinator(QObject):
         record = self._records.get(task_id)
         if record is None or record.terminal_seen:
             return
-        if generation != record.generation or not isinstance(outcome, TaskState):
-            details = (
+        protocol_details: str | None = None
+        if (
+            generation != record.generation
+            or not isinstance(outcome, TaskState)
+            or outcome not in (
+                TaskState.SUCCEEDED,
+                TaskState.FAILED,
+                TaskState.CANCELLED,
+            )
+        ):
+            protocol_details = (
                 f"invalid terminal protocol for {task_id}: "
                 f"generation={generation!r}, outcome={outcome!r}"
             )
+        else:
+            try:
+                _assert_ordinary_data(payload)
+            except TypeError as exc:
+                protocol_details = f"invalid task payload for {task_id}: {exc}"
+        if protocol_details is not None:
+            details = protocol_details
             self.internal_error.emit(details)
             outcome = TaskState.FAILED
             payload = TaskFailure(
@@ -287,6 +364,9 @@ class BackgroundTaskCoordinator(QObject):
         task_id = thread.property("douk_task_id")
         if not isinstance(task_id, str):
             return
+        self._observe_thread_finished(task_id, thread)
+
+    def _observe_thread_finished(self, task_id: str, thread: object) -> None:
         record = self._records.get(task_id)
         if record is None or record.thread is not thread:
             return
@@ -301,12 +381,6 @@ class BackgroundTaskCoordinator(QObject):
             )
             record.accept_terminal(TaskState.FAILED, failure)
             self.internal_error.emit(details)
-            self.task_settled.emit(
-                task_id,
-                record.generation,
-                TaskState.FAILED,
-                failure,
-            )
         self._maybe_remove(record)
 
     def _maybe_remove(self, record: TaskRecord) -> None:
