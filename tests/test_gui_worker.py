@@ -691,6 +691,9 @@ class ActionWorkerTests(unittest.TestCase):
         controller.engine = SimpleNamespace(current=None)
         controller.collector = SimpleNamespace(process=None)
         window.controller = controller
+        window._safe_widgets = []
+        window._path_widgets = []
+        window._dangerous_widgets = []
         window.coordinator = BackgroundTaskCoordinator(window)
         self.assertTrue(window.coordinator.begin_closing())
         event = SimpleNamespace(ignore=Mock(), accept=Mock())
@@ -702,6 +705,74 @@ class ActionWorkerTests(unittest.TestCase):
 
         event.ignore.assert_not_called()
         event.accept.assert_called_once_with()
+        window.deleteLater()
+
+    def test_close_from_degraded_stops_managed_collector_before_accepting(self) -> None:
+        window = self._window_harness()
+        window.queue_current = None
+        window.download_summary_thread = None
+        window.background_thread = None
+        stopped: list[bool] = []
+        controller = ManagerController.__new__(ManagerController)
+        controller.startup_state = StartupState.DEGRADED_READ_ONLY
+        controller.engine = SimpleNamespace(current=None)
+        controller.collector = SimpleNamespace(
+            process=object(),
+            stop=lambda: stopped.append(True),
+        )
+        controller.logger = SimpleNamespace(info=lambda *_args: None)
+        window.controller = controller
+        window._safe_widgets = []
+        window._path_widgets = []
+        window._dangerous_widgets = []
+        event = SimpleNamespace(ignore=Mock(), accept=Mock())
+
+        close_error: Exception | None = None
+        try:
+            MainWindow.closeEvent(window, event)
+        except Exception as exc:  # pragma: no cover - converted into an assertion below
+            close_error = exc
+
+        self.assertIsNone(close_error)
+        self.assertIs(controller.startup_state, StartupState.CLOSING)
+        self.assertTrue(window.coordinator.is_closing)
+        self.assertEqual(stopped, [True])
+        event.ignore.assert_not_called()
+        event.accept.assert_called_once_with()
+        window.deleteLater()
+
+    def test_close_keeps_window_open_when_managed_collector_stop_fails(self) -> None:
+        window = self._window_harness()
+        window.queue_current = None
+        window.download_summary_thread = None
+        window.background_thread = None
+        controller = ManagerController.__new__(ManagerController)
+        controller.startup_state = StartupState.READY
+        controller.engine = SimpleNamespace(current=None)
+
+        def fail_stop() -> None:
+            raise RuntimeError("synthetic collector stop failure")
+
+        controller.collector = SimpleNamespace(process=object(), stop=fail_stop)
+        controller.logger = SimpleNamespace(info=lambda *_args: None)
+        window.controller = controller
+        window._safe_widgets = []
+        window._path_widgets = []
+        window._dangerous_widgets = []
+        event = SimpleNamespace(ignore=Mock(), accept=Mock())
+
+        close_error: Exception | None = None
+        with patch.object(gui_module.QMessageBox, "critical") as critical:
+            try:
+                MainWindow.closeEvent(window, event)
+            except Exception as exc:  # pragma: no cover - converted into an assertion below
+                close_error = exc
+
+        self.assertIsNone(close_error)
+        self.assertIs(controller.startup_state, StartupState.CLOSING)
+        critical.assert_called_once()
+        event.ignore.assert_called_once_with()
+        event.accept.assert_not_called()
         window.deleteLater()
 
     def test_close_during_startup_requests_cooperative_cancel_without_waiting(self) -> None:

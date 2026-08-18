@@ -8,7 +8,7 @@ import unittest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEventLoop, QObject, QTimer
+from PySide6.QtCore import QEventLoop, QObject, QThread, QTimer
 from PySide6.QtWidgets import QApplication
 
 from douk_manager.background import (
@@ -182,6 +182,55 @@ class CoordinatorStateTests(unittest.TestCase):
                 )
             )
 
+    def test_terminal_record_waiting_for_thread_finish_does_not_block_next_generation(
+        self,
+    ) -> None:
+        coordinator = BackgroundTaskCoordinator()
+        record = make_record()
+        self.assertTrue(record.accept_terminal(TaskState.SUCCEEDED, {"ready": True}))
+        self.assertFalse(record.thread_finished_seen)
+        coordinator._records[record.task_id] = record
+
+        rejection: Exception | None = None
+        try:
+            coordinator._validate_start(make_spec())
+        except Exception as exc:  # pragma: no cover - converted into an assertion below
+            rejection = exc
+
+        self.assertIsNone(rejection)
+        self.assertIn(record.task_id, coordinator._records)
+
+    def test_finished_observer_does_not_call_qthread_methods(self) -> None:
+        property_calls: list[str] = []
+
+        class GuardedThread(QThread):
+            def property(self, name: str) -> object:  # noqa: A003
+                property_calls.append(name)
+                raise AssertionError("QThread method called after finished")
+
+        thread = GuardedThread()
+
+        class SenderCoordinator(BackgroundTaskCoordinator):
+            def sender(self) -> QObject:
+                return thread
+
+        coordinator = SenderCoordinator()
+        record = make_record()
+        record.thread = thread
+        self.assertTrue(record.accept_terminal(TaskState.SUCCEEDED, {"ready": True}))
+        coordinator._records[record.task_id] = record
+
+        observer_error: Exception | None = None
+        try:
+            coordinator._on_thread_finished()
+        except Exception as exc:  # pragma: no cover - converted into an assertion below
+            observer_error = exc
+
+        self.assertIsNone(observer_error)
+        self.assertEqual(property_calls, [])
+        self.assertFalse(coordinator.has_active_tasks())
+        thread.deleteLater()
+
     def test_cancellation_state_is_cooperative_and_idempotent(self) -> None:
         coordinator = BackgroundTaskCoordinator()
         record = make_record()
@@ -283,7 +332,7 @@ class CoordinatorQtLifecycleTests(unittest.TestCase):
         settlements: list[tuple[object, ...]] = []
         removals: list[str] = []
         worker_destructions: list[bool] = []
-        thread_finished_running_states: list[bool] = []
+        thread_finished_events: list[bool] = []
 
         def action(token: CancellationToken) -> dict[str, bool]:
             entered.set()
@@ -299,9 +348,7 @@ class CoordinatorQtLifecycleTests(unittest.TestCase):
         assert record.worker is not None
         assert record.thread is not None
         record.worker.destroyed.connect(lambda *_: worker_destructions.append(True))
-        record.thread.finished.connect(
-            lambda: thread_finished_running_states.append(record.thread.isRunning())
-        )
+        record.thread.finished.connect(lambda: thread_finished_events.append(True))
 
         release_timer = QTimer()
         release_timer.setInterval(1)
@@ -316,7 +363,7 @@ class CoordinatorQtLifecycleTests(unittest.TestCase):
         self._run_until(
             lambda: len(removals) == 1
             and len(worker_destructions) == 1
-            and len(thread_finished_running_states) == 1
+            and len(thread_finished_events) == 1
         )
         release_timer.stop()
 
@@ -324,7 +371,7 @@ class CoordinatorQtLifecycleTests(unittest.TestCase):
         self.assertEqual(settlements[0], (task_id, 17, TaskState.SUCCEEDED, {"ready": True}))
         self.assertEqual(removals, [task_id])
         self.assertEqual(worker_destructions, [True])
-        self.assertEqual(thread_finished_running_states, [False])
+        self.assertEqual(thread_finished_events, [True])
         self.assertFalse(coordinator.has_active_tasks())
 
     def test_completion_close_race_emits_idle_callback_once_without_gui_wait(self) -> None:

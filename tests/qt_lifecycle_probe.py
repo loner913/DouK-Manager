@@ -66,7 +66,7 @@ def run_round(round_number: int) -> None:
     settlements: list[tuple[object, ...]] = []
     removals: list[str] = []
     worker_destructions: list[bool] = []
-    thread_finished_running_states: list[bool] = []
+    thread_finished_events: list[bool] = []
 
     def action(token: CancellationToken) -> dict[str, int]:
         entered.set()
@@ -91,9 +91,7 @@ def run_round(round_number: int) -> None:
     assert record.worker is not None
     assert record.thread is not None
     record.worker.destroyed.connect(lambda *_: worker_destructions.append(True))
-    record.thread.finished.connect(
-        lambda: thread_finished_running_states.append(record.thread.isRunning())
-    )
+    record.thread.finished.connect(lambda: thread_finished_events.append(True))
 
     release_timer = QTimer()
     release_timer.setInterval(1)
@@ -108,7 +106,7 @@ def run_round(round_number: int) -> None:
     run_until(
         lambda: len(removals) == 1
         and len(worker_destructions) == 1
-        and len(thread_finished_running_states) == 1
+        and len(thread_finished_events) == 1
     )
     release_timer.stop()
 
@@ -121,9 +119,9 @@ def run_round(round_number: int) -> None:
         raise RuntimeError(
             f"round {round_number}: worker destruction count {len(worker_destructions)}"
         )
-    if thread_finished_running_states != [False]:
+    if thread_finished_events != [True]:
         raise RuntimeError(
-            f"round {round_number}: thread was active after finished signal"
+            f"round {round_number}: thread finished count {len(thread_finished_events)}"
         )
     if coordinator.has_active_tasks():
         raise RuntimeError(f"round {round_number}: coordinator retained active task")

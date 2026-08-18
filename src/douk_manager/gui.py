@@ -2740,12 +2740,27 @@ class MainWindow(QMainWindow):
             )
             event.ignore()
             return
+        begin_closing = getattr(self.controller, "begin_closing", None)
+        if callable(begin_closing):
+            self.coordinator.begin_closing()
+            begin_closing()
+            self._apply_action_gate()
         try:
             collector = getattr(self.controller, "collector", None)
             if collector is None or getattr(collector, "process", None) is not None:
                 self.controller.stop_collector()
-        finally:
-            event.accept()
+        except Exception as exc:
+            logger = getattr(self.controller, "logger", None)
+            if logger is not None and hasattr(logger, "exception"):
+                logger.exception("关闭前停止账号采集服务失败：%s", exc)
+            QMessageBox.critical(
+                self,
+                "账号采集服务停止失败",
+                f"管理器仍保持打开，未遗留关闭状态不明的采集进程。\n\n{exc}",
+            )
+            event.ignore()
+            return
+        event.accept()
 
     def _apply_style(self) -> None:
         self.setStyleSheet(

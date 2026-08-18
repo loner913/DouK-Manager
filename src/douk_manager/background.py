@@ -237,6 +237,8 @@ class BackgroundTaskCoordinator(QObject):
         if self._closing:
             raise TaskRejectedError("background task coordinator is closing")
         for record in self._records.values():
+            if record.terminal_seen:
+                continue
             if (
                 spec.deduplicate_key is not None
                 and record.spec.deduplicate_key == spec.deduplicate_key
@@ -272,7 +274,6 @@ class BackgroundTaskCoordinator(QObject):
         self._idle_emitted = False
 
         thread.setObjectName(f"douk-{spec.task_type}-{task_id[:8]}")
-        thread.setProperty("douk_task_id", task_id)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.settled.connect(self._on_worker_settled)
@@ -359,12 +360,10 @@ class BackgroundTaskCoordinator(QObject):
     @Slot()
     def _on_thread_finished(self) -> None:
         thread = self.sender()
-        if not isinstance(thread, QThread):
-            return
-        task_id = thread.property("douk_task_id")
-        if not isinstance(task_id, str):
-            return
-        self._observe_thread_finished(task_id, thread)
+        for task_id, record in tuple(self._records.items()):
+            if record.thread is thread:
+                self._observe_thread_finished(task_id, thread)
+                return
 
     def _observe_thread_finished(self, task_id: str, thread: object) -> None:
         record = self._records.get(task_id)
