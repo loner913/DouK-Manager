@@ -6,7 +6,9 @@ import threading
 import unittest
 from dataclasses import FrozenInstanceError, is_dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -15,11 +17,15 @@ from douk_manager.background import (
     CancellationToken,
     ClosePolicy,
     TaskCancelled,
+    TaskFailure,
     TaskRecord,
+    TaskRejectedError,
     TaskSpec,
     TaskState,
     TaskWorker,
 )
+from douk_manager.gui import MainWindow
+from douk_manager.startup import StartupState
 
 try:
     from douk_manager.operation import OperationContext, OperationProgress
@@ -262,6 +268,177 @@ class CoordinatorProtocolExtensionTests(unittest.TestCase):
         self.assertFalse(coordinator.begin_closing())
         self.assertTrue(coordinator.is_closing)
         self.assertFalse(context.cancel_requested)
+
+
+class _BindingCoordinator:
+    def __init__(self) -> None:
+        self.calls: list[tuple[Any, ...]] = []
+        self.error: Exception | None = None
+        self.cancelled: list[str] = []
+
+    def start(self, spec: TaskSpec, generation: int, action: Any) -> str:
+        if self.error is not None:
+            raise self.error
+        task_id = f"task-{len(self.calls) + 1}"
+        self.calls.append((spec, generation, action))
+        return task_id
+
+    def request_cancel(self, task_id: str) -> bool:
+        self.cancelled.append(task_id)
+        return True
+
+
+class MainWindowBackgroundBindingTests(unittest.TestCase):
+    @staticmethod
+    def _window() -> SimpleNamespace:
+        status_bar = SimpleNamespace(showMessage=Mock())
+        window = SimpleNamespace(
+            coordinator=_BindingCoordinator(),
+            controller=SimpleNamespace(
+                startup_state=StartupState.READY,
+                logger=Mock(),
+            ),
+            _background_bindings={},
+            _background_generations={},
+            _cancel_shutdown_for_new_work=Mock(),
+            _append_info=Mock(),
+            _apply_action_gate=Mock(),
+            _refresh_background_targets=Mock(),
+            statusBar=Mock(return_value=status_bar),
+        )
+        window._background_binding_is_current = lambda binding, generation: (
+            MainWindow._background_binding_is_current(window, binding, generation)
+        )
+        return window
+
+    @staticmethod
+    def _spec(name: str = "synthetic", *, refresh: tuple[str, ...] = ()) -> TaskSpec:
+        return TaskSpec(
+            task_type=name,
+            display_name=name,
+            deduplicate_key=name,
+            refresh_targets=refresh,
+            dynamic_cancellation=True,
+        )
+
+    def test_submit_success_progress_refresh_and_remove_share_one_binding(self) -> None:
+        window = self._window()
+        button = SimpleNamespace(setEnabled=Mock())
+        succeeded = Mock()
+        progressed = Mock()
+        removed = Mock()
+        spec = self._spec("success", refresh=("task_list", "runtime_status"))
+        action = lambda _context: {"ok": True}
+
+        task_id = MainWindow._submit_background(
+            window,
+            spec,
+            action,
+            buttons=(button,),
+            on_success=succeeded,
+            on_progress=progressed,
+            on_removed=removed,
+        )
+
+        self.assertEqual(task_id, "task-1")
+        self.assertEqual(window.coordinator.calls, [(spec, 1, action)])
+        button.setEnabled.assert_called_once_with(False)
+        progress = OperationProgress("scan", "reading", 1, 2)
+        MainWindow._on_background_task_progress(window, task_id, 1, progress)
+        progressed.assert_called_once_with(progress)
+
+        payload = {"ok": True}
+        MainWindow._on_background_task_settled(
+            window, task_id, 1, TaskState.SUCCEEDED, payload
+        )
+        succeeded.assert_called_once_with(payload)
+        window._refresh_background_targets.assert_called_once_with(spec.refresh_targets)
+
+        MainWindow._on_background_task_removed(window, task_id)
+        self.assertEqual(window._background_bindings, {})
+        self.assertEqual(button.setEnabled.call_args_list[-1].args, (True,))
+        removed.assert_called_once_with()
+        window._apply_action_gate.assert_called_once_with()
+
+    def test_failure_cancel_and_request_cancel_are_dispatched(self) -> None:
+        window = self._window()
+        failed = Mock()
+        cancelled = Mock()
+        first = MainWindow._submit_background(
+            window,
+            self._spec("failure"),
+            lambda _context: None,
+            on_failure=failed,
+        )
+        second = MainWindow._submit_background(
+            window,
+            self._spec("cancel"),
+            lambda _context: None,
+            on_cancelled=cancelled,
+        )
+        failure = TaskFailure("RuntimeError", "expected", "trace")
+
+        MainWindow._on_background_task_settled(
+            window, first, 1, TaskState.FAILED, failure
+        )
+        MainWindow._on_background_task_settled(
+            window, second, 1, TaskState.CANCELLED, "cancelled"
+        )
+
+        failed.assert_called_once_with(failure)
+        cancelled.assert_called_once_with("cancelled")
+        self.assertTrue(MainWindow._cancel_background(window, second))
+        self.assertEqual(window.coordinator.cancelled, [second])
+
+    def test_rejection_does_not_disable_or_replace_current_generation(self) -> None:
+        window = self._window()
+        window.coordinator.error = TaskRejectedError("synthetic conflict")
+        button = SimpleNamespace(setEnabled=Mock())
+
+        task_id = MainWindow._submit_background(
+            window,
+            self._spec("conflict"),
+            lambda _context: None,
+            output=SimpleNamespace(),
+            buttons=(button,),
+        )
+
+        self.assertIsNone(task_id)
+        self.assertEqual(window._background_bindings, {})
+        self.assertEqual(window._background_generations, {})
+        button.setEnabled.assert_not_called()
+        window._append_info.assert_called_once()
+
+    def test_stale_or_closing_progress_and_terminal_callbacks_are_dropped(self) -> None:
+        window = self._window()
+        succeeded = Mock()
+        progressed = Mock()
+        spec = self._spec("stale", refresh=("task_list",))
+        task_id = MainWindow._submit_background(
+            window,
+            spec,
+            lambda _context: None,
+            on_success=succeeded,
+            on_progress=progressed,
+        )
+        window._background_generations["stale"] = 2
+
+        MainWindow._on_background_task_progress(
+            window, task_id, 1, OperationProgress("scan", "old")
+        )
+        MainWindow._on_background_task_settled(
+            window, task_id, 1, TaskState.SUCCEEDED, "old"
+        )
+        self.assertFalse(progressed.called)
+        self.assertFalse(succeeded.called)
+        self.assertFalse(window._refresh_background_targets.called)
+
+        window.controller.startup_state = StartupState.CLOSING
+        window._background_generations["stale"] = 1
+        MainWindow._on_background_task_progress(
+            window, task_id, 1, OperationProgress("scan", "closing")
+        )
+        self.assertFalse(progressed.called)
 
 
 class PhaseOneFreezeTests(unittest.TestCase):

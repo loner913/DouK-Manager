@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, TypeVar
+from typing import Any, Callable, TypeVar
 
 from PySide6.QtCore import QObject, QThread, Qt, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut
@@ -38,6 +39,7 @@ from douk_manager.background import (
     BackgroundTaskCoordinator,
     ClosePolicy,
     TaskFailure,
+    TaskRejectedError,
     TaskSpec,
     TaskState,
 )
@@ -63,6 +65,21 @@ POST_MODES = (
     ("每一批完成后", "batch"),
     ("整个队列完成后", "queue"),
 )
+
+
+@dataclass
+class BackgroundTaskBinding:
+    generation_key: str
+    generation: int
+    spec: TaskSpec
+    output: QTextEdit | None = None
+    buttons: tuple[QWidget, ...] = ()
+    on_success: Callable[[object], None] | None = None
+    on_failure: Callable[[object], None] | None = None
+    on_cancelled: Callable[[object], None] | None = None
+    on_progress: Callable[[object], None] | None = None
+    on_removed: Callable[[], None] | None = None
+    allow_during_closing: bool = False
 
 
 def _status_label(status: AccountStatus | str) -> str:
@@ -178,7 +195,12 @@ class MainWindow(QMainWindow):
         self.controller = ManagerController()
         self.coordinator = BackgroundTaskCoordinator(self)
         self.coordinator.task_settled.connect(self._on_startup_task_settled)
+        self.coordinator.task_settled.connect(self._on_background_task_settled)
+        self.coordinator.task_progress.connect(self._on_background_task_progress)
+        self.coordinator.task_removed.connect(self._on_background_task_removed)
         self.coordinator.idle.connect(self._on_background_tasks_idle)
+        self._background_bindings: dict[str, BackgroundTaskBinding] = {}
+        self._background_generations: dict[str, int] = {}
         self.startup_generation = 0
         self._startup_task_id: str | None = None
         self._startup_result: StartupSafetyResult | None = None
@@ -1161,6 +1183,137 @@ class MainWindow(QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
             self.refresh_all()
+
+    def _submit_background(
+        self,
+        spec: TaskSpec,
+        action: Callable[[object], object],
+        *,
+        output: QTextEdit | None = None,
+        buttons: tuple[QWidget, ...] = (),
+        on_success: Callable[[object], None] | None = None,
+        on_failure: Callable[[object], None] | None = None,
+        on_cancelled: Callable[[object], None] | None = None,
+        on_progress: Callable[[object], None] | None = None,
+        on_removed: Callable[[], None] | None = None,
+        generation_key: str | None = None,
+        allow_during_closing: bool = False,
+    ) -> str | None:
+        self._cancel_shutdown_for_new_work()
+        key = generation_key or spec.deduplicate_key or spec.task_type
+        generation = self._background_generations.get(key, 0) + 1
+        try:
+            task_id = self.coordinator.start(spec, generation, action)
+        except TaskRejectedError as exc:
+            if output is not None:
+                self._append_info(output, f"【未启动】{exc}")
+            self.statusBar().showMessage(str(exc))
+            return None
+        self._background_generations[key] = generation
+        self._background_bindings[task_id] = BackgroundTaskBinding(
+            generation_key=key,
+            generation=generation,
+            spec=spec,
+            output=output,
+            buttons=buttons,
+            on_success=on_success,
+            on_failure=on_failure,
+            on_cancelled=on_cancelled,
+            on_progress=on_progress,
+            on_removed=on_removed,
+            allow_during_closing=allow_during_closing,
+        )
+        for button in buttons:
+            button.setEnabled(False)
+        return task_id
+
+    def _background_binding_is_current(
+        self,
+        binding: BackgroundTaskBinding,
+        generation: int,
+    ) -> bool:
+        if generation != binding.generation:
+            return False
+        if self._background_generations.get(binding.generation_key) != generation:
+            return False
+        return (
+            binding.allow_during_closing
+            or self.controller.startup_state is not StartupState.CLOSING
+        )
+
+    @Slot(str, int, object)
+    def _on_background_task_progress(
+        self,
+        task_id: str,
+        generation: int,
+        progress: object,
+    ) -> None:
+        binding = self._background_bindings.get(task_id)
+        if binding is None or not self._background_binding_is_current(
+            binding, generation
+        ):
+            return
+        if binding.on_progress is not None:
+            binding.on_progress(progress)
+
+    @Slot(str, int, object, object)
+    def _on_background_task_settled(
+        self,
+        task_id: str,
+        generation: int,
+        outcome: object,
+        payload: object,
+    ) -> None:
+        binding = self._background_bindings.get(task_id)
+        if binding is None or not self._background_binding_is_current(
+            binding, generation
+        ):
+            return
+        if outcome is TaskState.SUCCEEDED:
+            if binding.on_success is not None:
+                binding.on_success(payload)
+            self._refresh_background_targets(binding.spec.refresh_targets)
+            return
+        if outcome is TaskState.CANCELLED:
+            if binding.on_cancelled is not None:
+                binding.on_cancelled(payload)
+            elif binding.output is not None:
+                self._append_info(binding.output, "操作已取消。")
+            return
+        if binding.on_failure is not None:
+            binding.on_failure(payload)
+        else:
+            message = payload.message if isinstance(payload, TaskFailure) else str(payload)
+            if binding.output is not None:
+                self._append_info(binding.output, f"【失败】{message}")
+            self.controller.logger.error("后台操作失败：%s", message)
+            self.statusBar().showMessage("操作失败")
+
+    @Slot(str)
+    def _on_background_task_removed(self, task_id: str) -> None:
+        binding = self._background_bindings.pop(task_id, None)
+        if binding is None:
+            return
+        for button in binding.buttons:
+            if not any(
+                any(candidate is button for candidate in other.buttons)
+                for other in self._background_bindings.values()
+            ):
+                button.setEnabled(True)
+        if binding.on_removed is not None:
+            binding.on_removed()
+        self._apply_action_gate()
+
+    def _cancel_background(self, task_id: str) -> bool:
+        return self.coordinator.request_cancel(task_id)
+
+    def _refresh_background_targets(self, targets: tuple[str, ...]) -> None:
+        if "task_list" in targets:
+            self.refresh_tasks()
+        if "download_results" in targets and hasattr(self, "result_table"):
+            self.refresh_results()
+        if "runtime_status" in targets:
+            self._refresh_status()
 
     def _run_index_background(
         self,
