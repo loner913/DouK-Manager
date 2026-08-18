@@ -30,6 +30,7 @@ from douk_manager.integrations.collector import CollectorService, MigrationResul
 from douk_manager.integrations.indexer import IndexResult, IndexService
 from douk_manager.integrations.screenshots import ScreenshotPreview, ScreenshotResult, ScreenshotService
 from douk_manager.logging_setup import setup_logging
+from douk_manager.startup import StartupSafetyResult, StartupState
 
 
 class ControllerError(RuntimeError):
@@ -37,6 +38,10 @@ class ControllerError(RuntimeError):
 
 
 class ManagerController:
+    _DEGRADED_PATH_FIELDS = frozenset(
+        {"engine_exe", "video_root", "index_root", "old_screenshot_dir"}
+    )
+
     def __init__(self) -> None:
         self.root = application_root()
         default_paths = ManagedPaths.from_config(AppConfig(), self.root)
@@ -47,6 +52,9 @@ class ManagerController:
         self.logger, self.log_path = setup_logging(self.paths.manager_logs)
         self.startup_backup: Path | None = None
         self.read_only_reason = ""
+        self.startup_state = StartupState.BOOTSTRAPPING
+        self.startup_generation = 0
+        self._startup_result: StartupSafetyResult | None = None
         self._last_collector_running = False
         self._last_engine_running = False
         self._download_lifecycle_active = False
@@ -62,6 +70,77 @@ class ManagerController:
         self.collector = CollectorService(self.config, self.paths)
         self.screenshots = ScreenshotService()
         self.indexer = IndexService()
+
+    def _current_startup_state(self) -> StartupState:
+        # Older tests construct partial controllers with __new__. Real instances
+        # always receive BOOTSTRAPPING in __init__ and cannot use this fallback.
+        return getattr(self, "startup_state", StartupState.READY)
+
+    def begin_startup_check(self, generation: int) -> bool:
+        if self._current_startup_state() in (
+            StartupState.SAFETY_CHECKING,
+            StartupState.CLOSING,
+        ):
+            return False
+        current_generation = getattr(self, "startup_generation", 0)
+        if generation <= current_generation:
+            return False
+        self.startup_generation = generation
+        self.startup_state = StartupState.SAFETY_CHECKING
+        self.startup_backup = None
+        return True
+
+    def apply_startup_result(self, result: StartupSafetyResult) -> bool:
+        if self._current_startup_state() is StartupState.CLOSING:
+            return False
+        if self._current_startup_state() is not StartupState.SAFETY_CHECKING:
+            return False
+        if result.generation != getattr(self, "startup_generation", 0):
+            return False
+
+        self._startup_result = result
+        self.startup_backup = result.startup_backup
+        probe = result.process_probe
+        if probe is not None:
+            self._last_engine_running = probe.state.name != "SAFE"
+        if result.success and result.state is StartupState.READY:
+            self.startup_state = StartupState.READY
+            self.read_only_reason = ""
+        else:
+            self.startup_state = StartupState.DEGRADED_READ_ONLY
+            self.read_only_reason = result.summary or result.details
+        return True
+
+    def begin_closing(self) -> bool:
+        if self._current_startup_state() is StartupState.CLOSING:
+            return False
+        self.startup_state = StartupState.CLOSING
+        return True
+
+    def startup_error_text(self) -> str:
+        result = getattr(self, "_startup_result", None)
+        if result is not None and not result.success:
+            return "\n".join(part for part in (result.summary, result.details) if part)
+        return self.read_only_reason
+
+    def require_operational_ready(self, operation: str) -> None:
+        state = self._current_startup_state()
+        if state is StartupState.READY:
+            return
+        if state is StartupState.DEGRADED_READ_ONLY:
+            reason = self.startup_error_text() or "启动安全检查未通过。"
+        elif state is StartupState.CLOSING:
+            reason = "应用正在关闭。"
+        else:
+            reason = "启动安全检查尚未完成。"
+        raise ControllerError(f"{operation}不可用：{reason}")
+
+    def require_managed_runtime_control(self, operation: str, *, managed: bool) -> None:
+        state = self._current_startup_state()
+        if state not in (StartupState.READY, StartupState.CLOSING):
+            raise ControllerError(f"{operation}不可用：当前状态为 {state.value}。")
+        if not managed:
+            raise ControllerError(f"{operation}不可用：没有管理器持有的运行任务。")
 
     def health(self, *, check_processes: bool = False) -> dict[str, Any]:
         result: dict[str, Any] = self.paths.health()
@@ -153,6 +232,7 @@ class ManagerController:
             raise ControllerError("下载账号结果汇总或后续动作尚未完成，禁止修改配置或重新备份。")
 
     def require_safe_write(self) -> None:
+        self.require_operational_ready("写入正式数据")
         self.require_download_lifecycle_idle()
         if self.engine.external_running():
             raise ControllerError("下载引擎正在运行，禁止修改配置或重新备份。")
@@ -164,6 +244,7 @@ class ManagerController:
             raise ControllerError(self.read_only_reason)
 
     def require_collector_start(self) -> None:
+        self.require_operational_ready("启动账号采集服务")
         if getattr(self, "_download_lifecycle_active", False):
             return
         if self.engine.external_running():
@@ -171,10 +252,24 @@ class ManagerController:
         self.require_safe_write()
 
     def reconfigure(self, values: dict[str, Any]) -> str:
+        has_startup_state = hasattr(self, "startup_state")
+        state = self._current_startup_state()
+        if has_startup_state and state not in (
+            StartupState.READY,
+            StartupState.DEGRADED_READ_ONLY,
+        ):
+            raise ControllerError("正式路径只可在就绪或只读修复状态下修改。")
+        if state is StartupState.DEGRADED_READ_ONLY:
+            invalid_fields = set(values) - self._DEGRADED_PATH_FIELDS
+            if invalid_fields:
+                names = "、".join(sorted(invalid_fields))
+                raise ControllerError(f"只读修复状态只能修改正式路径：{names}")
         self.require_download_lifecycle_idle()
-        if self.engine.external_running():
+        if state is not StartupState.DEGRADED_READ_ONLY and self.engine.external_running():
             raise ControllerError("下载引擎正在运行，禁止切换正式路径或重建服务。")
         if self.collector.running:
+            if state is StartupState.DEGRADED_READ_ONLY:
+                raise ControllerError("账号采集服务仍由管理器持有，请先在就绪状态停止后再修复路径。")
             self.collector.stop()
         self._last_collector_running = False
         self._last_engine_running = False
@@ -184,13 +279,19 @@ class ManagerController:
         self.config.save(new_paths.config_file)
         self.paths = new_paths
         self.startup_backup = None
-        self.read_only_reason = ""
         self._build_services()
         self.logger.info("路径和任务设置已保存：%s", asdict(self.config))
+        if has_startup_state:
+            if state is StartupState.READY:
+                self.startup_state = StartupState.DEGRADED_READ_ONLY
+                self.read_only_reason = "正式路径已更改，等待重新执行启动安全检查。"
+            return ""
+        self.read_only_reason = ""
         return self.try_startup_backup()
 
     def update_post_options(self, values: dict[str, Any]) -> bool:
         """保存本次队列选项，不重建路径，也不制造一次多余的启动备份。"""
+        self.require_operational_ready("保存队列后续动作")
         self.require_download_lifecycle_idle()
         screenshot_mode = values.get(
             "screenshot_post_mode", self.config.screenshot_post_mode
@@ -292,11 +393,13 @@ class ManagerController:
         return result
 
     def save_task_order(self, ordered_paths: list[Path]) -> tuple[Path, ...]:
+        self.require_operational_ready("保存任务队列顺序")
         result = self.task_order.save_manual_order(ordered_paths)
         self.logger.info("任务队列顺序已保存：%s", [path.name for path in result])
         return result
 
     def restore_task_order(self) -> tuple[Path, ...]:
+        self.require_operational_ready("恢复任务队列顺序")
         result = self.task_order.restore_natural_order()
         self.logger.info("任务队列已恢复按 A 编号排序")
         return result
@@ -348,6 +451,11 @@ class ManagerController:
         return result
 
     def stop_monitor(self) -> Path | None:
+        run = getattr(self.engine, "current", None)
+        self.require_managed_runtime_control(
+            "停止后台监听",
+            managed=run is not None and getattr(run, "mode", None) == ENGINE_MODE_MONITOR,
+        )
         result = self.engine.stop_monitor()
         self._last_engine_running = False
         self.logger.info(
@@ -364,6 +472,12 @@ class ManagerController:
         self.engine.set_result_review(run, enabled)
 
     def cancel_current_download(self, run: EngineRun | None = None) -> Path:
+        current = getattr(self.engine, "current", None)
+        target = run or current
+        self.require_managed_runtime_control(
+            "取消当前下载",
+            managed=target is not None and target is current,
+        )
         result = self.engine.cancel_batch(run)
         self._last_engine_running = False
         self.logger.info("用户取消当前下载及全部待执行队列任务：任务日志=%s", result)
@@ -445,6 +559,10 @@ class ManagerController:
         return log_path
 
     def stop_collector(self) -> None:
+        self.require_managed_runtime_control(
+            "停止账号采集服务",
+            managed=getattr(self.collector, "process", None) is not None,
+        )
         self.collector.stop()
         self._last_collector_running = False
         self.logger.info("账号采集服务已停止")
@@ -462,11 +580,13 @@ class ManagerController:
         return self.screenshots.preview(self.paths.screenshot_inbox, self.paths.video_root)
 
     def organize_screenshots(self) -> ScreenshotResult:
+        self.require_operational_ready("整理截图")
         result = self.screenshots.execute(self.paths.screenshot_inbox, self.paths.video_root)
         self.logger.info("截图归档完成：移动%s张", result.moved)
         return result
 
     def refresh_index(self) -> IndexResult:
+        self.require_operational_ready("刷新索引")
         result = self.indexer.refresh(
             self.paths.video_root,
             self.paths.index_root,
@@ -477,6 +597,7 @@ class ManagerController:
         return result
 
     def cleanup_index(self) -> IndexResult:
+        self.require_operational_ready("清理失效索引")
         result = self.indexer.cleanup(
             self.paths.video_root,
             self.paths.index_root,
@@ -487,11 +608,13 @@ class ManagerController:
         return result
 
     def cleanup_index_self_test(self) -> IndexResult:
+        self.require_operational_ready("执行索引清理自检")
         result = self.indexer.cleanup_self_test()
         self.logger.info("失效快捷方式清理隔离自检通过")
         return result
 
     def run_post_actions(self, timing: str) -> list[str]:
+        self.require_operational_ready("执行下载后续动作")
         messages: list[str] = []
         if self.config.screenshot_post_mode == timing:
             result = self.organize_screenshots()

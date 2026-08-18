@@ -5,10 +5,12 @@ import signal
 import subprocess
 import ctypes
 import hashlib
+import json
 import time
 from ctypes import wintypes
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from threading import Lock
 
@@ -33,6 +35,19 @@ from douk_manager.ui_messages import format_information
 
 class EngineError(RuntimeError):
     pass
+
+
+class ProcessProbeState(Enum):
+    SAFE = "SAFE"
+    RUNNING = "RUNNING"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True)
+class ProcessProbe:
+    state: ProcessProbeState
+    details: str
+    matched_path: Path | None = None
 
 
 BATCH_RUN_COMMAND = "5 1 1 Q"
@@ -145,17 +160,28 @@ class EngineService:
         self.backup = backup
         self.current: EngineRun | None = None
 
-    def external_running(self) -> bool:
+    def probe_external_running(self) -> ProcessProbe:
+        """Probe manager-owned engine processes without treating uncertainty as safe."""
+
         if self.current and self.current.running:
-            return True
-        if _windows_engine_mutex_exists(self.paths.engine_exe):
-            return True
+            return ProcessProbe(ProcessProbeState.RUNNING, "manager-owned engine process")
+        try:
+            if _windows_engine_mutex_exists(self.paths.engine_exe):
+                return ProcessProbe(ProcessProbeState.RUNNING, "engine mutex is held")
+        except Exception as exc:
+            return ProcessProbe(ProcessProbeState.UNKNOWN, f"mutex probe failed: {exc}")
+
         if os.name != "nt" or not self.paths.engine_exe.name:
-            return False
+            return ProcessProbe(
+                ProcessProbeState.UNKNOWN,
+                "external process probe is unavailable on this platform",
+            )
+
         escaped_name = self.paths.engine_exe.name.replace("'", "''")
         command = (
-            f"Get-CimInstance Win32_Process -Filter \"Name='{escaped_name}'\" | "
-            "Select-Object -ExpandProperty ExecutablePath"
+            f"$processes = @(Get-CimInstance Win32_Process -Filter \"Name='{escaped_name}'\" | "
+            "Select-Object ProcessId, ExecutablePath); "
+            "ConvertTo-Json -InputObject $processes -Compress"
         )
         try:
             completed = subprocess.run(
@@ -165,16 +191,94 @@ class EngineService:
                 encoding="utf-8",
                 errors="replace",
                 timeout=8,
-                creationflags=subprocess.CREATE_NO_WINDOW,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-        except (OSError, subprocess.SubprocessError):
-            return False
+        except subprocess.TimeoutExpired as exc:
+            return ProcessProbe(ProcessProbeState.UNKNOWN, f"PowerShell timeout: {exc}")
+        except (OSError, subprocess.SubprocessError) as exc:
+            return ProcessProbe(ProcessProbeState.UNKNOWN, f"PowerShell launch failed: {exc}")
+
+        stdout = getattr(completed, "stdout", None)
+        stderr = getattr(completed, "stderr", None)
+        returncode = getattr(completed, "returncode", None)
+        if not isinstance(returncode, int):
+            return ProcessProbe(ProcessProbeState.UNKNOWN, "PowerShell returned no reliable exit code")
+        if returncode != 0:
+            detail = str(stderr).strip() if stderr else "no stderr"
+            return ProcessProbe(
+                ProcessProbeState.UNKNOWN,
+                f"PowerShell exited with code {returncode}: {detail}",
+            )
+        if not isinstance(stdout, str) or not isinstance(stderr, str):
+            return ProcessProbe(ProcessProbeState.UNKNOWN, "PowerShell output was malformed")
+        if stderr.strip():
+            return ProcessProbe(
+                ProcessProbeState.UNKNOWN,
+                f"PowerShell reported stderr: {stderr.strip()}",
+            )
+
+        payload = stdout.strip().lstrip("\ufeff")
+        if not payload:
+            return ProcessProbe(ProcessProbeState.UNKNOWN, "PowerShell returned empty output")
+        try:
+            decoded = json.loads(payload)
+        except (TypeError, json.JSONDecodeError) as exc:
+            return ProcessProbe(
+                ProcessProbeState.UNKNOWN,
+                f"PowerShell returned malformed JSON: {exc}",
+            )
+        if isinstance(decoded, dict):
+            processes = [decoded]
+        elif isinstance(decoded, list):
+            processes = decoded
+        else:
+            return ProcessProbe(
+                ProcessProbeState.UNKNOWN,
+                "PowerShell returned an unreliable process payload",
+            )
+        if not processes:
+            return ProcessProbe(ProcessProbeState.SAFE, "no matching engine process")
+
         expected = os.path.normcase(os.path.normpath(str(self.paths.engine_exe)))
-        return any(
-            os.path.normcase(os.path.normpath(line.strip())) == expected
-            for line in completed.stdout.splitlines()
-            if line.strip()
+        for process in processes:
+            if not isinstance(process, dict):
+                return ProcessProbe(
+                    ProcessProbeState.UNKNOWN,
+                    "PowerShell returned a malformed process record",
+                )
+            process_id = process.get("ProcessId")
+            executable_path = process.get("ExecutablePath")
+            if not isinstance(process_id, int) or process_id < 1:
+                return ProcessProbe(
+                    ProcessProbeState.UNKNOWN,
+                    "PowerShell returned a process without a reliable id",
+                )
+            if not isinstance(executable_path, str) or not executable_path.strip():
+                return ProcessProbe(
+                    ProcessProbeState.UNKNOWN,
+                    f"PowerShell could not read executable path for process {process_id}",
+                )
+            line = executable_path.strip()
+            if "\x00" in line or not os.path.isabs(line):
+                return ProcessProbe(
+                    ProcessProbeState.UNKNOWN,
+                    f"PowerShell returned unreliable executable path: {line}",
+                )
+            normalized = os.path.normcase(os.path.normpath(line))
+            if normalized == expected:
+                return ProcessProbe(
+                    ProcessProbeState.RUNNING,
+                    f"matching engine executable path for process {process_id}: {line}",
+                    Path(line),
+                )
+        return ProcessProbe(
+            ProcessProbeState.SAFE,
+            "no process matched the expected engine executable path",
         )
+
+    def external_running(self) -> bool:
+        probe = self.probe_external_running()
+        return probe.state in (ProcessProbeState.RUNNING, ProcessProbeState.UNKNOWN)
 
     def validate_ready(self) -> int:
         if not self.paths.engine_exe.is_file():

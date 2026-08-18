@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 from contextlib import contextmanager
@@ -59,6 +60,76 @@ class ProcessProbeTests(unittest.TestCase):
                 probe = service.probe_external_running()
 
             self.assertEqual(probe.state, state.UNKNOWN)
+
+    def test_empty_power_shell_output_is_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = self._state()
+            service = self._service(Path(directory))
+            completed = SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with patch(
+                "douk_manager.core.engine._windows_engine_mutex_exists",
+                return_value=False,
+            ), patch(
+                "douk_manager.core.engine.subprocess.run", return_value=completed
+            ):
+                probe = service.probe_external_running()
+
+            self.assertEqual(probe.state, state.UNKNOWN)
+
+    def test_structured_empty_process_list_is_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = self._state()
+            service = self._service(Path(directory))
+            completed = SimpleNamespace(returncode=0, stdout="[]", stderr="")
+
+            with patch(
+                "douk_manager.core.engine._windows_engine_mutex_exists",
+                return_value=False,
+            ), patch(
+                "douk_manager.core.engine.subprocess.run", return_value=completed
+            ):
+                probe = service.probe_external_running()
+
+            self.assertEqual(probe.state, state.SAFE)
+
+    def test_process_with_unreadable_executable_path_is_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = self._state()
+            service = self._service(Path(directory))
+            stdout = json.dumps([{"ProcessId": 42, "ExecutablePath": None}])
+            completed = SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+            with patch(
+                "douk_manager.core.engine._windows_engine_mutex_exists",
+                return_value=False,
+            ), patch(
+                "douk_manager.core.engine.subprocess.run", return_value=completed
+            ):
+                probe = service.probe_external_running()
+
+            self.assertEqual(probe.state, state.UNKNOWN)
+            self.assertIn("path", probe.details.casefold())
+
+    def test_structured_exact_executable_path_is_running(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = self._state()
+            service = self._service(Path(directory))
+            stdout = json.dumps(
+                [{"ProcessId": 42, "ExecutablePath": str(service.paths.engine_exe)}]
+            )
+            completed = SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+            with patch(
+                "douk_manager.core.engine._windows_engine_mutex_exists",
+                return_value=False,
+            ), patch(
+                "douk_manager.core.engine.subprocess.run", return_value=completed
+            ):
+                probe = service.probe_external_running()
+
+            self.assertEqual(probe.state, state.RUNNING)
+            self.assertEqual(probe.matched_path, service.paths.engine_exe)
 
 
 class StartupSafetyServiceTests(unittest.TestCase):
@@ -157,6 +228,20 @@ class StartupSafetyServiceTests(unittest.TestCase):
             self.assertIs(result.process_probe, unknown_probe)
             backup.create_critical_snapshot.assert_not_called()
 
+    def test_live_data_failure_is_reported_before_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service, engine, backup, probe_state, _ = self._service(Path(directory))
+            engine.probe_external_running.return_value = self._probe(probe_state.SAFE)
+            backup.validate_live_data.side_effect = OSError("synthetic SQLite failure")
+
+            result = service.run(generation=10, token=None)
+
+            self.assertFalse(result.success)
+            self.assertEqual(result.state, startup_module.StartupState.DEGRADED_READ_ONLY)
+            self.assertEqual(result.stage, startup_module.StartupStage.LIVE_DATA)
+            self.assertIn("SQLite failure", result.details)
+            backup.create_critical_snapshot.assert_not_called()
+
     def test_backup_failure_returns_backup_stage_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             service, engine, backup, probe_state, _ = self._service(Path(directory))
@@ -185,6 +270,25 @@ class StartupSafetyServiceTests(unittest.TestCase):
             self.assertEqual(result.stage, startup_module.StartupStage.SNAPSHOT)
             self.assertEqual(result.startup_backup, snapshot)
             self.assertTrue(result.recovered_command)
+
+    def test_success_uses_health_snapshot_taken_after_command_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service, engine, backup, probe_state, paths = self._service(Path(directory))
+            snapshot = paths.backups / "Startup-synthetic"
+            initial_health = paths.health()
+            final_health = {**initial_health, "collector_excel": True}
+            engine.probe_external_running.return_value = self._probe(probe_state.SAFE)
+            backup.create_critical_snapshot.return_value = snapshot
+
+            with patch.object(
+                type(paths), "health", side_effect=(initial_health, final_health)
+            ) as health:
+                result = service.run(generation=12, token=None)
+
+            self.assertTrue(result.success)
+            self.assertEqual(result.stage, startup_module.StartupStage.SNAPSHOT)
+            self.assertEqual(result.health_snapshot, final_health)
+            self.assertEqual(health.call_count, 2)
 
     def test_lock_recheck_stops_backup_when_process_becomes_running(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -228,6 +332,31 @@ class StartupSafetyServiceTests(unittest.TestCase):
             self.assertEqual(result.stage, startup_module.StartupStage.PROCESS)
             self.assertEqual(probe_count, 2)
             self.assertFalse(lock_held.is_set(), "startup safety must release the lock")
+            backup.create_critical_snapshot.assert_not_called()
+
+    def test_raise_only_token_cancellation_inside_lock_propagates(self) -> None:
+        class SyntheticCancellation(RuntimeError):
+            pass
+
+        class RaiseOnlyToken:
+            def __init__(self) -> None:
+                self.checkpoints = 0
+
+            def raise_if_cancelled(self) -> None:
+                self.checkpoints += 1
+                if self.checkpoints == 4:
+                    raise SyntheticCancellation("cancelled inside lock")
+
+        with tempfile.TemporaryDirectory() as directory:
+            service, engine, backup, probe_state, _ = self._service(Path(directory))
+            engine.probe_external_running.return_value = self._probe(probe_state.SAFE)
+            token = RaiseOnlyToken()
+
+            with self.assertRaises(SyntheticCancellation):
+                service.run(generation=13, token=token)
+
+            self.assertEqual(token.checkpoints, 4)
+            backup.validate_live_data.assert_not_called()
             backup.create_critical_snapshot.assert_not_called()
 
 

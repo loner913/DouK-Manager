@@ -159,6 +159,119 @@ class ControllerRuntimeSafetyTests(unittest.TestCase):
             controller._build_services.assert_called_once_with()
             controller.try_startup_backup.assert_not_called()
 
+    def test_degraded_reconfiguration_rejects_non_path_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = self._degraded_controller(Path(directory))
+            controller._build_services = Mock()
+            original_port = controller.config.collector_port
+
+            with self.assertRaises(ControllerError):
+                controller.reconfigure({"collector_port": 19999})
+
+            self.assertEqual(controller.config.collector_port, original_port)
+            controller._build_services.assert_not_called()
+            controller.collector.stop.assert_not_called()
+
+    def test_degraded_path_reconfiguration_does_not_stop_managed_collector(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            controller = self._degraded_controller(root)
+            controller._build_services = Mock()
+            controller.collector.running = True
+            controller.collector.process = object()
+
+            with self.assertRaises(ControllerError):
+                controller.reconfigure({"engine_exe": str(root / "replacement" / "main.exe")})
+
+            controller.collector.stop.assert_not_called()
+            controller._build_services.assert_not_called()
+
+    def test_degraded_path_reconfiguration_skips_uncertain_process_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            controller = self._degraded_controller(root)
+            controller._build_services = Mock()
+            controller.engine.external_running.return_value = True
+            replacement = root / "replacement" / "main.exe"
+
+            try:
+                result = controller.reconfigure({"engine_exe": str(replacement)})
+            except ControllerError as exc:
+                self.fail(f"degraded path repair must not depend on process certainty: {exc}")
+
+            self.assertEqual(result, "")
+            self.assertEqual(controller.config.engine_exe, str(replacement))
+            controller.engine.external_running.assert_not_called()
+            controller._build_services.assert_called_once_with()
+
+    def test_startup_check_is_single_flight_while_safety_checking(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = make_controller(Path(directory), engine_running=False)
+            controller.startup_state = self._startup_state().BOOTSTRAPPING
+            controller.startup_generation = 0
+
+            self.assertTrue(controller.begin_startup_check(1))
+            self.assertFalse(controller.begin_startup_check(2))
+            self.assertEqual(controller.startup_generation, 1)
+            self.assertEqual(controller.startup_state, self._startup_state().SAFETY_CHECKING)
+
+    def test_runtime_stop_and_cancel_reject_non_operational_states(self) -> None:
+        state = self._startup_state()
+        for blocked_state in (
+            state.BOOTSTRAPPING,
+            state.SAFETY_CHECKING,
+            state.DEGRADED_READ_ONLY,
+        ):
+            with self.subTest(state=blocked_state), tempfile.TemporaryDirectory() as directory:
+                controller = make_controller(Path(directory), engine_running=False)
+                controller.startup_state = blocked_state
+                controller.engine.current = SimpleNamespace(mode="monitor")
+                controller.collector.process = object()
+
+                for operation in (
+                    controller.stop_monitor,
+                    controller.cancel_current_download,
+                    controller.stop_collector,
+                ):
+                    with self.subTest(operation=operation.__name__):
+                        with self.assertRaises(ControllerError):
+                            operation()
+
+    def test_runtime_stop_and_cancel_require_manager_owned_work(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = make_controller(Path(directory), engine_running=False)
+            controller.startup_state = self._startup_state().READY
+            controller.engine.current = None
+            controller.collector.process = None
+
+            for operation in (
+                controller.stop_monitor,
+                controller.cancel_current_download,
+                controller.stop_collector,
+            ):
+                with self.subTest(operation=operation.__name__):
+                    with self.assertRaises(ControllerError):
+                        operation()
+
+    def test_runtime_stop_and_cancel_allow_managed_work_when_ready_or_closing(self) -> None:
+        state = self._startup_state()
+        for allowed_state in (state.READY, state.CLOSING):
+            with self.subTest(state=allowed_state), tempfile.TemporaryDirectory() as directory:
+                controller = make_controller(Path(directory), engine_running=False)
+                controller.startup_state = allowed_state
+                controller.engine.current = SimpleNamespace(mode="monitor")
+                controller.engine.stop_monitor.return_value = controller.paths.active_settings
+                controller.engine.cancel_batch.return_value = controller.paths.logs / "task.log"
+                controller.collector.process = object()
+
+                controller.stop_monitor()
+                controller.cancel_current_download()
+                controller.stop_collector()
+
+                controller.engine.stop_monitor.assert_called_once_with()
+                controller.engine.cancel_batch.assert_called_once_with(None)
+                controller.collector.stop.assert_called_once_with()
+
     def test_monitor_start_requires_successful_startup_backup_before_engine_launch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             controller = make_controller(Path(directory), engine_running=False)
