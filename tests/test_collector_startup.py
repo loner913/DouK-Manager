@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 
 from douk_manager.config import AppConfig
 from douk_manager.integrations.collector import CollectorService, CollectorServiceError
+from douk_manager.operation import OperationContext, TaskCancelled
 from tests.helpers import make_test_paths
 
 
@@ -94,6 +95,48 @@ class CollectorStartupTests(unittest.TestCase):
             self.assertIn("worker import failed", message)
             self.assertIn("Collector_", message)
             self.assertIsNone(service.process)
+
+    def test_cancel_during_health_wait_stops_created_process(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = self._service(Path(directory))
+            process = FakeProcess([None, None])
+            context = OperationContext()
+            health_calls = 0
+
+            def cancel_after_process_created(*_args, **_kwargs):
+                nonlocal health_calls
+                health_calls += 1
+                if health_calls == 2:
+                    context.request_cancel()
+                return False
+
+            service.health = Mock(side_effect=cancel_after_process_created)
+            with patch(
+                "douk_manager.integrations.collector.subprocess.Popen",
+                return_value=process,
+            ):
+                with self.assertRaises(TaskCancelled):
+                    service.start(context=context)
+            self.assertIsNone(service.process)
+            self.assertEqual(process.poll(), 0)
+
+    def test_health_success_seals_collector_start_against_late_cancel(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = self._service(Path(directory))
+            process = FakeProcess([None, None])
+            context = OperationContext()
+            service.health = Mock(side_effect=[False, True])
+            with patch(
+                "douk_manager.integrations.collector.subprocess.Popen",
+                return_value=process,
+            ):
+                service.start(context=context)
+            try:
+                self.assertTrue(context.critical_to_completion)
+                self.assertFalse(context.request_cancel())
+                self.assertTrue(service.running)
+            finally:
+                service.stop()
 
 
 if __name__ == "__main__":

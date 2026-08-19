@@ -6,6 +6,7 @@ import traceback
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields, is_dataclass
+from datetime import date, datetime, time
 from enum import Enum
 from pathlib import Path
 from types import TracebackType
@@ -49,6 +50,7 @@ class TaskSpec:
     refresh_targets: tuple[str, ...] = ()
     critical_write_started: bool = False
     dynamic_cancellation: bool = False
+    allow_during_closing: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "resource_keys", frozenset(self.resource_keys))
@@ -101,7 +103,9 @@ def _assert_ordinary_data(
         raise TypeError("task payload cannot contain a SQLite connection")
     if isinstance(value, TracebackType):
         raise TypeError("task payload cannot contain a live traceback")
-    if value is None or isinstance(value, (bool, int, float, str, bytes, Path, Enum)):
+    if value is None or isinstance(
+        value, (bool, int, float, str, bytes, Path, Enum, date, datetime, time)
+    ):
         return
     if isinstance(value, TaskFailure):
         return
@@ -251,7 +255,14 @@ class BackgroundTaskCoordinator(QObject):
         return bool(self._records)
 
     def _validate_start(self, spec: TaskSpec) -> None:
-        if self._closing:
+        if self._closing and not (
+            spec.allow_during_closing
+            and spec.task_type == "collector_stop_on_close"
+            and spec.close_policy is ClosePolicy.WAIT
+            and not spec.cancellable
+            and spec.resource_keys == frozenset({"collector_process"})
+            and spec.deduplicate_key == "collector_stop_on_close"
+        ):
             raise TaskRejectedError("background task coordinator is closing")
         for record in self._records.values():
             if record.terminal_seen:

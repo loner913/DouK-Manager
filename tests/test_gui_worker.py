@@ -536,6 +536,44 @@ class ActionWorkerTests(unittest.TestCase):
         self.assertEqual(window.queue_pending, [Path("A3.json")])
         window.refresh_all.assert_called_once_with()
 
+    def test_incomplete_summary_is_folded_into_queue_completion_state(self) -> None:
+        window = self._window_harness()
+        window.download_summary_worker = SimpleNamespace(
+            error=None,
+            result=SimpleNamespace(complete=False, reliable=True),
+        )
+        window.download_summary_thread = object()
+        window.download_summary_run = window.queue_current
+        window.download_summary_exit_code = 0
+        window.download_summary_assessment = assess_process_exit(0)
+        window.controller.run_post_actions.return_value = []
+
+        with patch.object(gui_module, "format_summary_for_ui", return_value=("部分汇总",)):
+            MainWindow._finish_download_summary(window)
+
+        self.assertFalse(window.queue_summaries_complete)
+        self.assertTrue(window.queue_summaries_reliable)
+
+    def test_background_queue_post_action_success_finalizes_without_resubmitting(self) -> None:
+        window = self._window_harness()
+        window.queue_current = None
+        window.queue_pending = []
+        window.queue_cancel_button = SimpleNamespace(setEnabled=Mock())
+        window._background_bindings = {}
+        window._background_generations = {}
+        window._background_pending = {}
+        window._submit_background = Mock()
+
+        MainWindow._run_post_actions_background(window, "queue", None)
+
+        binding = window._submit_background.call_args.kwargs
+        binding["on_success"](["索引完成"])
+
+        self.assertFalse(window.queue_active)
+        self.assertIsNone(window.queue_current)
+        window._start_next_queue_item.assert_not_called()
+        window.controller.release_download_lifecycle.assert_called_once_with()
+
     def test_abnormal_summary_completion_displays_partial_result_and_stops(self) -> None:
         window = self._window_harness(exit_code=7)
         window.download_summary_worker = SimpleNamespace(

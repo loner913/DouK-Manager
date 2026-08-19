@@ -9,10 +9,14 @@ import uuid
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from douk_manager.config import ManagedPaths
 from douk_manager.core.json_store import read_json
+from douk_manager.operation import TaskCancelled
+
+if TYPE_CHECKING:
+    from douk_manager.operation import OperationContext
 
 
 class BackupError(RuntimeError):
@@ -96,6 +100,7 @@ class BackupService:
         metadata: dict[str, Any] | None = None,
         *,
         keep_latest: int | None = None,
+        context: OperationContext | None = None,
     ) -> Path:
         """Back up only the unique settings and database files.
 
@@ -109,6 +114,7 @@ class BackupService:
             metadata,
             scope="critical",
             keep_latest=keep_latest,
+            context=context,
         )
 
     def create_full_snapshot(
@@ -117,6 +123,7 @@ class BackupService:
         metadata: dict[str, Any] | None = None,
         *,
         keep_latest: int | None = None,
+        context: OperationContext | None = None,
     ) -> Path:
         """Create an explicitly requested complete Volume snapshot."""
 
@@ -125,6 +132,7 @@ class BackupService:
             metadata,
             scope="full",
             keep_latest=keep_latest,
+            context=context,
         )
 
     def _create_snapshot(
@@ -134,6 +142,7 @@ class BackupService:
         *,
         scope: str,
         keep_latest: int | None,
+        context: OperationContext | None,
     ) -> Path:
         state = self.validate_live_data()
         if scope not in {"critical", "full"}:
@@ -157,12 +166,16 @@ class BackupService:
                 else [self.paths.volume / name for name in self.CRITICAL_FILENAMES]
             )
             for source in sources:
+                if context is not None and source.resolve() != self.paths.database.resolve():
+                    context.raise_if_cancelled()
                 relative = source.relative_to(self.paths.volume)
                 target = volume_target / relative
                 if source.is_dir():
                     target.mkdir(parents=True, exist_ok=True)
                     continue
                 if source.resolve() == self.paths.database.resolve():
+                    if context is not None:
+                        context.enter_critical_phase()
                     sqlite_backup(source, target)
                 else:
                     target.parent.mkdir(parents=True, exist_ok=True)
@@ -206,6 +219,8 @@ class BackupService:
             return final
         except Exception as exc:
             shutil.rmtree(temp, ignore_errors=True)
+            if isinstance(exc, TaskCancelled):
+                raise
             if isinstance(exc, BackupError):
                 raise
             raise BackupError(f"创建永久备份失败：{exc}") from exc

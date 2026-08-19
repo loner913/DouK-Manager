@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import inspect
 import os
+import tempfile
 import threading
 import unittest
 from dataclasses import FrozenInstanceError, is_dataclass
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -25,6 +27,16 @@ from douk_manager.background import (
     TaskWorker,
 )
 from douk_manager.gui import MainWindow
+from douk_manager.controller import ManagerController
+from douk_manager.core.result_history import (
+    AccountHistoryRow,
+    DownloadTaskHistory,
+    ResultHistoryService,
+    ResultPageSnapshot,
+)
+from douk_manager.core.download_summary import AccountStatus
+from douk_manager.core.backup import BackupService, BackupError
+from douk_manager.core.engine_update import EngineUpdateService
 from douk_manager.startup import StartupState
 
 try:
@@ -439,6 +451,144 @@ class MainWindowBackgroundBindingTests(unittest.TestCase):
             window, task_id, 1, OperationProgress("scan", "closing")
         )
         self.assertFalse(progressed.called)
+
+
+class PhaseTwoReadOnlyTaskTests(unittest.TestCase):
+    @staticmethod
+    def _history_run(path: str, *, complete: bool = True) -> DownloadTaskHistory:
+        ended_at = datetime(2026, 8, 19, 1, 2, 3)
+        row = AccountHistoryRow(
+            ended_at=ended_at,
+            a_number=7,
+            status=AccountStatus.PRIVATE,
+            completed_with_anomaly=False,
+            task_template="Task_A7.json",
+            task_log=Path(path),
+        )
+        return DownloadTaskHistory(
+            ended_at=ended_at,
+            task_template="Task_A7.json",
+            exit_code=0,
+            complete=complete,
+            reliable=True,
+            details_complete=complete,
+            account_rows=(row,),
+            task_log=Path(path),
+        )
+
+    def test_result_page_snapshot_derives_rows_and_integrity_from_one_scan(self) -> None:
+        service = ResultHistoryService(Path("unused"))
+        runs = (
+            self._history_run("new.log"),
+            self._history_run("old.log", complete=False),
+        )
+        service.list_runs = Mock(return_value=runs)
+        context = Mock()
+
+        snapshot = service.page_snapshot(limit=500, context=context)
+
+        self.assertIsInstance(snapshot, ResultPageSnapshot)
+        self.assertEqual(snapshot.runs, runs)
+        self.assertEqual(snapshot.rows, runs[0].account_rows + runs[1].account_rows)
+        self.assertEqual(snapshot.incomplete_old_runs, 1)
+        service.list_runs.assert_called_once_with(limit=500, context=context)
+
+    def test_controller_result_snapshot_delegates_without_second_scan(self) -> None:
+        controller = ManagerController.__new__(ManagerController)
+        controller.results = SimpleNamespace(page_snapshot=Mock(return_value="snapshot"))
+        context = Mock()
+
+        result = controller.result_snapshot(limit=123, context=context)
+
+        self.assertEqual(result, "snapshot")
+        controller.results.page_snapshot.assert_called_once_with(
+            limit=123, context=context
+        )
+
+    def test_coalescing_cancels_current_and_starts_only_latest_after_removal(self) -> None:
+        window = MainWindowBackgroundBindingTests._window()
+        window._background_pending = {}
+        first_action = lambda _context: "first"
+        middle_action = lambda _context: "middle"
+        latest_action = lambda _context: "latest"
+        spec = MainWindowBackgroundBindingTests._spec("snapshot")
+
+        first = MainWindow._submit_coalesced_background(window, spec, first_action)
+        middle = MainWindow._submit_coalesced_background(window, spec, middle_action)
+        latest = MainWindow._submit_coalesced_background(window, spec, latest_action)
+
+        self.assertEqual(first, "task-1")
+        self.assertEqual(middle, "task-1")
+        self.assertEqual(latest, "task-1")
+        self.assertEqual(window.coordinator.cancelled, ["task-1", "task-1"])
+        self.assertEqual(len(window.coordinator.calls), 1)
+        self.assertEqual(window._background_generations["snapshot"], 3)
+
+        MainWindow._on_background_task_removed(window, "task-1")
+
+        self.assertEqual(len(window.coordinator.calls), 2)
+        self.assertIs(window.coordinator.calls[1][2], latest_action)
+        self.assertEqual(window.coordinator.calls[1][1], 3)
+        self.assertEqual(window._background_pending, {})
+
+    def test_private_preview_result_is_rejected_after_inputs_change(self) -> None:
+        window = SimpleNamespace(
+            task_expression=SimpleNamespace(text=Mock(return_value="A8")),
+            task_private_days=SimpleNamespace(value=Mock(return_value=3)),
+            task_smart_private=SimpleNamespace(isChecked=Mock(return_value=True)),
+            _replace_info=Mock(),
+            task_output=object(),
+            _smart_preview_lines=Mock(return_value=("preview",)),
+        )
+
+        applied = MainWindow._render_private_preview_if_current(
+            window, "result", "A7", 3
+        )
+
+        self.assertFalse(applied)
+        window._replace_info.assert_not_called()
+
+    def test_full_backup_cancel_before_sqlite_cleans_temporary_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            from tests.helpers import make_test_paths
+
+            paths = make_test_paths(Path(directory))
+            context = OperationContext()
+            service = BackupService(paths)
+            context.request_cancel()
+            with self.assertRaises(TaskCancelled):
+                service.create_full_snapshot("Phase2", context=context)
+            category = paths.backups / "Phase2"
+            self.assertFalse(
+                any(path.name.startswith(".") for path in category.iterdir())
+                if category.is_dir()
+                else False
+            )
+
+    def test_engine_update_cancel_after_backup_never_moves_formal_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            from tests.helpers import make_test_paths
+            from tests.test_engine_update import write_update_zip
+
+            base = Path(directory)
+            paths = make_test_paths(base)
+            archive = base / "new-engine.zip"
+            write_update_zip(archive)
+            context = OperationContext()
+            backup = BackupService(paths)
+            original = backup.create_full_snapshot
+
+            def backup_then_cancel(*args, **kwargs):
+                result = original(*args, **kwargs)
+                context.request_cancel()
+                return result
+
+            backup.create_full_snapshot = backup_then_cancel
+            service = EngineUpdateService(paths, backup)
+            with patch("douk_manager.core.engine_update.shutil.move") as move:
+                with self.assertRaises(TaskCancelled):
+                    service.apply(archive, context=context)
+            move.assert_not_called()
 
 
 class PhaseOneFreezeTests(unittest.TestCase):

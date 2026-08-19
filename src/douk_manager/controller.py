@@ -4,7 +4,7 @@ import logging
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from douk_manager.config import AppConfig, ManagedPaths, application_root, update_config
 from douk_manager.core.backup import BackupService
@@ -31,6 +31,9 @@ from douk_manager.integrations.indexer import IndexResult, IndexService
 from douk_manager.integrations.screenshots import ScreenshotPreview, ScreenshotResult, ScreenshotService
 from douk_manager.logging_setup import setup_logging
 from douk_manager.startup import StartupSafetyResult, StartupState
+
+if TYPE_CHECKING:
+    from douk_manager.operation import OperationContext
 
 
 class ControllerError(RuntimeError):
@@ -142,7 +145,14 @@ class ManagerController:
         if not managed:
             raise ControllerError(f"{operation}不可用：没有管理器持有的运行任务。")
 
-    def health(self, *, check_processes: bool = False) -> dict[str, Any]:
+    def health(
+        self,
+        *,
+        check_processes: bool = False,
+        context: OperationContext | None = None,
+    ) -> dict[str, Any]:
+        if context is not None:
+            context.raise_if_cancelled()
         result: dict[str, Any] = self.paths.health()
         if check_processes:
             self._last_collector_running = self.collector.health()
@@ -186,6 +196,8 @@ class ManagerController:
                 )
             except Exception as exc:
                 result["master_error"] = str(exc)
+        if context is not None:
+            context.raise_if_cancelled()
         return result
 
     def try_startup_backup(self) -> str:
@@ -323,12 +335,18 @@ class ManagerController:
     def preview_selection(self, expression: str):
         return self.tasks.preview(expression)
 
-    def preview_private_skip(self, expression: str, validity_days: int):
+    def preview_private_skip(
+        self,
+        expression: str,
+        validity_days: int,
+        *,
+        context: OperationContext | None = None,
+    ):
         if validity_days < 1 or validity_days > 3650:
             raise ControllerError("私密账号参考期限必须是 1 到 3650 天的整数。")
         requested = self.tasks.preview(expression)
         decisions = self.results.classify_private_reference(
-            requested.selection.numbers, validity_days
+            requested.selection.numbers, validity_days, context=context
         )
         matches = tuple(
             RecentPrivateMatch(
@@ -384,6 +402,14 @@ class ManagerController:
 
     def result_rows(self, *, limit: int = 500):
         return self.results.list_account_rows(limit=limit)
+
+    def result_snapshot(
+        self,
+        *,
+        limit: int = 500,
+        context: OperationContext | None = None,
+    ):
+        return self.results.page_snapshot(limit=limit, context=context)
 
     def generate_batches(
         self, start: int, end: int, size: int, rule: EarliestRule
@@ -528,23 +554,38 @@ class ManagerController:
             task_template=task_path,
         )
 
-    def backup_now(self, category: str = "Manual") -> Path:
+    def backup_now(
+        self,
+        category: str = "Manual",
+        *,
+        context: OperationContext | None = None,
+    ) -> Path:
         self.require_safe_write()
         with critical_section(self.paths.lock_file):
-            result = self.backup.create_full_snapshot(
-                category, {"operation": "manual_full_volume"}
-            )
+            kwargs = {"category": category, "metadata": {"operation": "manual_full_volume"}}
+            if context is not None:
+                kwargs["context"] = context
+            result = self.backup.create_full_snapshot(**kwargs)
         self.logger.info("手动完整 Volume 备份完成：%s", result)
         return result
 
     def preview_engine_update(self, archive: Path) -> EnginePackagePreview:
         return self.engine_updates.preview(archive)
 
-    def apply_engine_update(self, archive: Path) -> EngineUpdateResult:
+    def apply_engine_update(
+        self,
+        archive: Path,
+        *,
+        context: OperationContext | None = None,
+    ) -> EngineUpdateResult:
         self.require_safe_write()
         if self.engine.external_running():
             raise ControllerError("下载引擎正在运行，禁止更新。")
-        result = self.engine_updates.apply(archive)
+        result = (
+            self.engine_updates.apply(archive)
+            if context is None
+            else self.engine_updates.apply(archive, context=context)
+        )
         self.logger.info(
             "下载引擎安全更新完成：ZIP=%s；备份=%s；旧引擎=%s",
             result.archive,
@@ -553,9 +594,12 @@ class ManagerController:
         )
         return result
 
-    def start_collector(self) -> Path:
+    def start_collector(self, *, context: OperationContext | None = None) -> Path:
         self.require_collector_start()
-        self.collector.start()
+        if context is None:
+            self.collector.start()
+        else:
+            self.collector.start(context=context)
         self._last_collector_running = True
         log_path = self.collector.last_log_path or self.paths.logs
         self.logger.info(
@@ -583,40 +627,64 @@ class ManagerController:
         self.logger.info("旧采集器数据迁移：%s", result)
         return result
 
-    def screenshot_preview(self) -> ScreenshotPreview:
-        return self.screenshots.preview(self.paths.screenshot_inbox, self.paths.video_root)
+    def screenshot_preview(
+        self, *, context: OperationContext | None = None
+    ) -> ScreenshotPreview:
+        return self.screenshots.preview(
+            self.paths.screenshot_inbox, self.paths.video_root, context=context
+        )
 
-    def organize_screenshots(self) -> ScreenshotResult:
+    def organize_screenshots(
+        self, *, context: OperationContext | None = None
+    ) -> ScreenshotResult:
         self.require_operational_ready("整理截图")
-        result = self.screenshots.execute(self.paths.screenshot_inbox, self.paths.video_root)
+        result = self.screenshots.execute(
+            self.paths.screenshot_inbox, self.paths.video_root, context=context
+        )
         self.logger.info("截图归档完成：移动%s张", result.moved)
         return result
 
-    def refresh_index(self) -> IndexResult:
+    def refresh_index(self, *, context: OperationContext | None = None) -> IndexResult:
         self.require_operational_ready("刷新索引")
-        result = self.indexer.refresh(
+        arguments = (
             self.paths.video_root,
             self.paths.index_root,
             self.paths.index_refresh_logs,
+        )
+        result = (
+            self.indexer.refresh(*arguments)
+            if context is None
+            else self.indexer.refresh(*arguments, context=context)
         )
         for line in result.display_lines("索引刷新"):
             self.logger.info(line)
         return result
 
-    def cleanup_index(self) -> IndexResult:
+    def cleanup_index(self, *, context: OperationContext | None = None) -> IndexResult:
         self.require_operational_ready("清理失效索引")
-        result = self.indexer.cleanup(
+        arguments = (
             self.paths.video_root,
             self.paths.index_root,
             self.paths.index_cleanup_logs,
+        )
+        result = (
+            self.indexer.cleanup(*arguments)
+            if context is None
+            else self.indexer.cleanup(*arguments, context=context)
         )
         for line in result.display_lines("失效快捷方式清理"):
             self.logger.info(line)
         return result
 
-    def cleanup_index_self_test(self) -> IndexResult:
+    def cleanup_index_self_test(
+        self, *, context: OperationContext | None = None
+    ) -> IndexResult:
         self.require_operational_ready("执行索引清理自检")
-        result = self.indexer.cleanup_self_test()
+        result = (
+            self.indexer.cleanup_self_test()
+            if context is None
+            else self.indexer.cleanup_self_test(context=context)
+        )
         self.logger.info("失效快捷方式清理隔离自检通过")
         return result
 

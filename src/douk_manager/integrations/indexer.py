@@ -5,9 +5,12 @@ import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from douk_manager.config import resource_path
+
+if TYPE_CHECKING:
+    from douk_manager.operation import OperationContext
 
 
 class IndexError(RuntimeError):
@@ -151,6 +154,7 @@ class IndexService:
         index: Path,
         log_root: Path,
         open_folder: bool,
+        context: OperationContext | None = None,
     ) -> IndexResult:
         if os.name != "nt":
             raise IndexError("快捷方式索引仅支持 Windows。")
@@ -177,6 +181,9 @@ class IndexService:
         ]
         if open_folder:
             command.append("-OpenIndexFolderAfterRun")
+        if context is not None:
+            context.raise_if_cancelled()
+            context.enter_critical_phase()
         completed = subprocess.run(
             command,
             capture_output=True,
@@ -199,6 +206,7 @@ class IndexService:
         *,
         open_folder: bool = False,
         prompt_delete_broken: bool = False,
+        context: OperationContext | None = None,
     ) -> IndexResult:
         if os.name != "nt":
             raise IndexError("快捷方式索引仅支持 Windows。")
@@ -222,6 +230,9 @@ class IndexService:
             command.append("-OpenIndexFolderAfterRun")
         if prompt_delete_broken:
             command.append("-PromptDeleteBrokenShortcuts")
+        if context is not None:
+            context.raise_if_cancelled()
+            context.enter_critical_phase()
         completed = subprocess.run(
             command,
             capture_output=True,
@@ -243,12 +254,15 @@ class IndexService:
         log_root: Path,
         *,
         open_folder: bool = False,
+        context: OperationContext | None = None,
     ) -> IndexResult:
         return self._run(
-            "Cleanup-BrokenDoukIndex.ps1", source, index, log_root, open_folder
+            "Cleanup-BrokenDoukIndex.ps1", source, index, log_root, open_folder, context
         )
 
-    def cleanup_self_test(self) -> IndexResult:
+    def cleanup_self_test(
+        self, *, context: OperationContext | None = None
+    ) -> IndexResult:
         """Exercise the production cleanup script in an isolated temp folder."""
 
         if os.name != "nt":
@@ -258,6 +272,9 @@ class IndexService:
         )
         if not script.is_file():
             raise IndexError(f"清理自检脚本缺失：{script}")
+        if context is not None:
+            context.raise_if_cancelled()
+            context.enter_critical_phase()
         completed = subprocess.run(
             [
                 "powershell.exe",

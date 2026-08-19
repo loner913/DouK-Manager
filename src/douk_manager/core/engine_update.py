@@ -9,10 +9,14 @@ import zipfile
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING
 
 from douk_manager.config import ManagedPaths
 from douk_manager.core.backup import BackupService, sha256_file, sqlite_quick_check
 from douk_manager.core.json_store import read_json
+
+if TYPE_CHECKING:
+    from douk_manager.operation import OperationContext
 
 
 class EngineUpdateError(RuntimeError):
@@ -64,7 +68,14 @@ class EngineUpdateService:
     def preview(self, archive: Path) -> EnginePackagePreview:
         return self._analyse(archive).preview
 
-    def apply(self, archive: Path) -> EngineUpdateResult:
+    def apply(
+        self,
+        archive: Path,
+        *,
+        context: OperationContext | None = None,
+    ) -> EngineUpdateResult:
+        if context is not None:
+            context.raise_if_cancelled()
         analysis = self._analyse(archive)
         preview = analysis.preview
         self.backup.validate_live_data()
@@ -78,15 +89,18 @@ class EngineUpdateService:
 
         critical_before = self._critical_hashes()
         old_main_sha256 = sha256_file(self.paths.engine_exe)
-        backup_path = self.backup.create_full_snapshot(
-            "BeforeEngineUpdate",
-            {
+        backup_kwargs = {
+            "category": "BeforeEngineUpdate",
+            "metadata": {
                 "archive": str(preview.archive),
                 "archive_sha256": preview.archive_sha256,
                 "old_main_sha256": old_main_sha256,
             },
-            keep_latest=2,
-        )
+            "keep_latest": 2,
+        }
+        backup_path = self.backup.create_full_snapshot(**backup_kwargs)
+        if context is not None:
+            context.raise_if_cancelled()
 
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
         staging = self.paths.updates / "EngineStaging" / f"{stamp}-{uuid.uuid4().hex}"
@@ -110,6 +124,9 @@ class EngineUpdateService:
             elif packaged_volume.exists():
                 packaged_volume.unlink()
             new_main_sha256 = sha256_file(new_exe)
+
+            if context is not None:
+                context.enter_critical_phase()
 
             shutil.move(str(self.paths.engine_exe), str(old_exe))
             shutil.move(str(current_internal), str(old_internal))
