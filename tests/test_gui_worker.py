@@ -813,6 +813,51 @@ class ActionWorkerTests(unittest.TestCase):
         event.accept.assert_not_called()
         window.deleteLater()
 
+    def test_close_retries_after_managed_collector_stop_task_is_removed(self) -> None:
+        window = self._window_harness()
+        controller = ManagerController.__new__(ManagerController)
+        controller.startup_state = StartupState.READY
+        controller.engine = SimpleNamespace(current=None)
+        controller.collector = SimpleNamespace(process=object())
+        controller.logger = SimpleNamespace(info=lambda *_args: None)
+
+        def stop_collector() -> None:
+            controller.collector.process = None
+
+        controller.stop_collector = stop_collector
+        window.controller = controller
+        window._safe_widgets = []
+        window._path_widgets = []
+        window._dangerous_widgets = []
+        window._background_bindings = {}
+        window._background_generations = {}
+        window._background_pending = {}
+        window._collector_stop_task_id = None
+        window.queue_current = None
+        window.download_summary_thread = None
+        window.background_thread = None
+        window.coordinator.task_settled.connect(window._on_background_task_settled)
+        window.coordinator.task_removed.connect(window._on_background_task_removed)
+        window.coordinator.idle.connect(window._on_background_tasks_idle)
+
+        try:
+            window.show()
+            window.close()
+            for _ in range(300):
+                self.app.processEvents()
+                if not window.isVisible() and not window.coordinator.has_active_tasks():
+                    break
+                QTest.qWait(10)
+
+            self.assertFalse(window.isVisible())
+            self.assertFalse(window.coordinator.has_active_tasks())
+            self.assertIsNone(controller.collector.process)
+            self.assertIs(controller.startup_state, StartupState.CLOSING)
+        finally:
+            window.hide()
+            window.deleteLater()
+            self.app.processEvents()
+
     def test_close_during_startup_requests_cooperative_cancel_without_waiting(self) -> None:
         window = self._window_harness()
         window.queue_current = None

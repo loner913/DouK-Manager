@@ -3434,6 +3434,7 @@ class MainWindow(QMainWindow):
     def _start_collector_stop_on_close(self) -> None:
         if self._collector_stop_task_id is not None:
             return
+        stop_succeeded = {"value": False}
         spec = TaskSpec(
             task_type="collector_stop_on_close",
             display_name="关闭前停止采集服务",
@@ -3445,10 +3446,16 @@ class MainWindow(QMainWindow):
         )
 
         def success(_result: object) -> None:
+            stop_succeeded["value"] = True
             self._collector_stop_task_id = None
-            if self.coordinator.has_active_tasks():
+
+        def finish_after_removal() -> None:
+            if not stop_succeeded["value"]:
                 return
-            QTimer.singleShot(0, self.close)
+            if self.coordinator.has_active_tasks():
+                self._close_pending = True
+            else:
+                QTimer.singleShot(0, self.close)
 
         def failure(payload: object) -> None:
             self._collector_stop_task_id = None
@@ -3464,6 +3471,7 @@ class MainWindow(QMainWindow):
             lambda _token: self.controller.stop_collector(),
             on_success=success,
             on_failure=failure,
+            on_removed=finish_after_removal,
             allow_during_closing=True,
         )
 
