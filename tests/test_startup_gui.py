@@ -17,6 +17,7 @@ from PySide6.QtWidgets import QApplication, QPushButton
 
 from douk_manager import app as app_module
 from douk_manager.background import TaskFailure, TaskRejectedError, TaskState
+from douk_manager.core.engine import ProcessProbe, ProcessProbeState
 from douk_manager.gui import MainWindow
 from douk_manager.startup import StartupSafetyResult, StartupStage, StartupState
 
@@ -269,6 +270,116 @@ class StartupGuiTests(unittest.TestCase):
             window._refresh_status()
             window.refresh_all.assert_called_once_with(check_processes=True)
             self._dispose_window(window)
+
+    def test_degraded_runtime_diagnostic_remains_available_without_enabling_actions(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window = self._window(Path(directory))
+            try:
+                window.controller.startup_state = StartupState.DEGRADED_READ_ONLY
+                window._apply_action_gate()
+                self.assertFalse(window.result_refresh_button.isEnabled())
+                self.assertTrue(window.refresh_status_button.isEnabled())
+                self.assertTrue(
+                    all(not widget.isEnabled() for widget in window._dangerous_widgets)
+                )
+                submit = Mock()
+                window._submit_coalesced_background = submit
+
+                window._refresh_status()
+
+                submit.assert_called_once()
+                spec = submit.call_args.args[0]
+                self.assertEqual(spec.task_type, "runtime_status_snapshot")
+                self.assertEqual(spec.refresh_targets, ())
+                on_success = submit.call_args.kwargs["on_success"]
+                with patch.object(
+                    window.controller.engine,
+                    "probe_external_running",
+                    return_value=ProcessProbe(
+                        ProcessProbeState.UNKNOWN,
+                        "synthetic external process uncertainty",
+                    ),
+                ), patch.object(window.controller.collector, "health", return_value=False):
+                    health = window.controller.health(check_processes=True)
+                self.assertTrue(health["engine_running"])
+
+                on_success(health)
+
+                self.assertFalse(window.monitor_start_button.isEnabled())
+                self.assertFalse(window.result_refresh_button.isEnabled())
+                self.assertTrue(window.refresh_status_button.isEnabled())
+                self.assertTrue(
+                    all(not widget.isEnabled() for widget in window._dangerous_widgets)
+                )
+            finally:
+                self._dispose_window(window)
+
+    def test_degraded_result_schedulers_are_ready_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window = self._window(Path(directory))
+            window.controller.startup_state = StartupState.DEGRADED_READ_ONLY
+            window.refresh_results = Mock()
+            window.refresh_tasks = Mock()
+            window.result_refresh_timer = SimpleNamespace(start=Mock())
+
+            for trigger in (
+                lambda: window._tab_changed(window.result_tab_index),
+                window._schedule_result_refresh,
+                window._refresh_results_if_startup_applied,
+                window._refresh_noncritical_after_startup,
+            ):
+                with self.subTest(trigger=trigger):
+                    window.refresh_results.reset_mock()
+                    window.refresh_tasks.reset_mock()
+                    window.result_refresh_timer.start.reset_mock()
+                    generations = dict(window._background_generations)
+                    pending = dict(window._background_pending)
+                    bindings = dict(window._background_bindings)
+
+                    trigger()
+
+                    window.refresh_results.assert_not_called()
+                    window.refresh_tasks.assert_not_called()
+                    window.result_refresh_timer.start.assert_not_called()
+                    self.assertEqual(window._background_generations, generations)
+                    self.assertEqual(window._background_pending, pending)
+                    self.assertEqual(window._background_bindings, bindings)
+                    self.assertFalse(window.coordinator.has_active_tasks())
+            self._dispose_window(window)
+
+    def test_degraded_startup_delayed_refresh_does_not_submit_read_only_tasks(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window = self._window(Path(directory))
+            try:
+                window.refresh_results = Mock()
+                window.refresh_tasks = Mock()
+                generations = dict(window._background_generations)
+                pending = dict(window._background_pending)
+                bindings = dict(window._background_bindings)
+                self.assertTrue(window.controller.begin_startup_check(1))
+
+                window.apply_startup_result(
+                    make_result(
+                        1,
+                        success=False,
+                        state=StartupState.DEGRADED_READ_ONLY,
+                        summary="synthetic degraded state",
+                    )
+                )
+                self.app.processEvents()
+
+                window.refresh_results.assert_not_called()
+                window.refresh_tasks.assert_not_called()
+                self.assertEqual(window._background_generations, generations)
+                self.assertEqual(window._background_pending, pending)
+                self.assertEqual(window._background_bindings, bindings)
+                self.assertFalse(window.coordinator.has_active_tasks())
+            finally:
+                self._dispose_window(window)
 
     def test_degraded_result_disables_dangerous_controls_but_keeps_path_repair_and_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

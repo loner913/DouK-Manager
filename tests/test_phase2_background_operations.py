@@ -51,6 +51,25 @@ else:
     OPERATION_IMPORT_ERROR = None
 
 
+def dispose_test_coordinator(
+    app: QCoreApplication,
+    coordinator: BackgroundTaskCoordinator,
+) -> None:
+    if coordinator.has_active_tasks():
+        raise AssertionError("cannot dispose a coordinator with active records")
+    if coordinator.findChildren(QThread):
+        raise AssertionError("cannot dispose a coordinator with live QThreads")
+    coordinator.task_settled.disconnect()
+    coordinator.task_removed.disconnect()
+    destroyed: list[bool] = []
+    coordinator.destroyed.connect(lambda *_args: destroyed.append(True))
+    coordinator.deleteLater()
+    QCoreApplication.sendPostedEvents(coordinator, QEvent.Type.DeferredDelete)
+    app.processEvents()
+    if destroyed != [True]:
+        raise AssertionError("coordinator DeferredDelete was not processed")
+
+
 class OperationContractTests(unittest.TestCase):
     def require_context(self) -> tuple[Any, Any]:
         self.assertIsNone(
@@ -374,6 +393,168 @@ class MainWindowBackgroundBindingTests(unittest.TestCase):
         removed.assert_called_once_with()
         window._apply_action_gate.assert_called_once_with()
 
+    def test_settled_parent_admits_eight_resource_runtime_refresh_before_removal(
+        self,
+    ) -> None:
+        app = QCoreApplication.instance() or QCoreApplication([])
+        coordinator = BackgroundTaskCoordinator()
+        runtime_resources = frozenset(
+            {
+                "engine_process",
+                "collector_process",
+                "engine_files",
+                "volume",
+                "settings",
+                "video_tree",
+                "index",
+                "collector_data",
+            }
+        )
+        window = SimpleNamespace(
+            coordinator=coordinator,
+            controller=SimpleNamespace(
+                startup_state=StartupState.READY,
+                logger=Mock(),
+            ),
+            _background_bindings={},
+            _background_generations={},
+            _background_pending={},
+            _cancel_shutdown_for_new_work=Mock(),
+            _append_info=Mock(),
+            _apply_action_gate=Mock(),
+            statusBar=Mock(return_value=SimpleNamespace(showMessage=Mock())),
+        )
+        window._background_binding_is_current = lambda binding, generation: (
+            MainWindow._background_binding_is_current(window, binding, generation)
+        )
+        window._refresh_background_targets = lambda targets: (
+            MainWindow._refresh_background_targets(window, targets)
+        )
+
+        parent_task_id: list[str] = []
+        diagnostic_task_id: list[str] = []
+        admission_state: list[tuple[bool, bool, bool]] = []
+        diagnostic_success = Mock()
+        diagnostic_started = threading.Event()
+        diagnostic_admitted_before_parent_removal = threading.Event()
+        release_diagnostic = threading.Event()
+        settlements: list[tuple[object, ...]] = []
+        removals: list[str] = []
+
+        diagnostic_spec = TaskSpec(
+            task_type="runtime_status_snapshot",
+            display_name="refresh runtime status",
+            resource_keys=runtime_resources,
+            deduplicate_key="runtime_status_snapshot",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            refresh_targets=(),
+            dynamic_cancellation=True,
+        )
+
+        def refresh_status() -> None:
+            parent_record = coordinator._records[parent_task_id[0]]
+            admission_state.append(
+                (
+                    parent_record.terminal_seen,
+                    parent_record.thread_finished_seen,
+                    parent_task_id[0] in coordinator._records,
+                )
+            )
+
+            def diagnose(_context: object) -> dict[str, bool]:
+                diagnostic_started.set()
+                if not release_diagnostic.wait(timeout=3):
+                    raise AssertionError("test did not release runtime diagnostic")
+                return {"safe": True}
+
+            task_id = MainWindow._submit_background(
+                window,
+                diagnostic_spec,
+                diagnose,
+                on_success=diagnostic_success,
+                generation_key="runtime_status_snapshot",
+            )
+            if task_id is not None:
+                diagnostic_task_id.append(task_id)
+
+        window._refresh_status = refresh_status
+        coordinator.task_settled.connect(
+            lambda *args: MainWindow._on_background_task_settled(window, *args)
+        )
+        coordinator.task_removed.connect(
+            lambda task_id: MainWindow._on_background_task_removed(window, task_id)
+        )
+
+        def observe_settled(*args: object) -> None:
+            settlements.append(args)
+            if not parent_task_id or args[0] != parent_task_id[0]:
+                return
+            parent_record = coordinator._records[parent_task_id[0]]
+            self.assertTrue(parent_record.terminal_seen)
+            self.assertFalse(parent_record.thread_finished_seen)
+            self.assertEqual(len(diagnostic_task_id), 1)
+            child_id = diagnostic_task_id[0]
+            child_record = coordinator._records[child_id]
+            child_binding = window._background_bindings[child_id]
+            self.assertFalse(child_record.terminal_seen)
+            self.assertEqual(child_binding.generation, child_record.generation)
+            self.assertEqual(
+                window._background_generations[child_binding.generation_key],
+                child_record.generation,
+            )
+            diagnostic_admitted_before_parent_removal.set()
+            release_diagnostic.set()
+
+        coordinator.task_settled.connect(observe_settled)
+        coordinator.task_removed.connect(removals.append)
+
+        parent_spec = TaskSpec(
+            task_type="parent_write",
+            display_name="parent write",
+            resource_keys=runtime_resources,
+            deduplicate_key="parent_write",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            refresh_targets=("runtime_status",),
+            dynamic_cancellation=True,
+        )
+        submitted_parent = MainWindow._submit_background(
+            window,
+            parent_spec,
+            lambda _context: {"parent": "settled"},
+            generation_key="parent_write",
+        )
+        self.assertIsNotNone(submitted_parent)
+        parent_task_id.append(submitted_parent)
+
+        for _ in range(2000):
+            app.processEvents()
+            if not coordinator.has_active_tasks():
+                break
+        for _ in range(2000):
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            app.processEvents()
+            if not coordinator.findChildren(QThread):
+                break
+
+        self.assertEqual(admission_state, [(True, False, True)])
+        self.assertEqual(len(diagnostic_task_id), 1)
+        self.assertTrue(diagnostic_started.is_set())
+        self.assertTrue(diagnostic_admitted_before_parent_removal.is_set())
+        diagnostic_success.assert_called_once_with({"safe": True})
+        self.assertEqual(
+            [entry[0] for entry in settlements],
+            [parent_task_id[0], diagnostic_task_id[0]],
+        )
+        self.assertEqual(set(removals), {parent_task_id[0], diagnostic_task_id[0]})
+        self.assertFalse(coordinator.has_active_tasks())
+        self.assertEqual(window._background_bindings, {})
+        self.assertEqual(window._background_pending, {})
+        self.assertFalse(coordinator.findChildren(QThread))
+        dispose_test_coordinator(app, coordinator)
+        window.coordinator = None
+
     def test_failure_cancel_and_request_cancel_are_dispatched(self) -> None:
         window = self._window()
         failed = Mock()
@@ -453,6 +634,494 @@ class MainWindowBackgroundBindingTests(unittest.TestCase):
             window, task_id, 1, OperationProgress("scan", "closing")
         )
         self.assertFalse(progressed.called)
+
+
+class ReadOnlyEntryCoordinatorContractTests(unittest.TestCase):
+    RUNTIME_RESOURCES = frozenset(
+        {
+            "engine_process",
+            "collector_process",
+            "engine_files",
+            "volume",
+            "settings",
+            "video_tree",
+            "index",
+            "collector_data",
+        }
+    )
+
+    @staticmethod
+    def _window(state: StartupState = StartupState.READY) -> SimpleNamespace:
+        controller = SimpleNamespace(
+            startup_state=state,
+            logger=Mock(),
+            result_snapshot=Mock(return_value="result-payload"),
+            list_tasks=Mock(return_value=(Path("Task_A1.json"),)),
+            preview_private_skip=Mock(return_value="private-payload"),
+            screenshot_preview=Mock(
+                return_value=SimpleNamespace(
+                    recognized_folders=1,
+                    recognized_images=2,
+                    movable=2,
+                    missing_account_folder=0,
+                    already_existing=0,
+                    unmatched_folders=0,
+                )
+            ),
+            runtime_status_snapshot=Mock(return_value={"engine_running": False}),
+        )
+        window = SimpleNamespace(
+            coordinator=_BindingCoordinator(),
+            controller=controller,
+            _background_bindings={},
+            _background_generations={"unrelated": 9},
+            _background_pending={"unrelated": object()},
+            _cancel_shutdown_for_new_work=Mock(),
+            _append_info=Mock(),
+            _apply_action_gate=Mock(),
+            _refresh_background_targets=Mock(),
+            statusBar=Mock(return_value=SimpleNamespace(showMessage=Mock())),
+            refresh_all=lambda **_kwargs: None,
+            result_table=object(),
+            result_refresh_button=SimpleNamespace(setEnabled=Mock()),
+            task_list=object(),
+            task_refresh_button=SimpleNamespace(setEnabled=Mock()),
+            task_smart_private=SimpleNamespace(isChecked=Mock(return_value=True)),
+            task_expression=SimpleNamespace(text=Mock(return_value="A1-A3")),
+            task_private_days=SimpleNamespace(value=Mock(return_value=30)),
+            task_output=object(),
+            task_preview_button=SimpleNamespace(setEnabled=Mock()),
+            post_output=object(),
+            screenshot_preview_button=SimpleNamespace(setEnabled=Mock()),
+            refresh_status_button=SimpleNamespace(setEnabled=Mock()),
+            _render_result_snapshot=Mock(),
+            _render_task_paths=Mock(),
+            _render_private_preview_if_current=Mock(return_value=True),
+            _render_health_snapshot=Mock(),
+            _replace_info=Mock(),
+        )
+        window._background_binding_is_current = lambda binding, generation: (
+            MainWindow._background_binding_is_current(window, binding, generation)
+        )
+        window._submit_background = lambda *args, **kwargs: MainWindow._submit_background(
+            window, *args, **kwargs
+        )
+        window._submit_coalesced_background = (
+            lambda *args, **kwargs: MainWindow._submit_coalesced_background(
+                window, *args, **kwargs
+            )
+        )
+        return window
+
+    @staticmethod
+    def _invoke(window: SimpleNamespace, entry: str) -> None:
+        entries = {
+            "result": MainWindow.refresh_results,
+            "task": MainWindow.refresh_tasks,
+            "private": MainWindow._preview_task,
+            "screenshot": MainWindow._preview_screenshots,
+            "runtime": MainWindow._refresh_status,
+        }
+        entries[entry](window)
+
+    def test_ready_real_entries_submit_exact_specs_context_and_one_direct_render(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "result",
+                "result_page_snapshot",
+                "刷新下载结果",
+                {"result_logs"},
+                "result_page_snapshot",
+            ),
+            (
+                "task",
+                "task_list_snapshot",
+                "刷新任务列表",
+                {"task_templates", "settings"},
+                "task_list_snapshot",
+            ),
+            (
+                "private",
+                "private_preview",
+                "智能私密预览",
+                {"result_logs", "settings"},
+                "private_preview",
+            ),
+            (
+                "screenshot",
+                "screenshot_preview",
+                "预览截图归档",
+                {"screenshots", "video_tree"},
+                "screenshot_preview",
+            ),
+        )
+        for entry, task_type, display_name, resources, deduplicate_key in cases:
+            with self.subTest(entry=entry):
+                window = self._window()
+                self._invoke(window, entry)
+
+                self.assertEqual(len(window.coordinator.calls), 1)
+                spec, generation, action = window.coordinator.calls[0]
+                self.assertEqual(spec.task_type, task_type)
+                self.assertEqual(spec.display_name, display_name)
+                self.assertEqual(spec.resource_keys, frozenset(resources))
+                self.assertEqual(spec.deduplicate_key, deduplicate_key)
+                self.assertTrue(spec.cancellable)
+                self.assertIs(spec.close_policy, ClosePolicy.CANCEL)
+                self.assertEqual(spec.refresh_targets, ())
+                self.assertTrue(spec.dynamic_cancellation)
+                self.assertFalse(spec.critical_write_started)
+                self.assertFalse(spec.allow_during_closing)
+                self.assertEqual(generation, 1)
+
+                context = Mock(name=f"{entry}_context")
+                payload = action(context)
+                task_id = next(iter(window._background_bindings))
+                self.assertEqual(
+                    window._background_bindings[task_id].generation_key,
+                    deduplicate_key,
+                )
+                MainWindow._on_background_task_settled(
+                    window, task_id, generation, TaskState.SUCCEEDED, payload
+                )
+                if entry == "result":
+                    window.controller.result_snapshot.assert_called_once_with(
+                        limit=500, context=context
+                    )
+                    window._render_result_snapshot.assert_called_once_with(payload)
+                elif entry == "task":
+                    window.controller.list_tasks.assert_called_once_with(context=context)
+                    window._render_task_paths.assert_called_once_with(tuple(payload))
+                elif entry == "private":
+                    window.controller.preview_private_skip.assert_called_once_with(
+                        "A1-A3", 30, context=context
+                    )
+                    window._render_private_preview_if_current.assert_called_once_with(
+                        payload, "A1-A3", 30
+                    )
+                else:
+                    window.controller.screenshot_preview.assert_called_once_with(
+                        context=context
+                    )
+                    window._replace_info.assert_called_once()
+                window._refresh_background_targets.assert_called_once_with(())
+
+    def test_non_ready_read_only_entries_leave_all_admission_and_ui_state_unchanged(
+        self,
+    ) -> None:
+        blocked_states = (
+            StartupState.DEGRADED_READ_ONLY,
+            StartupState.BOOTSTRAPPING,
+            StartupState.SAFETY_CHECKING,
+            StartupState.CLOSING,
+        )
+        for state in blocked_states:
+            for entry in ("result", "task", "private", "screenshot"):
+                with self.subTest(state=state, entry=entry):
+                    window = self._window(state)
+                    generations = dict(window._background_generations)
+                    pending = dict(window._background_pending)
+                    bindings = dict(window._background_bindings)
+
+                    self._invoke(window, entry)
+
+                    self.assertEqual(window.coordinator.calls, [])
+                    self.assertEqual(window._background_generations, generations)
+                    self.assertEqual(window._background_pending, pending)
+                    self.assertEqual(window._background_bindings, bindings)
+                    window._append_info.assert_not_called()
+                    window._replace_info.assert_not_called()
+                    window._render_result_snapshot.assert_not_called()
+                    window._render_task_paths.assert_not_called()
+                    window._render_private_preview_if_current.assert_not_called()
+                    for button in (
+                        window.result_refresh_button,
+                        window.task_refresh_button,
+                        window.task_preview_button,
+                        window.screenshot_preview_button,
+                    ):
+                        button.setEnabled.assert_not_called()
+
+    def test_runtime_diagnostic_state_gate_and_exact_eight_resource_conflicts(
+        self,
+    ) -> None:
+        for state in (StartupState.READY, StartupState.DEGRADED_READ_ONLY):
+            with self.subTest(allowed=state):
+                window = self._window(state)
+                self._invoke(window, "runtime")
+                self.assertEqual(len(window.coordinator.calls), 1)
+
+        for state in (
+            StartupState.BOOTSTRAPPING,
+            StartupState.SAFETY_CHECKING,
+            StartupState.CLOSING,
+        ):
+            with self.subTest(blocked=state):
+                window = self._window(state)
+                generations = dict(window._background_generations)
+                pending = dict(window._background_pending)
+                self._invoke(window, "runtime")
+                self.assertEqual(window.coordinator.calls, [])
+                self.assertEqual(window._background_generations, generations)
+                self.assertEqual(window._background_pending, pending)
+                window._render_health_snapshot.assert_not_called()
+                window.refresh_status_button.setEnabled.assert_not_called()
+
+        window = self._window()
+        self._invoke(window, "runtime")
+        spec, _generation, action = window.coordinator.calls[0]
+        self.assertEqual(spec.task_type, "runtime_status_snapshot")
+        self.assertEqual(spec.display_name, "刷新运行状态")
+        self.assertEqual(spec.deduplicate_key, "runtime_status_snapshot")
+        self.assertEqual(spec.resource_keys, self.RUNTIME_RESOURCES)
+        self.assertNotIn("runtime_status", spec.resource_keys)
+        self.assertNotIn("static_paths", spec.resource_keys)
+        self.assertEqual(spec.refresh_targets, ())
+        self.assertTrue(spec.cancellable)
+        self.assertIs(spec.close_policy, ClosePolicy.CANCEL)
+        self.assertTrue(spec.dynamic_cancellation)
+        runtime_task_id = next(iter(window._background_bindings))
+        self.assertEqual(
+            window._background_bindings[runtime_task_id].generation_key,
+            "runtime_status_snapshot",
+        )
+        context = Mock(name="runtime_context")
+        self.assertEqual(action(context), {"engine_running": False})
+        window.controller.runtime_status_snapshot.assert_called_once_with(context=context)
+
+        for resource in sorted(self.RUNTIME_RESOURCES):
+            with self.subTest(conflict=resource):
+                coordinator = BackgroundTaskCoordinator()
+                coordinator._records["writer"] = TaskRecord(
+                    task_id="writer",
+                    spec=TaskSpec(
+                        task_type=f"{resource}_writer",
+                        display_name=f"{resource} writer",
+                        resource_keys=frozenset({resource}),
+                        deduplicate_key=f"{resource}_writer",
+                    ),
+                    generation=1,
+                    token=CancellationToken(),
+                    thread=None,
+                    worker=None,
+                    state=TaskState.RUNNING,
+                )
+                with self.assertRaisesRegex(TaskRejectedError, resource):
+                    coordinator._validate_start(spec)
+
+        coordinator = BackgroundTaskCoordinator()
+        coordinator._records["result-reader"] = TaskRecord(
+            task_id="result-reader",
+            spec=TaskSpec(
+                task_type="result-reader",
+                display_name="result reader",
+                resource_keys=frozenset({"result_logs"}),
+                deduplicate_key="result-reader",
+            ),
+            generation=1,
+            token=CancellationToken(),
+            thread=None,
+            worker=None,
+            state=TaskState.RUNNING,
+        )
+        coordinator._validate_start(spec)
+
+    def test_result_private_and_screenshot_resource_conflicts_are_symmetric(
+        self,
+    ) -> None:
+        specs: dict[str, TaskSpec] = {}
+        for entry in ("result", "task", "private", "screenshot"):
+            window = self._window()
+            self._invoke(window, entry)
+            specs[entry] = window.coordinator.calls[0][0]
+
+        summary = TaskSpec(
+            task_type="download_summary",
+            display_name="summary",
+            resource_keys=frozenset({"task_logs", "result_logs"}),
+            deduplicate_key="summary:run",
+        )
+        settings_write = TaskSpec(
+            task_type="settings_write",
+            display_name="settings write",
+            resource_keys=frozenset({"settings"}),
+            deduplicate_key="settings_write",
+        )
+        screenshot_archive = TaskSpec(
+            task_type="screenshot_archive",
+            display_name="archive screenshots",
+            resource_keys=frozenset({"screenshots", "video_tree"}),
+            deduplicate_key="screenshot_archive",
+        )
+        index_refresh = TaskSpec(
+            task_type="index_refresh",
+            display_name="refresh index",
+            resource_keys=frozenset({"video_tree", "index"}),
+            deduplicate_key="index_refresh",
+        )
+
+        for left, right, resource in (
+            (specs["result"], summary, "result_logs"),
+            (specs["task"], settings_write, "settings"),
+            (specs["private"], summary, "result_logs"),
+            (specs["private"], settings_write, "settings"),
+            (specs["screenshot"], screenshot_archive, "screenshots"),
+            (specs["screenshot"], index_refresh, "video_tree"),
+        ):
+            for active, candidate in ((left, right), (right, left)):
+                coordinator = BackgroundTaskCoordinator()
+                coordinator._records["active"] = TaskRecord(
+                    task_id="active",
+                    spec=active,
+                    generation=1,
+                    token=CancellationToken(),
+                    thread=None,
+                    worker=None,
+                    state=TaskState.RUNNING,
+                )
+                with self.assertRaisesRegex(TaskRejectedError, resource):
+                    coordinator._validate_start(candidate)
+
+        coordinator = BackgroundTaskCoordinator()
+        coordinator._records["result-reader"] = TaskRecord(
+            task_id="result-reader",
+            spec=TaskSpec(
+                task_type="result-reader",
+                display_name="result reader",
+                resource_keys=frozenset({"result_logs"}),
+                deduplicate_key="result-reader",
+            ),
+            generation=1,
+            token=CancellationToken(),
+            thread=None,
+            worker=None,
+            state=TaskState.RUNNING,
+        )
+        coordinator._validate_start(specs["task"])
+
+    def test_rejected_resource_admission_does_not_replace_generation_or_binding(
+        self,
+    ) -> None:
+        for entry in ("result", "private", "screenshot"):
+            with self.subTest(entry=entry):
+                window = self._window()
+                sentinel = SimpleNamespace(generation_key="settings_write")
+                window._background_bindings["existing"] = sentinel
+                window.coordinator.error = TaskRejectedError("synthetic resource conflict")
+                generations = dict(window._background_generations)
+                pending = dict(window._background_pending)
+                bindings = dict(window._background_bindings)
+
+                self._invoke(window, entry)
+
+                self.assertEqual(window._background_generations, generations)
+                self.assertEqual(window._background_pending, pending)
+                self.assertEqual(window._background_bindings, bindings)
+                window._render_result_snapshot.assert_not_called()
+                window._render_private_preview_if_current.assert_not_called()
+                window._replace_info.assert_not_called()
+
+    def test_stale_or_closing_callbacks_only_remove_read_only_bindings(self) -> None:
+        for entry in ("result", "task", "private", "screenshot", "runtime"):
+            for terminal_mode in ("stale", "closing"):
+                with self.subTest(entry=entry, terminal_mode=terminal_mode):
+                    window = self._window()
+                    self._invoke(window, entry)
+                    task_id = next(iter(window._background_bindings))
+                    binding = window._background_bindings[task_id]
+                    if terminal_mode == "stale":
+                        window._background_generations[binding.generation_key] = 2
+                    else:
+                        window.controller.startup_state = StartupState.CLOSING
+
+                    MainWindow._on_background_task_settled(
+                        window,
+                        task_id,
+                        binding.generation,
+                        TaskState.SUCCEEDED,
+                        SimpleNamespace(
+                            recognized_folders=1,
+                            recognized_images=1,
+                            movable=1,
+                            missing_account_folder=0,
+                            already_existing=0,
+                            unmatched_folders=0,
+                        ),
+                    )
+                    MainWindow._on_background_task_removed(window, task_id)
+
+                    self.assertNotIn(task_id, window._background_bindings)
+                    self.assertEqual(len(window.coordinator.calls), 1)
+                    window._render_result_snapshot.assert_not_called()
+                    window._render_task_paths.assert_not_called()
+                    window._render_private_preview_if_current.assert_not_called()
+                    window._render_health_snapshot.assert_not_called()
+                    window._replace_info.assert_not_called()
+                    window._refresh_background_targets.assert_not_called()
+
+    def test_result_and_private_rapid_requests_render_only_latest_generation(
+        self,
+    ) -> None:
+        for entry in ("result", "private"):
+            with self.subTest(entry=entry):
+                window = self._window()
+                self._invoke(window, entry)
+                first_task_id = next(iter(window._background_bindings))
+                self._invoke(window, entry)
+                self._invoke(window, entry)
+                key = (
+                    "result_page_snapshot" if entry == "result" else "private_preview"
+                )
+                self.assertEqual(window._background_generations[key], 3)
+                self.assertEqual(window._background_pending[key].generation, 3)
+                self.assertEqual(
+                    window.coordinator.cancelled,
+                    [first_task_id, first_task_id],
+                )
+
+                MainWindow._on_background_task_settled(
+                    window, first_task_id, 1, TaskState.SUCCEEDED, "old"
+                )
+                MainWindow._on_background_task_removed(window, first_task_id)
+                latest_task_id = next(
+                    task_id
+                    for task_id in window._background_bindings
+                    if task_id != "existing"
+                )
+                MainWindow._on_background_task_settled(
+                    window, latest_task_id, 3, TaskState.SUCCEEDED, "latest"
+                )
+
+                if entry == "result":
+                    window._render_result_snapshot.assert_called_once_with("latest")
+                else:
+                    window._render_private_preview_if_current.assert_called_once_with(
+                        "latest", "A1-A3", 30
+                    )
+                window._refresh_background_targets.assert_called_once_with(())
+
+    def test_cancelled_screenshot_and_runtime_scans_never_write_old_ui(self) -> None:
+        for entry in ("screenshot", "runtime"):
+            with self.subTest(entry=entry):
+                window = self._window()
+                self._invoke(window, entry)
+                task_id = next(iter(window._background_bindings))
+                binding = window._background_bindings[task_id]
+
+                MainWindow._on_background_task_settled(
+                    window,
+                    task_id,
+                    binding.generation,
+                    TaskState.CANCELLED,
+                    "cancelled at deterministic scan checkpoint",
+                )
+
+                window._append_info.assert_not_called()
+                window._replace_info.assert_not_called()
+                window._render_health_snapshot.assert_not_called()
+                window._refresh_background_targets.assert_not_called()
 
 
 class DownloadSummaryCoordinatorCorrectionTests(unittest.TestCase):
@@ -649,6 +1318,9 @@ class DownloadSummaryCoordinatorCorrectionTests(unittest.TestCase):
         window._finish_run_after_summary.assert_called_once_with(
             run, binding.assessment
         )
+        thread = None
+        dispose_test_coordinator(app, coordinator)
+        window.coordinator = None
 
     def test_real_gui_result_reader_and_summary_conflicts_recover_both_ways(
         self,
@@ -732,15 +1404,16 @@ class DownloadSummaryCoordinatorCorrectionTests(unittest.TestCase):
         coordinator.task_removed.connect(
             lambda task_id: MainWindow._on_background_task_removed(window, task_id)
         )
-        retained_threads: list[QThread] = []
         destroyed: list[str] = []
+        expected_destroyed = 0
 
         def retain_current_thread(label: str) -> str:
+            nonlocal expected_destroyed
             self.assertEqual(len(coordinator._records), 1)
             record = next(iter(coordinator._records.values()))
             self.assertIsNotNone(record.thread)
-            retained_threads.append(record.thread)
             record.thread.destroyed.connect(lambda *_: destroyed.append(label))
+            expected_destroyed += 1
             return record.task_id
 
         def drain_current_task(done: threading.Event) -> None:
@@ -753,7 +1426,7 @@ class DownloadSummaryCoordinatorCorrectionTests(unittest.TestCase):
             for _ in range(1000):
                 QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
                 app.processEvents()
-                if len(destroyed) == len(retained_threads):
+                if len(destroyed) == expected_destroyed:
                     break
 
         try:
@@ -813,7 +1486,7 @@ class DownloadSummaryCoordinatorCorrectionTests(unittest.TestCase):
             for _ in range(1000):
                 QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
                 app.processEvents()
-                if len(destroyed) == len(retained_threads):
+                if len(destroyed) == expected_destroyed:
                     break
 
         self.assertEqual(reader_calls, [1, 2])
@@ -823,6 +1496,8 @@ class DownloadSummaryCoordinatorCorrectionTests(unittest.TestCase):
         self.assertEqual(removals, expected_ids)
         self.assertEqual(destroyed, ["reader-1", "summary", "reader-2"])
         self.assertFalse(coordinator.findChildren(QThread))
+        dispose_test_coordinator(app, coordinator)
+        window.coordinator = None
 
     def test_summary_and_result_readers_share_result_logs_resource(self) -> None:
         window, run = self._summary_window(Path("Data/DownloadTask_20260820.log"))
@@ -831,7 +1506,10 @@ class DownloadSummaryCoordinatorCorrectionTests(unittest.TestCase):
         result_window = SimpleNamespace(
             result_table=object(),
             result_refresh_button=None,
-            controller=SimpleNamespace(result_snapshot=Mock()),
+            controller=SimpleNamespace(
+                startup_state=StartupState.READY,
+                result_snapshot=Mock(),
+            ),
             _submit_coalesced_background=Mock(),
         )
         MainWindow.refresh_results(result_window)
@@ -843,14 +1521,20 @@ class DownloadSummaryCoordinatorCorrectionTests(unittest.TestCase):
             task_private_days=SimpleNamespace(value=Mock(return_value=7)),
             task_output=object(),
             task_preview_button=object(),
-            controller=SimpleNamespace(preview_private_skip=Mock()),
+            controller=SimpleNamespace(
+                startup_state=StartupState.READY,
+                preview_private_skip=Mock(),
+            ),
             _submit_coalesced_background=Mock(),
         )
         MainWindow._preview_task(private_window)
         private_spec = private_window._submit_coalesced_background.call_args.args[0]
 
         self.assertEqual(result_spec.resource_keys, frozenset({"result_logs"}))
-        self.assertEqual(private_spec.resource_keys, frozenset({"result_logs"}))
+        self.assertEqual(
+            private_spec.resource_keys,
+            frozenset({"result_logs", "settings"}),
+        )
 
         coordinator = BackgroundTaskCoordinator()
         coordinator._records["reader"] = TaskRecord(
@@ -1642,6 +2326,9 @@ class DownloadPostActionsCoordinatorCorrectionTests(unittest.TestCase):
                 window._refresh_background_targets.assert_not_called()
                 window._begin_shutdown_countdown_if_requested.assert_not_called()
                 window.controller.release_download_lifecycle.assert_called_once_with()
+                thread = None
+                dispose_test_coordinator(app, coordinator)
+                window.coordinator = None
 
 
 class PhaseTwoReadOnlyTaskTests(unittest.TestCase):

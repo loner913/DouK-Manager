@@ -138,6 +138,38 @@ class ManagerController:
             reason = "启动安全检查尚未完成。"
         raise ControllerError(f"{operation}不可用：{reason}")
 
+    def _require_operational_ready_with_context(
+        self,
+        operation: str,
+        *,
+        context: OperationContext | None = None,
+    ) -> None:
+        if context is not None:
+            context.raise_if_cancelled()
+        try:
+            self.require_operational_ready(operation)
+        except ControllerError:
+            if context is not None:
+                context.raise_if_cancelled()
+            raise
+        if context is not None:
+            context.raise_if_cancelled()
+
+    def _require_runtime_diagnostic(
+        self,
+        *,
+        context: OperationContext | None = None,
+    ) -> None:
+        if context is not None:
+            context.raise_if_cancelled()
+        state = self._current_startup_state()
+        if state not in (StartupState.READY, StartupState.DEGRADED_READ_ONLY):
+            if context is not None:
+                context.raise_if_cancelled()
+            raise ControllerError(f"刷新运行状态不可用：当前状态为 {state.value}。")
+        if context is not None:
+            context.raise_if_cancelled()
+
     def require_managed_runtime_control(self, operation: str, *, managed: bool) -> None:
         state = self._current_startup_state()
         if state not in (StartupState.READY, StartupState.CLOSING):
@@ -154,14 +186,22 @@ class ManagerController:
         if context is not None:
             context.raise_if_cancelled()
         result: dict[str, Any] = self.paths.health()
+        if context is not None:
+            context.raise_if_cancelled()
         if check_processes:
             self._last_collector_running = self.collector.health()
-            self._last_engine_running = self.engine.external_running()
         else:
             if self.collector.process is not None:
                 self._last_collector_running = self.collector.running
+        if context is not None:
+            context.raise_if_cancelled()
+        if check_processes:
+            self._last_engine_running = self.engine.external_running()
+        else:
             if self.engine.current is not None:
                 self._last_engine_running = self.engine.current.running
+        if context is not None:
+            context.raise_if_cancelled()
         result["collector_running"] = self._last_collector_running
         result["engine_running"] = self._last_engine_running
         current = self.engine.current
@@ -177,6 +217,8 @@ class ManagerController:
             )
         else:
             result["engine_mode"] = ""
+        if context is not None:
+            context.raise_if_cancelled()
         result["monitor_running"] = result["engine_mode"] == ENGINE_MODE_MONITOR
         result["startup_backup"] = str(self.startup_backup or "")
         result["read_only_reason"] = self.read_only_reason
@@ -199,6 +241,14 @@ class ManagerController:
         if context is not None:
             context.raise_if_cancelled()
         return result
+
+    def runtime_status_snapshot(
+        self,
+        *,
+        context: OperationContext | None = None,
+    ) -> dict[str, Any]:
+        self._require_runtime_diagnostic(context=context)
+        return self.health(check_processes=True, context=context)
 
     def try_startup_backup(self) -> str:
         required = self.paths.health()
@@ -342,6 +392,9 @@ class ManagerController:
         *,
         context: OperationContext | None = None,
     ):
+        self._require_operational_ready_with_context(
+            "智能私密预览", context=context
+        )
         if validity_days < 1 or validity_days > 3650:
             raise ControllerError("私密账号参考期限必须是 1 到 3650 天的整数。")
         requested = self.tasks.preview(expression)
@@ -409,6 +462,9 @@ class ManagerController:
         limit: int = 500,
         context: OperationContext | None = None,
     ):
+        self._require_operational_ready_with_context(
+            "刷新下载结果", context=context
+        )
         return self.results.page_snapshot(limit=limit, context=context)
 
     def generate_batches(
@@ -419,8 +475,13 @@ class ManagerController:
         self.logger.info("批次任务已生成：%s 个；A%s-A%s；每批%s", len(result), start, end, size)
         return result
 
-    def list_tasks(self) -> tuple[Path, ...]:
-        result = self.task_order.list_tasks()
+    def list_tasks(
+        self, *, context: OperationContext | None = None
+    ) -> tuple[Path, ...]:
+        self._require_operational_ready_with_context(
+            "刷新任务列表", context=context
+        )
+        result = self.task_order.list_tasks(context=context)
         if self.task_order.last_warning:
             self.logger.warning(self.task_order.last_warning)
         return result
@@ -630,6 +691,9 @@ class ManagerController:
     def screenshot_preview(
         self, *, context: OperationContext | None = None
     ) -> ScreenshotPreview:
+        self._require_operational_ready_with_context(
+            "预览截图归档", context=context
+        )
         return self.screenshots.preview(
             self.paths.screenshot_inbox, self.paths.video_root, context=context
         )

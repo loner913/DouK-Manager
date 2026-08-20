@@ -254,6 +254,7 @@ class MainWindow(QMainWindow):
         self._close_pending = False
         self._safe_widgets: list[QWidget] = []
         self._path_widgets: list[QWidget] = []
+        self._diagnostic_widgets: list[QWidget] = []
         self._dangerous_widgets: list[QWidget] = []
         self.queue_pending: list[Path] = []
         self.queue_active = False
@@ -303,6 +304,11 @@ class MainWindow(QMainWindow):
             self._path_widgets.append(widget)
         return widget
 
+    def _mark_diagnostic_widget(self, widget: QWidget) -> QWidget:
+        if widget not in self._diagnostic_widgets:
+            self._diagnostic_widgets.append(widget)
+        return widget
+
     def _finalize_action_gates(self) -> None:
         controls = (
             QPushButton,
@@ -318,6 +324,7 @@ class MainWindow(QMainWindow):
             if isinstance(widget, controls)
             and widget not in self._safe_widgets
             and widget not in self._path_widgets
+            and widget not in self._diagnostic_widgets
         ]
         self._apply_action_gate()
 
@@ -325,11 +332,17 @@ class MainWindow(QMainWindow):
         state = self.controller.startup_state
         dangerous_enabled = state is StartupState.READY
         path_enabled = state in (StartupState.READY, StartupState.DEGRADED_READ_ONLY)
+        diagnostic_enabled = state in (
+            StartupState.READY,
+            StartupState.DEGRADED_READ_ONLY,
+        )
         safe_enabled = state is not StartupState.CLOSING
         for widget in self._dangerous_widgets:
             widget.setEnabled(dangerous_enabled)
         for widget in self._path_widgets:
             widget.setEnabled(path_enabled)
+        for widget in self._diagnostic_widgets:
+            widget.setEnabled(diagnostic_enabled)
         for widget in self._safe_widgets:
             widget.setEnabled(safe_enabled)
 
@@ -456,7 +469,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_noncritical_after_startup(self) -> None:
         if (
-            self.controller.startup_state is StartupState.CLOSING
+            self.controller.startup_state is not StartupState.READY
             or not self.isVisible()
         ):
             return
@@ -472,10 +485,7 @@ class MainWindow(QMainWindow):
             self.refresh_results()
 
     def _refresh_results_if_startup_applied(self) -> None:
-        if self.isVisible() and self.controller.startup_state in (
-            StartupState.READY,
-            StartupState.DEGRADED_READ_ONLY,
-        ):
+        if self.isVisible() and self.controller.startup_state is StartupState.READY:
             self.refresh_results()
 
     def _copy_startup_error(self) -> None:
@@ -560,8 +570,7 @@ class MainWindow(QMainWindow):
     def _tab_changed(self, index: int) -> None:
         if (
             index == getattr(self, "result_tab_index", -1)
-            and self.controller.startup_state
-            in (StartupState.READY, StartupState.DEGRADED_READ_ONLY)
+            and self.controller.startup_state is StartupState.READY
         ):
             self.refresh_results()
 
@@ -646,7 +655,7 @@ class MainWindow(QMainWindow):
             button = QPushButton(text)
             button.clicked.connect(callback)
             if text == "刷新状态":
-                self.refresh_status_button = button
+                self.refresh_status_button = self._mark_diagnostic_widget(button)
             elif text == "手动完整备份 Volume（大文件）":
                 self.manual_backup_button = button
             buttons.addWidget(button)
@@ -1172,7 +1181,6 @@ class MainWindow(QMainWindow):
         self.result_refresh_button = refresh_button
         refresh_button.setToolTip("立即重新读取 Logs\\DownloadTasks 中的最新任务结果。")
         refresh_button.clicked.connect(self.refresh_results)
-        self._mark_safe_widget(refresh_button)
         filters.addWidget(refresh_button)
         layout.addLayout(filters)
         self.result_table = QTableWidget(0, 6)
@@ -1536,7 +1544,10 @@ class MainWindow(QMainWindow):
             self.refresh_all()
 
     def _refresh_status(self, _checked: bool = False) -> None:
-        if self.controller.startup_state is not StartupState.READY:
+        if self.controller.startup_state not in (
+            StartupState.READY,
+            StartupState.DEGRADED_READ_ONLY,
+        ):
             return
         if not hasattr(self, "_background_bindings") or hasattr(
             self.refresh_all, "assert_called_once_with"
@@ -1546,7 +1557,18 @@ class MainWindow(QMainWindow):
         spec = TaskSpec(
             task_type="runtime_status_snapshot",
             display_name="刷新运行状态",
-            resource_keys=frozenset({"runtime_status"}),
+            resource_keys=frozenset(
+                {
+                    "engine_process",
+                    "collector_process",
+                    "engine_files",
+                    "volume",
+                    "settings",
+                    "video_tree",
+                    "index",
+                    "collector_data",
+                }
+            ),
             deduplicate_key="runtime_status_snapshot",
             cancellable=True,
             close_policy=ClosePolicy.CANCEL,
@@ -1554,9 +1576,7 @@ class MainWindow(QMainWindow):
         )
         self._submit_coalesced_background(
             spec,
-            lambda context: self.controller.health(
-                check_processes=True, context=context
-            ),
+            lambda context: self.controller.runtime_status_snapshot(context=context),
             buttons=(getattr(self, "refresh_status_button", None),)
             if getattr(self, "refresh_status_button", None) is not None
             else (),
@@ -1570,11 +1590,13 @@ class MainWindow(QMainWindow):
         self._render_health_snapshot(health)
         if self.controller.startup_state is not StartupState.READY:
             self._apply_action_gate()
+            return
         self.refresh_tasks()
         if hasattr(self, "result_table"):
             self.refresh_results()
 
     def _render_health_snapshot(self, health: dict[str, object]) -> None:
+        operational_ready = self.controller.startup_state is StartupState.READY
         for key, label in self.status_labels.items():
             value = bool(health.get(key, False))
             if key.endswith("_running"):
@@ -1605,26 +1627,32 @@ class MainWindow(QMainWindow):
             label.style().polish(label)
         if hasattr(self, "queue_shutdown"):
             self.queue_shutdown.setEnabled(
-                not collector_running and mode != ENGINE_MODE_MONITOR
+                operational_ready
+                and not collector_running
+                and mode != ENGINE_MODE_MONITOR
             )
             if collector_running and self.queue_shutdown.isChecked():
                 self.queue_shutdown.setChecked(False)
         if hasattr(self, "queue_pause_button"):
             self.queue_pause_button.setEnabled(
-                self.queue_active
+                operational_ready
+                and self.queue_active
                 and not self.queue_cancel_requested
                 and str(health.get("engine_mode") or "") != ENGINE_MODE_MONITOR
             )
         if hasattr(self, "queue_cancel_button"):
             self.queue_cancel_button.setEnabled(
-                self.queue_active
+                operational_ready
+                and self.queue_active
                 and not self.queue_cancel_requested
                 and str(health.get("engine_mode") or "") != ENGINE_MODE_MONITOR
             )
         if hasattr(self, "monitor_start_button"):
             monitor_running = mode == ENGINE_MODE_MONITOR
-            self.monitor_start_button.setEnabled(not engine_running and not collector_running)
-            self.monitor_stop_button.setEnabled(monitor_running)
+            self.monitor_start_button.setEnabled(
+                operational_ready and not engine_running and not collector_running
+            )
+            self.monitor_stop_button.setEnabled(operational_ready and monitor_running)
         self.collector_path_label.setText(
             f"正式主档：{self.controller.paths.master_settings}\n"
             f"Excel：{self.controller.paths.collector_excel}\n"
@@ -1677,12 +1705,15 @@ class MainWindow(QMainWindow):
     def refresh_tasks(self) -> None:
         # Render keeps the established list flags: no drag/drop
         # (``~Qt.ItemIsDragEnabled`` and ``~Qt.ItemIsDropEnabled``).
-        if not hasattr(self, "task_list"):
+        if (
+            self.controller.startup_state is not StartupState.READY
+            or not hasattr(self, "task_list")
+        ):
             return
         spec = TaskSpec(
             task_type="task_list_snapshot",
             display_name="刷新任务列表",
-            resource_keys=frozenset({"task_directory"}),
+            resource_keys=frozenset({"task_templates", "settings"}),
             deduplicate_key="task_list_snapshot",
             cancellable=True,
             close_policy=ClosePolicy.CANCEL,
@@ -1690,7 +1721,7 @@ class MainWindow(QMainWindow):
         )
         self._submit_coalesced_background(
             spec,
-            lambda context: self.controller.list_tasks(),
+            lambda context: self.controller.list_tasks(context=context),
             buttons=(getattr(self, "task_refresh_button", None),)
             if getattr(self, "task_refresh_button", None) is not None
             else (),
@@ -1752,10 +1783,7 @@ class MainWindow(QMainWindow):
             self.refresh_tasks()
 
     def _schedule_result_refresh(self, *_args) -> None:
-        if self.controller.startup_state not in (
-            StartupState.READY,
-            StartupState.DEGRADED_READ_ONLY,
-        ):
+        if self.controller.startup_state is not StartupState.READY:
             return
         if hasattr(self, "result_refresh_timer"):
             self.result_refresh_timer.start(150)
@@ -1818,7 +1846,10 @@ class MainWindow(QMainWindow):
         )
 
     def refresh_results(self) -> None:
-        if not hasattr(self, "result_table"):
+        if (
+            self.controller.startup_state is not StartupState.READY
+            or not hasattr(self, "result_table")
+        ):
             return
         spec = TaskSpec(
             task_type="result_page_snapshot",
@@ -1956,13 +1987,15 @@ class MainWindow(QMainWindow):
             self.task_list.blockSignals(signals_were_blocked)
 
     def _preview_task(self) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
         if self.task_smart_private.isChecked():
             expression = self.task_expression.text()
             validity_days = self.task_private_days.value()
             spec = TaskSpec(
                 task_type="private_preview",
                 display_name="智能私密预览",
-                resource_keys=frozenset({"result_logs"}),
+                resource_keys=frozenset({"result_logs", "settings"}),
                 deduplicate_key="private_preview",
                 cancellable=True,
                 close_policy=ClosePolicy.CANCEL,
@@ -3521,6 +3554,8 @@ class MainWindow(QMainWindow):
             self._open_path(result.parent)
 
     def _preview_screenshots(self) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
         spec = TaskSpec(
             task_type="screenshot_preview",
             display_name="预览截图归档",
@@ -3547,6 +3582,7 @@ class MainWindow(QMainWindow):
             output=self.post_output,
             buttons=(self.screenshot_preview_button,),
             on_success=show_result,
+            on_cancelled=lambda _payload: None,
         )
 
     def _organize_screenshots(self) -> None:

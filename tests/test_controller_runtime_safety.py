@@ -31,7 +31,13 @@ from douk_manager.background import (
 from douk_manager.config import AppConfig
 from douk_manager.controller import ControllerError, ManagerController
 from douk_manager.core.backup import BackupService
-from douk_manager.core.engine import EngineError, EngineService, _WindowsEngineMutex
+from douk_manager.core.engine import (
+    EngineError,
+    EngineService,
+    ProcessProbe,
+    ProcessProbeState,
+    _WindowsEngineMutex,
+)
 from douk_manager.core.json_store import read_json, write_json_atomic
 from douk_manager.core.settings_tasks import EarliestRule, SettingsTaskService
 from douk_manager.gui import MainWindow
@@ -203,6 +209,287 @@ class ControllerRuntimeSafetyTests(unittest.TestCase):
             sources.append(source)
             destinations.append(destination / source.name)
         return inbox, accounts, tuple(sources), tuple(destinations)
+
+    def _read_only_controller(self, state) -> ManagerController:
+        controller = ManagerController.__new__(ManagerController)
+        controller.startup_state = state
+        controller.read_only_reason = "synthetic startup gate"
+        controller.logger = Mock()
+        controller.results = Mock()
+        controller.results.page_snapshot.return_value = "result-snapshot"
+        controller.results.classify_private_reference.return_value = ()
+        controller.task_order = Mock()
+        controller.task_order.list_tasks.return_value = (Path("Task_A1.json"),)
+        controller.task_order.last_warning = ""
+        controller.tasks = Mock()
+        controller.tasks.preview.return_value = SimpleNamespace(
+            selection=SimpleNamespace(numbers=())
+        )
+        controller.tasks.preview_with_private_filter.return_value = "private-preview"
+        controller.screenshots = Mock()
+        controller.screenshots.preview.return_value = "screenshot-preview"
+        controller.paths = SimpleNamespace(
+            screenshot_inbox=Path("synthetic-screenshots"),
+            video_root=Path("synthetic-videos"),
+        )
+        return controller
+
+    def _runtime_diagnostic_controller(self, state=None) -> ManagerController:
+        state = state or self._startup_state().READY
+        controller = ManagerController.__new__(ManagerController)
+        controller.startup_state = state
+        controller.read_only_reason = "synthetic startup gate"
+        controller.startup_backup = None
+        controller._last_collector_running = False
+        controller._last_engine_running = False
+        controller.logger = Mock()
+        controller.paths = SimpleNamespace(
+            health=Mock(return_value={"engine_exe": True}),
+            active_settings=Mock(is_file=Mock(return_value=False)),
+            master_settings=Mock(is_file=Mock(return_value=False)),
+        )
+        controller.collector = SimpleNamespace(
+            health=Mock(return_value=False),
+            process=None,
+            running=False,
+        )
+        controller.engine = SimpleNamespace(
+            external_running=Mock(return_value=False),
+            current=None,
+        )
+        return controller
+
+    @staticmethod
+    def _invoke_read_only_controller(
+        controller: ManagerController,
+        entry: str,
+        *,
+        context: object | None = None,
+    ):
+        if entry == "result":
+            return controller.result_snapshot(limit=25, context=context)
+        if entry == "task":
+            return controller.list_tasks()
+        if entry == "private":
+            return controller.preview_private_skip("A1", 30, context=context)
+        if entry == "screenshot":
+            return controller.screenshot_preview(context=context)
+        raise AssertionError(entry)
+
+    def test_read_only_controller_entries_have_independent_ready_second_gate(
+        self,
+    ) -> None:
+        state_type = self._startup_state()
+        expected = {
+            "result": "result-snapshot",
+            "task": (Path("Task_A1.json"),),
+            "private": "private-preview",
+            "screenshot": "screenshot-preview",
+        }
+        blocked_states = (
+            state_type.DEGRADED_READ_ONLY,
+            state_type.BOOTSTRAPPING,
+            state_type.SAFETY_CHECKING,
+            state_type.CLOSING,
+        )
+        for entry in expected:
+            with self.subTest(entry=entry, state="READY"):
+                controller = self._read_only_controller(state_type.READY)
+                context = Mock(name=f"{entry}_context")
+                self.assertEqual(
+                    self._invoke_read_only_controller(
+                        controller, entry, context=context
+                    ),
+                    expected[entry],
+                )
+                if entry == "result":
+                    controller.results.page_snapshot.assert_called_once_with(
+                        limit=25, context=context
+                    )
+                elif entry == "private":
+                    controller.results.classify_private_reference.assert_called_once_with(
+                        (), 30, context=context
+                    )
+                elif entry == "screenshot":
+                    controller.screenshots.preview.assert_called_once_with(
+                        controller.paths.screenshot_inbox,
+                        controller.paths.video_root,
+                        context=context,
+                    )
+            for blocked_state in blocked_states:
+                with self.subTest(entry=entry, state=blocked_state):
+                    controller = self._read_only_controller(blocked_state)
+                    with self.assertRaises(ControllerError):
+                        self._invoke_read_only_controller(controller, entry)
+                    if entry == "result":
+                        controller.results.page_snapshot.assert_not_called()
+                    elif entry == "task":
+                        controller.task_order.list_tasks.assert_not_called()
+                    elif entry == "private":
+                        controller.tasks.preview.assert_not_called()
+                        controller.results.classify_private_reference.assert_not_called()
+                    else:
+                        controller.screenshots.preview.assert_not_called()
+
+    def test_task_scan_controller_accepts_and_forwards_operation_context(self) -> None:
+        controller = self._read_only_controller(self._startup_state().READY)
+        context = Mock(name="task_scan_context")
+
+        result = controller.list_tasks(context=context)
+
+        self.assertEqual(result, (Path("Task_A1.json"),))
+        controller.task_order.list_tasks.assert_called_once_with(context=context)
+
+    def test_runtime_diagnostic_controller_allows_only_ready_and_degraded(self) -> None:
+        state_type = self._startup_state()
+        for allowed_state in (state_type.READY, state_type.DEGRADED_READ_ONLY):
+            with self.subTest(allowed=allowed_state):
+                controller = self._runtime_diagnostic_controller(allowed_state)
+                controller.health = Mock(return_value={"state": allowed_state.value})
+                context = Mock(name=f"{allowed_state.value}_context")
+
+                result = controller.runtime_status_snapshot(context=context)
+
+                self.assertEqual(result, {"state": allowed_state.value})
+                controller.health.assert_called_once_with(
+                    check_processes=True, context=context
+                )
+
+        for blocked_state in (
+            state_type.BOOTSTRAPPING,
+            state_type.SAFETY_CHECKING,
+            state_type.CLOSING,
+        ):
+            with self.subTest(blocked=blocked_state):
+                controller = self._runtime_diagnostic_controller(blocked_state)
+                controller.health = Mock()
+                with self.assertRaises(ControllerError):
+                    controller.runtime_status_snapshot(context=Mock())
+                controller.health.assert_not_called()
+
+    def test_runtime_diagnostic_context_cancels_between_each_access_domain(self) -> None:
+        for cancel_stage in ("paths", "collector", "engine"):
+            with self.subTest(cancel_stage=cancel_stage):
+                controller = self._runtime_diagnostic_controller()
+                context = OperationContext()
+                master_is_file = controller.paths.master_settings.is_file
+
+                if cancel_stage == "paths":
+                    controller.paths.health.side_effect = lambda: (
+                        context.request_cancel(),
+                        {"engine_exe": True},
+                    )[1]
+                elif cancel_stage == "collector":
+                    controller.collector.health.side_effect = lambda: (
+                        context.request_cancel(),
+                        False,
+                    )[1]
+                else:
+                    controller.engine.external_running.side_effect = lambda: (
+                        context.request_cancel(),
+                        False,
+                    )[1]
+
+                with self.assertRaises(TaskCancelled):
+                    controller.health(check_processes=True, context=context)
+
+                if cancel_stage == "paths":
+                    controller.collector.health.assert_not_called()
+                    controller.engine.external_running.assert_not_called()
+                elif cancel_stage == "collector":
+                    controller.engine.external_running.assert_not_called()
+                master_is_file.assert_not_called()
+
+        controller = self._runtime_diagnostic_controller()
+        controller.engine.external_running.return_value = True
+        controller.paths.active_settings.is_file.return_value = True
+        context = OperationContext()
+
+        def cancel_during_active_settings(path: object) -> dict[str, object]:
+            if path is controller.paths.active_settings:
+                self.assertTrue(context.request_cancel())
+                return {"run_command": "5 1 1 Q"}
+            return {"accounts_urls": []}
+
+        with patch(
+            "douk_manager.controller.read_json",
+            side_effect=cancel_during_active_settings,
+        ):
+            with self.assertRaises(TaskCancelled):
+                controller.health(check_processes=True, context=context)
+        controller.paths.master_settings.is_file.assert_not_called()
+
+        controller = self._runtime_diagnostic_controller()
+        controller.paths.master_settings.is_file.return_value = True
+        context = OperationContext()
+
+        def cancel_during_master(_path: Path) -> dict[str, object]:
+            self.assertTrue(context.request_cancel())
+            return {"accounts_urls": []}
+
+        with patch("douk_manager.controller.read_json", side_effect=cancel_during_master):
+            with self.assertRaises(TaskCancelled):
+                controller.health(check_processes=True, context=context)
+
+    def test_unknown_engine_probe_is_fail_closed_in_runtime_snapshot(self) -> None:
+        engine = EngineService.__new__(EngineService)
+        engine.probe_external_running = Mock(
+            return_value=ProcessProbe(
+                ProcessProbeState.UNKNOWN, "synthetic process probe uncertainty"
+            )
+        )
+        self.assertTrue(engine.external_running())
+
+        controller = self._runtime_diagnostic_controller()
+        controller.engine = SimpleNamespace(
+            external_running=engine.external_running,
+            current=None,
+        )
+        snapshot = controller.health(check_processes=True)
+
+        self.assertTrue(snapshot["engine_running"])
+
+    def test_cancelled_screenshot_preview_preserves_files_and_never_reaches_result(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inbox, accounts, sources, destinations = self._create_screenshot_inputs(root)
+            controller = self._read_only_controller(self._startup_state().READY)
+            controller.paths = SimpleNamespace(
+                screenshot_inbox=inbox,
+                video_root=accounts,
+            )
+            controller.screenshots = ScreenshotService()
+            context = OperationContext()
+            original = sources[0].read_bytes()
+            real_scan = screenshot_organizer.scan_all
+
+            def scan_then_cancel(*args, **kwargs):
+                result = real_scan(*args, **kwargs)
+                self.assertTrue(context.request_cancel())
+                return result
+
+            settlements: list[tuple[object, ...]] = []
+            worker = TaskWorker(
+                "screenshot-preview",
+                1,
+                lambda worker_context: controller.screenshot_preview(
+                    context=worker_context
+                ),
+                CancellationToken(),
+                operation_context=context,
+            )
+            worker.settled.connect(lambda *args: settlements.append(args))
+            with patch.object(
+                screenshot_organizer, "scan_all", side_effect=scan_then_cancel
+            ):
+                worker.run()
+
+            self.assertEqual(len(settlements), 1)
+            self.assertEqual(settlements[0][:3], ("screenshot-preview", 1, TaskState.CANCELLED))
+            self.assertEqual(sources[0].read_bytes(), original)
+            self.assertFalse(destinations[0].exists())
 
     def test_degraded_read_only_rejects_every_dangerous_entry_point(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
