@@ -26,9 +26,11 @@ from PySide6.QtCore import (
     QCoreApplication,
     QEvent,
     QEventLoop,
+    QObject,
     QThread,
     QTimer,
     Qt,
+    Slot,
     qInstallMessageHandler,
 )
 from PySide6.QtWidgets import QApplication, QMessageBox
@@ -38,6 +40,7 @@ from douk_manager.background import (
     ClosePolicy,
     TaskSpec,
     TaskState,
+    TaskWorker,
 )
 from douk_manager.config import AppConfig
 from douk_manager.core.download_summary import (
@@ -272,6 +275,17 @@ class _ManagedCollectorProcess:
         return 0
 
 
+class _TaskThreadFinishedObserver(QObject):
+    def __init__(self, task: dict[str, Any], parent: QObject) -> None:
+        super().__init__(parent)
+        self._task = task
+
+    @Slot()
+    def observe(self) -> None:
+        self._task["thread_finished_count"] += 1
+        self._task["lifecycle_events"].append("thread_finished_signal")
+
+
 def _summary_payload() -> DownloadSummary:
     return DownloadSummary(
         planned_count=0,
@@ -337,6 +351,10 @@ class _RoundObserver:
         self.coordinator = window.coordinator
         self.tasks: list[dict[str, Any]] = []
         self.tasks_by_id: dict[str, dict[str, Any]] = {}
+        self._qt_refs: dict[
+            str,
+            tuple[TaskWorker, QThread, _TaskThreadFinishedObserver],
+        ] = {}
         self.required_entry_calls: list[str] = []
         self.summary_post_sequence: list[str] = []
         self.controller_calls: list[dict[str, Any]] = []
@@ -417,6 +435,8 @@ class _RoundObserver:
             "coordinator_type": _type_name(self.coordinator),
             "thread_type": None,
             "worker_type": None,
+            "finished_observer_type": None,
+            "finished_observer_gui_affinity": False,
             "thread_name": None,
             "thread_started": False,
             "thread_running_after_start": False,
@@ -506,7 +526,13 @@ class _RoundObserver:
         )
         self.tasks.append(task)
         self.tasks_by_id[task_id] = task
-        thread.finished.connect(lambda task=task: self._observe_thread_finished(task))
+        finished_observer = _TaskThreadFinishedObserver(task, self.window)
+        task["finished_observer_type"] = _type_name(finished_observer)
+        task["finished_observer_gui_affinity"] = (
+            finished_observer.thread() is self.window.thread()
+        )
+        self._qt_refs[task_id] = (worker, thread, finished_observer)
+        thread.finished.connect(finished_observer.observe)
         thread.destroyed.connect(
             lambda *_args, task=task: self._observe_qobject_destroyed(task, "thread")
         )
@@ -523,15 +549,14 @@ class _RoundObserver:
                 release.set()
         return task_id
 
-    def _observe_thread_finished(self, task: dict[str, Any]) -> None:
-        task["thread_finished_count"] += 1
-        task["lifecycle_events"].append("thread_finished_signal")
-
     @staticmethod
     def _observe_qobject_destroyed(task: dict[str, Any], object_name: str) -> None:
         field = f"{object_name}_destroyed_count"
         task[field] += 1
         task["lifecycle_events"].append(f"{object_name}_destroyed")
+
+    def release_qt_refs_after_window_dispose(self) -> None:
+        self._qt_refs.clear()
 
     def release_held_task(self, task_id: str) -> None:
         try:
@@ -553,6 +578,12 @@ class _RoundObserver:
         task["settled_count"] += 1
         task["outcome"] = outcome.value if isinstance(outcome, TaskState) else repr(outcome)
         task["payload"] = _json_value(payload)
+        if (
+            task["invocation"] is None
+            and outcome is TaskState.CANCELLED
+            and task["spec"]["cancellable"]
+        ):
+            task["expected_outcome"] = TaskState.CANCELLED.value
         task["lifecycle_events"].append("settled")
         self.call_sequence.append(f"settled:{task['task_type']}:{task['outcome']}")
         if task["task_type"] == "download_summary":
@@ -883,6 +914,11 @@ class _RoundObserver:
         refresh_count_before = len(self.refresh_events)
         self.window.controller.startup_state = StartupState.CLOSING
         close_completed_immediately = self.coordinator.begin_closing()
+        for active_task_id, active_record in self.coordinator._records.items():
+            if active_record.state is TaskState.CANCELLING:
+                self.tasks_by_id[active_task_id]["expected_outcome"] = (
+                    TaskState.CANCELLED.value
+                )
         record = self.coordinator._records[task_id]
         context = record.operation_context
         if context is None:
@@ -968,6 +1004,7 @@ class _RoundObserver:
             "bindings_after_cleanup": len(self.window._background_bindings),
             "pending_after_cleanup": len(self.window._background_pending),
             "qthreads_after_cleanup": len(self.window.findChildren(QThread)),
+            "qt_refs_before_window_dispose": len(self._qt_refs),
             "errors": cleanup_errors,
         }
 
@@ -1081,6 +1118,16 @@ class _RoundObserver:
                 errors.append(f"task did not use the real Worker: {task['task_type']}")
             if task["thread_type"] != "PySide6.QtCore.QThread":
                 errors.append(f"task did not use a real QThread: {task['task_type']}")
+            if not task["finished_observer_type"].endswith(
+                "._TaskThreadFinishedObserver"
+            ):
+                errors.append(
+                    f"task did not use a QObject finished observer: {task['task_type']}"
+                )
+            if not task["finished_observer_gui_affinity"]:
+                errors.append(
+                    f"finished observer had wrong thread affinity: {task['task_type']}"
+                )
             if task["action_thread_name"] != task["thread_name"]:
                 errors.append(f"task action ran on the wrong thread: {task['task_type']}")
             for field in (
@@ -1157,6 +1204,12 @@ class _RoundObserver:
             errors.append("MainWindow retained pending requests")
         if self.window.findChildren(QThread):
             errors.append("MainWindow retained QThread children")
+        expected_qt_refs = {task["task_id"] for task in self.tasks}
+        if set(self._qt_refs) != expected_qt_refs:
+            errors.append(
+                "probe did not retain every Qt wrapper through event drain: "
+                f"actual={sorted(self._qt_refs)!r} expected={sorted(expected_qt_refs)!r}"
+            )
         if errors:
             raise RuntimeError("; ".join(errors))
 
@@ -1313,6 +1366,11 @@ def run_round(round_number: int) -> dict[str, Any]:
                     evidence["round_cleanup"] = observer.cleanup_before_dispose()
                 if window is not None:
                     evidence["window_cleanup"] = _dispose_window(window)
+                if observer is not None:
+                    observer.release_qt_refs_after_window_dispose()
+                    evidence["round_cleanup"]["qt_refs_after_cleanup"] = len(
+                        observer._qt_refs
+                    )
                 cleanup_errors = evidence.get("round_cleanup", {}).get("errors", [])
                 window_destroyed = evidence.get("window_cleanup", {}).get(
                     "window_destroyed_count", 0
