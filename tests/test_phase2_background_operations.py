@@ -2331,6 +2331,331 @@ class DownloadPostActionsCoordinatorCorrectionTests(unittest.TestCase):
                 window.coordinator = None
 
 
+class EngineUpdateCoordinatorCorrectionTests(unittest.TestCase):
+    @staticmethod
+    def _preview_payload(archive: Path) -> SimpleNamespace:
+        return SimpleNamespace(
+            archive=archive,
+            archive_sha256="a" * 64,
+            package_prefix="package",
+            file_count=2,
+            uncompressed_bytes=2048,
+            main_exe_bytes=1024,
+            contains_packaged_volume=False,
+        )
+
+    @staticmethod
+    def _apply_payload(archive: Path) -> SimpleNamespace:
+        return SimpleNamespace(
+            archive=archive,
+            backup_path=Path("synthetic-backup"),
+            rollback_path=Path("synthetic-rollback"),
+            old_main_sha256="b" * 64,
+            new_main_sha256="c" * 64,
+        )
+
+    @classmethod
+    def _window(
+        cls,
+        archive: Path,
+        state: StartupState = StartupState.READY,
+    ) -> SimpleNamespace:
+        controller = SimpleNamespace(
+            startup_state=state,
+            logger=Mock(),
+            config=SimpleNamespace(collector_port=18765),
+            preview_engine_update=Mock(return_value=cls._preview_payload(archive)),
+            apply_engine_update=Mock(return_value=cls._apply_payload(archive)),
+            start_collector=Mock(return_value=Path("synthetic-collector.log")),
+        )
+        window = SimpleNamespace(
+            coordinator=_BindingCoordinator(),
+            controller=controller,
+            _background_bindings={},
+            _background_generations={},
+            _background_pending={},
+            _cancel_shutdown_for_new_work=Mock(),
+            _append_info=Mock(),
+            _replace_info=Mock(),
+            _apply_action_gate=Mock(),
+            _refresh_background_targets=Mock(),
+            statusBar=Mock(return_value=SimpleNamespace(showMessage=Mock())),
+            engine_update_zip=SimpleNamespace(text=Mock(return_value=os.fspath(archive))),
+            settings_output=object(),
+            collector_output=object(),
+            engine_update_preview_button=SimpleNamespace(setEnabled=Mock()),
+            engine_update_apply_button=SimpleNamespace(setEnabled=Mock()),
+            collector_start_button=SimpleNamespace(setEnabled=Mock()),
+        )
+        window._background_binding_is_current = lambda binding, generation: (
+            MainWindow._background_binding_is_current(window, binding, generation)
+        )
+        window._submit_background = lambda *args, **kwargs: MainWindow._submit_background(
+            window, *args, **kwargs
+        )
+        window._submit_coalesced_background = (
+            lambda *args, **kwargs: MainWindow._submit_coalesced_background(
+                window, *args, **kwargs
+            )
+        )
+        window._submit_engine_update_apply = lambda selected: (
+            MainWindow._submit_engine_update_apply(window, selected)
+        )
+        return window
+
+    @staticmethod
+    def _engine_preview_key(archive: Path) -> str:
+        canonical = os.path.normcase(
+            os.path.normpath(os.path.abspath(os.fspath(archive)))
+        )
+        return f"engine_update_preview:{canonical}"
+
+    @staticmethod
+    def _record(spec: TaskSpec) -> TaskRecord:
+        return TaskRecord(
+            task_id="active",
+            spec=spec,
+            generation=1,
+            token=CancellationToken(),
+            thread=None,
+            worker=None,
+            state=TaskState.RUNNING,
+        )
+
+    def test_engine_preview_gui_ready_gate_precedes_all_admission(self) -> None:
+        for entry in (
+            MainWindow._preview_engine_update,
+            MainWindow._apply_engine_update,
+        ):
+            for state in (
+                StartupState.BOOTSTRAPPING,
+                StartupState.SAFETY_CHECKING,
+                StartupState.DEGRADED_READ_ONLY,
+                StartupState.CLOSING,
+            ):
+                with self.subTest(entry=entry.__name__, state=state):
+                    window = self._window(Path("synthetic-engine.zip"), state)
+                    generations = dict(window._background_generations)
+                    pending = dict(window._background_pending)
+
+                    entry(window)
+
+                    self.assertEqual(window.coordinator.calls, [])
+                    self.assertEqual(window._background_bindings, {})
+                    self.assertEqual(window._background_generations, generations)
+                    self.assertEqual(window._background_pending, pending)
+                    window.controller.preview_engine_update.assert_not_called()
+                    window._replace_info.assert_not_called()
+                    window._refresh_background_targets.assert_not_called()
+                    window.engine_update_preview_button.setEnabled.assert_not_called()
+                    window.engine_update_apply_button.setEnabled.assert_not_called()
+
+    def test_engine_preview_uses_canonical_per_zip_dedup_and_global_generation(
+        self,
+    ) -> None:
+        relative = Path("synthetic-engine-updates") / "Engine.ZIP"
+        archive = Path.cwd() / relative
+        equivalent_paths = (
+            relative,
+            archive,
+            archive.parent / "nested" / ".." / archive.name,
+            Path(os.fspath(archive).swapcase()),
+        )
+        keys: list[str | None] = []
+        generation_keys: list[str] = []
+        for candidate in equivalent_paths:
+            window = self._window(candidate)
+            MainWindow._preview_engine_update(window)
+            spec, _generation, _action = window.coordinator.calls[0]
+            keys.append(spec.deduplicate_key)
+            binding = next(iter(window._background_bindings.values()))
+            generation_keys.append(binding.generation_key)
+
+        expected = self._engine_preview_key(archive)
+        self.assertEqual(keys, [expected] * len(equivalent_paths))
+        self.assertEqual(
+            generation_keys,
+            ["engine_update_preview"] * len(equivalent_paths),
+        )
+
+        other = archive.parent / "other.zip"
+        other_window = self._window(other)
+        MainWindow._preview_engine_update(other_window)
+        other_spec = other_window.coordinator.calls[0][0]
+        self.assertEqual(other_spec.deduplicate_key, self._engine_preview_key(other))
+        self.assertNotEqual(other_spec.deduplicate_key, expected)
+
+        apply_window = self._window(archive)
+        MainWindow._apply_engine_update(apply_window)
+        apply_preview_spec = apply_window.coordinator.calls[0][0]
+        apply_binding = next(iter(apply_window._background_bindings.values()))
+        self.assertEqual(apply_preview_spec.deduplicate_key, expected)
+        self.assertEqual(apply_binding.generation_key, "engine_update_preview")
+
+    def test_both_preview_actions_forward_the_worker_operation_context(self) -> None:
+        archive = Path("synthetic-engine.zip")
+        for entry in (
+            MainWindow._preview_engine_update,
+            MainWindow._apply_engine_update,
+        ):
+            with self.subTest(entry=entry.__name__):
+                window = self._window(archive)
+                entry(window)
+                spec, generation, action = window.coordinator.calls[0]
+                context = Mock(name=f"{entry.__name__}_context")
+
+                result = action(context)
+
+                self.assertEqual(spec.resource_keys, frozenset({"engine_files"}))
+                self.assertTrue(spec.dynamic_cancellation)
+                self.assertEqual(generation, 1)
+                self.assertIs(result, window.controller.preview_engine_update.return_value)
+                window.controller.preview_engine_update.assert_called_once_with(
+                    archive, context=context
+                )
+
+    def test_rapid_a_b_c_preview_only_c_renders_and_stale_removals_do_not_enable(
+        self,
+    ) -> None:
+        archives = tuple(Path(f"engine-{name}.zip") for name in ("A", "B", "C"))
+        window = self._window(archives[0])
+        button = window.engine_update_preview_button
+        rendered = threading.Event()
+        window._replace_info.side_effect = lambda *_args, **_kwargs: rendered.set()
+
+        MainWindow._preview_engine_update(window)
+        first_task_id = next(iter(window._background_bindings))
+        window.engine_update_zip.text.return_value = os.fspath(archives[1])
+        MainWindow._preview_engine_update(window)
+        MainWindow._on_background_task_settled(
+            window,
+            first_task_id,
+            1,
+            TaskState.SUCCEEDED,
+            self._preview_payload(archives[0]),
+        )
+        MainWindow._on_background_task_removed(window, first_task_id)
+        self.assertFalse(rendered.is_set())
+
+        second_task_id = next(iter(window._background_bindings))
+        window.engine_update_zip.text.return_value = os.fspath(archives[2])
+        MainWindow._preview_engine_update(window)
+        MainWindow._on_background_task_settled(
+            window,
+            second_task_id,
+            2,
+            TaskState.SUCCEEDED,
+            self._preview_payload(archives[1]),
+        )
+        MainWindow._on_background_task_removed(window, second_task_id)
+        self.assertFalse(rendered.is_set())
+
+        third_task_id = next(iter(window._background_bindings))
+        MainWindow._on_background_task_settled(
+            window,
+            third_task_id,
+            3,
+            TaskState.SUCCEEDED,
+            self._preview_payload(archives[2]),
+        )
+        self.assertTrue(rendered.is_set())
+
+        self.assertEqual(window._background_generations["engine_update_preview"], 3)
+        self.assertEqual(window.coordinator.cancelled, [first_task_id, second_task_id])
+        self.assertEqual(len(window.coordinator.calls), 3)
+        window._replace_info.assert_called_once()
+        rendered_messages = window._replace_info.call_args.args[1:]
+        self.assertIn(f"ZIP：{archives[2]}", rendered_messages)
+        self.assertNotIn(f"ZIP：{archives[0]}", rendered_messages)
+        self.assertNotIn(f"ZIP：{archives[1]}", rendered_messages)
+        self.assertNotIn(True, [call.args[0] for call in button.setEnabled.call_args_list])
+
+    def test_engine_resources_conflict_while_result_logs_remain_parallel(self) -> None:
+        preview_a_window = self._window(Path("engine-A.zip"))
+        preview_b_window = self._window(Path("engine-B.zip"))
+        apply_window = self._window(Path("engine-A.zip"))
+        collector_window = self._window(Path("engine-A.zip"))
+        MainWindow._preview_engine_update(preview_a_window)
+        MainWindow._preview_engine_update(preview_b_window)
+        MainWindow._submit_engine_update_apply(apply_window, Path("engine-A.zip"))
+        MainWindow._start_collector(collector_window)
+        preview_a = preview_a_window.coordinator.calls[0][0]
+        preview_b = preview_b_window.coordinator.calls[0][0]
+        apply_spec = apply_window.coordinator.calls[0][0]
+        collector_start = collector_window.coordinator.calls[0][0]
+
+        self.assertEqual(
+            apply_spec.resource_keys,
+            frozenset(
+                {
+                    "engine_process",
+                    "collector_process",
+                    "engine_files",
+                    "volume",
+                    "settings",
+                }
+            ),
+        )
+        for active, candidate, resource in (
+            (preview_a, preview_b, "engine_files"),
+            (preview_a, apply_spec, "engine_files"),
+            (apply_spec, preview_a, "engine_files"),
+            (apply_spec, collector_start, "collector_process"),
+        ):
+            with self.subTest(
+                active=active.task_type,
+                candidate=candidate.task_type,
+            ):
+                coordinator = BackgroundTaskCoordinator()
+                coordinator._records["active"] = self._record(active)
+                with self.assertRaisesRegex(TaskRejectedError, resource):
+                    coordinator._validate_start(candidate)
+
+        coordinator = BackgroundTaskCoordinator()
+        coordinator._records["active"] = self._record(preview_a)
+        coordinator._validate_start(
+            TaskSpec(
+                task_type="result_reader",
+                display_name="result reader",
+                resource_keys=frozenset({"result_logs"}),
+                deduplicate_key="result_reader",
+            )
+        )
+
+    def test_apply_success_refreshes_only_runtime_status_and_closing_drops_ui(
+        self,
+    ) -> None:
+        archive = Path("synthetic-engine.zip")
+        window = self._window(archive)
+        MainWindow._submit_engine_update_apply(window, archive)
+        task_id = next(iter(window._background_bindings))
+        binding = window._background_bindings[task_id]
+        self.assertEqual(binding.spec.refresh_targets, ("runtime_status",))
+        self.assertNotIn("static_paths", binding.spec.refresh_targets)
+
+        payload = self._apply_payload(archive)
+        MainWindow._on_background_task_settled(
+            window, task_id, binding.generation, TaskState.SUCCEEDED, payload
+        )
+        window._replace_info.assert_called_once()
+        window._refresh_background_targets.assert_called_once_with(("runtime_status",))
+
+        closing = self._window(archive)
+        MainWindow._submit_engine_update_apply(closing, archive)
+        closing_task_id = next(iter(closing._background_bindings))
+        closing_binding = closing._background_bindings[closing_task_id]
+        closing.controller.startup_state = StartupState.CLOSING
+        MainWindow._on_background_task_settled(
+            closing,
+            closing_task_id,
+            closing_binding.generation,
+            TaskState.SUCCEEDED,
+            payload,
+        )
+        closing._replace_info.assert_not_called()
+        closing._refresh_background_targets.assert_not_called()
+
+
 class PhaseTwoReadOnlyTaskTests(unittest.TestCase):
     @staticmethod
     def _history_run(path: str, *, complete: bool = True) -> DownloadTaskHistory:

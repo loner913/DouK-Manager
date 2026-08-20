@@ -630,8 +630,16 @@ class ManagerController:
         self.logger.info("手动完整 Volume 备份完成：%s", result)
         return result
 
-    def preview_engine_update(self, archive: Path) -> EnginePackagePreview:
-        return self.engine_updates.preview(archive)
+    def preview_engine_update(
+        self,
+        archive: Path,
+        *,
+        context: OperationContext | None = None,
+    ) -> EnginePackagePreview:
+        self._require_operational_ready_with_context(
+            "预检下载引擎更新包", context=context
+        )
+        return self.engine_updates.preview(archive, context=context)
 
     def apply_engine_update(
         self,
@@ -642,6 +650,8 @@ class ManagerController:
         self.require_safe_write()
         if self.engine.external_running():
             raise ControllerError("下载引擎正在运行，禁止更新。")
+        if self.collector.running or self.collector.health():
+            raise ControllerError("账号采集服务运行时不能更新下载引擎。")
         result = (
             self.engine_updates.apply(archive)
             if context is None

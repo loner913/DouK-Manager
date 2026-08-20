@@ -2860,6 +2860,11 @@ class MainWindow(QMainWindow):
         return os.path.normcase(path)
 
     @staticmethod
+    def _canonical_engine_update_archive(archive: Path) -> str:
+        resolved = archive.expanduser().resolve(strict=False)
+        return os.path.normcase(os.path.normpath(os.fspath(resolved)))
+
+    @staticmethod
     def _download_summary_key(run) -> str:
         return f"download_summary:{MainWindow._canonical_task_log(run.task_log)}"
 
@@ -3722,12 +3727,18 @@ class MainWindow(QMainWindow):
             self.engine_update_zip.setText(selected)
 
     def _preview_engine_update(self) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
         archive = Path(self.engine_update_zip.text().strip())
+        deduplicate_key = (
+            "engine_update_preview:"
+            f"{MainWindow._canonical_engine_update_archive(archive)}"
+        )
         spec = TaskSpec(
             task_type="engine_update_preview",
             display_name="预检更新包",
             resource_keys=frozenset({"engine_files"}),
-            deduplicate_key="engine_update_preview",
+            deduplicate_key=deduplicate_key,
             cancellable=True,
             close_policy=ClosePolicy.CANCEL,
             dynamic_cancellation=True,
@@ -3749,7 +3760,9 @@ class MainWindow(QMainWindow):
             )
         self._submit_coalesced_background(
             spec,
-            lambda context: self.controller.preview_engine_update(archive),
+            lambda context: self.controller.preview_engine_update(
+                archive, context=context
+            ),
             output=self.settings_output,
             buttons=(self.engine_update_preview_button,),
             on_success=show_result,
@@ -3757,12 +3770,18 @@ class MainWindow(QMainWindow):
         )
 
     def _apply_engine_update(self) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
         archive = Path(self.engine_update_zip.text().strip())
+        deduplicate_key = (
+            "engine_update_preview:"
+            f"{MainWindow._canonical_engine_update_archive(archive)}"
+        )
         spec = TaskSpec(
             task_type="engine_update_preview_for_apply",
             display_name="预检更新包",
             resource_keys=frozenset({"engine_files"}),
-            deduplicate_key="engine_update_preview",
+            deduplicate_key=deduplicate_key,
             cancellable=True,
             close_policy=ClosePolicy.CANCEL,
             dynamic_cancellation=True,
@@ -3786,7 +3805,9 @@ class MainWindow(QMainWindow):
 
         self._submit_coalesced_background(
             spec,
-            lambda _context: self.controller.preview_engine_update(archive),
+            lambda context: self.controller.preview_engine_update(
+                archive, context=context
+            ),
             output=self.settings_output,
             buttons=(self.engine_update_apply_button,),
             on_success=confirm,
@@ -3797,6 +3818,8 @@ class MainWindow(QMainWindow):
         )
 
     def _submit_engine_update_apply(self, archive: Path) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
         spec = TaskSpec(
             task_type="engine_update_apply",
             display_name="安装引擎更新",

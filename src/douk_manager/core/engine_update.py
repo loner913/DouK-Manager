@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -14,6 +15,7 @@ from typing import TYPE_CHECKING
 from douk_manager.config import ManagedPaths
 from douk_manager.core.backup import BackupService, sha256_file, sqlite_quick_check
 from douk_manager.core.json_store import read_json
+from douk_manager.operation import TaskCancelled
 
 if TYPE_CHECKING:
     from douk_manager.operation import OperationContext
@@ -65,8 +67,13 @@ class EngineUpdateService:
         self.paths = paths
         self.backup = backup
 
-    def preview(self, archive: Path) -> EnginePackagePreview:
-        return self._analyse(archive).preview
+    def preview(
+        self,
+        archive: Path,
+        *,
+        context: OperationContext | None = None,
+    ) -> EnginePackagePreview:
+        return self._analyse(archive, context=context).preview
 
     def apply(
         self,
@@ -76,7 +83,7 @@ class EngineUpdateService:
     ) -> EngineUpdateResult:
         if context is not None:
             context.raise_if_cancelled()
-        analysis = self._analyse(archive)
+        analysis = self._analyse(archive, context=context)
         preview = analysis.preview
         self.backup.validate_live_data()
         if not self.paths.engine_exe.is_file():
@@ -166,6 +173,8 @@ class EngineUpdateService:
                 new_main_sha256=new_main_sha256,
                 preserved_files=self.CRITICAL_NAMES,
             )
+        except TaskCancelled:
+            raise
         except Exception as exc:
             rollback_error = self._restore_failed_update(old_exe, old_internal)
             if rollback_error:
@@ -181,28 +190,49 @@ class EngineUpdateService:
             if staging.exists():
                 shutil.rmtree(staging, ignore_errors=True)
 
-    def _analyse(self, archive: Path) -> _PackageAnalysis:
+    def _analyse(
+        self,
+        archive: Path,
+        *,
+        context: OperationContext | None = None,
+    ) -> _PackageAnalysis:
+        self._raise_if_cancelled(context)
         archive = archive.expanduser().resolve()
+        self._raise_if_cancelled(context)
         if not archive.is_file():
             raise EngineUpdateError(f"更新包不存在：{archive}")
         if archive.suffix.lower() != ".zip":
             raise EngineUpdateError("下载引擎更新包必须是 ZIP 文件。")
+        self._raise_if_cancelled(context)
         try:
+            self._raise_if_cancelled(context)
             with zipfile.ZipFile(archive) as handle:
+                self._raise_if_cancelled(context)
                 infos = handle.infolist()
-                bad = handle.testzip()
+                self._raise_if_cancelled(context)
+                bad = self._first_bad_zip_member(
+                    handle,
+                    infos,
+                    context=context,
+                )
+        except TaskCancelled:
+            raise
         except (OSError, zipfile.BadZipFile, RuntimeError) as exc:
             raise EngineUpdateError(f"无法读取有效 ZIP 更新包：{exc}") from exc
+        self._raise_if_cancelled(context)
         if bad:
             raise EngineUpdateError(f"ZIP CRC 校验失败：{bad}")
         if len(infos) > self.MAX_FILES:
             raise EngineUpdateError("更新包文件数量超过安全限制。")
+        self._raise_if_cancelled(context)
 
         members: list[tuple[zipfile.ZipInfo, PurePosixPath]] = []
         seen: set[str] = set()
         total = 0
         for info in infos:
+            self._raise_if_cancelled(context)
             path = self._safe_member_path(info)
+            self._raise_if_cancelled(context)
             key = path.as_posix().casefold()
             if key in seen:
                 raise EngineUpdateError(f"更新包包含重复路径：{path}")
@@ -211,50 +241,122 @@ class EngineUpdateService:
             if total > self.MAX_UNCOMPRESSED_BYTES:
                 raise EngineUpdateError("更新包解压大小超过安全限制。")
             members.append((info, path))
+            self._raise_if_cancelled(context)
 
+        self._raise_if_cancelled(context)
         file_paths = [path for info, path in members if not info.is_dir()]
         roots: set[tuple[str, ...]] = set()
         for path in file_paths:
+            self._raise_if_cancelled(context)
             if path.name.casefold() != "main.exe":
                 continue
             root = path.parts[:-1]
             internal_prefix = tuple(part.casefold() for part in (*root, "_internal"))
-            if any(
-                tuple(part.casefold() for part in candidate.parts[: len(internal_prefix)])
-                == internal_prefix
-                and len(candidate.parts) > len(root) + 1
-                for candidate in file_paths
-            ):
+            contains_internal = False
+            for candidate in file_paths:
+                self._raise_if_cancelled(context)
+                if (
+                    tuple(
+                        part.casefold()
+                        for part in candidate.parts[: len(internal_prefix)]
+                    )
+                    == internal_prefix
+                    and len(candidate.parts) > len(root) + 1
+                ):
+                    contains_internal = True
+                    break
+            if contains_internal:
                 roots.add(root)
+        self._raise_if_cancelled(context)
         if len(roots) != 1:
             raise EngineUpdateError(
                 "更新包必须且只能包含一套 main.exe 与对应的 _internal。"
             )
         root_parts = roots.pop()
         main_path = PurePosixPath(*root_parts, "main.exe")
-        main_info = next(
-            (info for info, path in members if path.as_posix().casefold() == main_path.as_posix().casefold()),
-            None,
-        )
+        main_key = main_path.as_posix().casefold()
+        main_info = None
+        for info, path in members:
+            self._raise_if_cancelled(context)
+            if path.as_posix().casefold() == main_key:
+                main_info = info
+                break
         if main_info is None or main_info.file_size <= 0:
             raise EngineUpdateError("更新包中的 main.exe 无效。")
         volume_prefix = tuple(part.casefold() for part in (*root_parts, "_internal", "Volume"))
-        contains_volume = any(
-            tuple(part.casefold() for part in path.parts[: len(volume_prefix)])
-            == volume_prefix
-            for _, path in members
-        )
+        contains_volume = False
+        for _, path in members:
+            self._raise_if_cancelled(context)
+            if (
+                tuple(part.casefold() for part in path.parts[: len(volume_prefix)])
+                == volume_prefix
+            ):
+                contains_volume = True
+                break
         prefix = PurePosixPath(*root_parts).as_posix() if root_parts else "."
+        self._raise_if_cancelled(context)
         preview = EnginePackagePreview(
             archive=archive,
-            archive_sha256=sha256_file(archive),
+            archive_sha256=self._sha256_file_with_context(
+                archive,
+                context=context,
+            ),
             package_prefix=prefix,
             file_count=sum(not info.is_dir() for info, _ in members),
             uncompressed_bytes=total,
             main_exe_bytes=main_info.file_size,
             contains_packaged_volume=contains_volume,
         )
+        self._raise_if_cancelled(context)
         return _PackageAnalysis(preview, tuple(members), root_parts)
+
+    @staticmethod
+    def _raise_if_cancelled(context: OperationContext | None) -> None:
+        if context is not None:
+            context.raise_if_cancelled()
+
+    @classmethod
+    def _first_bad_zip_member(
+        cls,
+        handle: zipfile.ZipFile,
+        infos: list[zipfile.ZipInfo],
+        *,
+        context: OperationContext | None,
+    ) -> str | None:
+        chunk_size = 2**20
+        for info in infos:
+            cls._raise_if_cancelled(context)
+            try:
+                with handle.open(info.filename, "r") as source:
+                    while True:
+                        cls._raise_if_cancelled(context)
+                        chunk = source.read(chunk_size)
+                        cls._raise_if_cancelled(context)
+                        if not chunk:
+                            break
+            except zipfile.BadZipFile:
+                return info.filename
+        return None
+
+    @classmethod
+    def _sha256_file_with_context(
+        cls,
+        path: Path,
+        *,
+        context: OperationContext | None,
+    ) -> str:
+        digest = hashlib.sha256()
+        cls._raise_if_cancelled(context)
+        with path.open("rb") as handle:
+            while True:
+                cls._raise_if_cancelled(context)
+                chunk = handle.read(1024 * 1024)
+                cls._raise_if_cancelled(context)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        cls._raise_if_cancelled(context)
+        return digest.hexdigest()
 
     @staticmethod
     def _safe_member_path(info: zipfile.ZipInfo) -> PurePosixPath:

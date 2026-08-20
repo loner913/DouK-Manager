@@ -449,6 +449,112 @@ class ControllerRuntimeSafetyTests(unittest.TestCase):
 
         self.assertTrue(snapshot["engine_running"])
 
+    def test_engine_preview_requires_ready_and_forwards_one_context(self) -> None:
+        state_type = self._startup_state()
+        archive = Path("synthetic-engine.zip")
+        for state in (
+            state_type.BOOTSTRAPPING,
+            state_type.SAFETY_CHECKING,
+            state_type.DEGRADED_READ_ONLY,
+            state_type.CLOSING,
+        ):
+            with self.subTest(blocked=state), tempfile.TemporaryDirectory() as directory:
+                controller = make_controller(Path(directory), engine_running=False)
+                controller.startup_state = state
+                with self.assertRaises(ControllerError):
+                    controller.preview_engine_update(archive)
+
+                controller.engine_updates.preview.assert_not_called()
+
+        with tempfile.TemporaryDirectory() as directory:
+            controller = make_controller(Path(directory), engine_running=False)
+            controller.startup_state = state_type.READY
+            context = Mock(name="engine_preview_context")
+            preview = Mock(name="engine_preview")
+            controller.engine_updates.preview.return_value = preview
+
+            result = controller.preview_engine_update(archive, context=context)
+
+            self.assertIs(result, preview)
+            controller.engine_updates.preview.assert_called_once_with(
+                archive, context=context
+            )
+
+    def test_engine_apply_rejects_managed_or_healthy_collector_before_any_stage(
+        self,
+    ) -> None:
+        for managed_running, health_running in ((True, False), (False, True)):
+            with (
+                self.subTest(
+                    managed_running=managed_running,
+                    health_running=health_running,
+                ),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                controller = make_controller(Path(directory), engine_running=False)
+                controller.startup_state = self._startup_state().READY
+                controller.collector.running = managed_running
+                controller.collector.health.return_value = health_running
+                apply_entered = threading.Event()
+                backup = Mock(name="engine_update_backup")
+                extract = Mock(name="engine_update_extract")
+                move = Mock(name="engine_update_move")
+
+                def unsafe_apply(*_args, **_kwargs):
+                    apply_entered.set()
+                    backup()
+                    extract()
+                    move()
+                    return SimpleNamespace(
+                        archive=Path(directory) / "engine.zip",
+                        backup_path=Path(directory) / "backup",
+                        rollback_path=Path(directory) / "rollback",
+                    )
+
+                controller.engine_updates.apply.side_effect = unsafe_apply
+
+                error: ControllerError | None = None
+                try:
+                    controller.apply_engine_update(
+                        Path(directory) / "engine.zip",
+                        context=OperationContext(),
+                    )
+                except ControllerError as exc:
+                    error = exc
+
+                controller.engine_updates.apply.assert_not_called()
+                self.assertFalse(apply_entered.is_set())
+                backup.assert_not_called()
+                extract.assert_not_called()
+                move.assert_not_called()
+                self.assertIsNotNone(error, "a persistent collector must reject apply")
+                if not managed_running:
+                    controller.collector.health.assert_called_once_with()
+
+    def test_engine_apply_idle_collector_passes_same_context_to_service(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = make_controller(Path(directory), engine_running=False)
+            controller.startup_state = self._startup_state().READY
+            controller.collector.running = False
+            controller.collector.health.return_value = False
+            archive = Path(directory) / "engine.zip"
+            context = OperationContext()
+            result = SimpleNamespace(
+                archive=archive,
+                backup_path=Path(directory) / "backup",
+                rollback_path=Path(directory) / "rollback",
+            )
+            controller.engine_updates.apply.return_value = result
+
+            self.assertIs(
+                controller.apply_engine_update(archive, context=context),
+                result,
+            )
+            controller.collector.health.assert_called_once_with()
+            controller.engine_updates.apply.assert_called_once_with(
+                archive, context=context
+            )
+
     def test_cancelled_screenshot_preview_preserves_files_and_never_reaches_result(
         self,
     ) -> None:
