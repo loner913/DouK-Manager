@@ -638,6 +638,11 @@ class ManagerController:
         self, *, context: OperationContext | None = None
     ) -> ScreenshotResult:
         self.require_operational_ready("整理截图")
+        return self._organize_screenshots(context=context)
+
+    def _organize_screenshots(
+        self, *, context: OperationContext | None = None
+    ) -> ScreenshotResult:
         result = self.screenshots.execute(
             self.paths.screenshot_inbox, self.paths.video_root, context=context
         )
@@ -646,6 +651,11 @@ class ManagerController:
 
     def refresh_index(self, *, context: OperationContext | None = None) -> IndexResult:
         self.require_operational_ready("刷新索引")
+        return self._refresh_index(context=context)
+
+    def _refresh_index(
+        self, *, context: OperationContext | None = None
+    ) -> IndexResult:
         arguments = (
             self.paths.video_root,
             self.paths.index_root,
@@ -662,6 +672,11 @@ class ManagerController:
 
     def cleanup_index(self, *, context: OperationContext | None = None) -> IndexResult:
         self.require_operational_ready("清理失效索引")
+        return self._cleanup_index(context=context)
+
+    def _cleanup_index(
+        self, *, context: OperationContext | None = None
+    ) -> IndexResult:
         arguments = (
             self.paths.video_root,
             self.paths.index_root,
@@ -688,18 +703,42 @@ class ManagerController:
         self.logger.info("失效快捷方式清理隔离自检通过")
         return result
 
-    def run_post_actions(self, timing: str) -> list[str]:
-        self.require_operational_ready("执行下载后续动作")
+    def run_post_actions(
+        self,
+        timing: str,
+        *,
+        context: OperationContext | None = None,
+    ) -> list[str]:
+        if context is not None:
+            context.raise_if_cancelled()
+        if timing not in {"batch", "queue"}:
+            raise ControllerError(f"下载后续动作时机无效：{timing}")
+        try:
+            self.require_operational_ready("执行下载后续动作")
+            if not getattr(self, "_download_lifecycle_active", False):
+                raise ControllerError("当前没有可执行后续动作的下载生命周期。")
+        except ControllerError:
+            if context is not None:
+                context.raise_if_cancelled()
+            raise
+        if context is not None:
+            context.raise_if_cancelled()
+
+        run_screenshots = self.config.screenshot_post_mode == timing
+        run_index = self.config.index_post_mode == timing
+        run_cleanup = run_index and bool(self.config.cleanup_after_index)
         messages: list[str] = []
-        if self.config.screenshot_post_mode == timing:
-            result = self.organize_screenshots()
+        if run_screenshots:
+            result = self._organize_screenshots(context=context)
             messages.append(f"截图归档：{result.moved}张")
-        if self.config.index_post_mode == timing:
-            index_result = self.refresh_index()
+        if context is not None:
+            context.raise_if_cancelled()
+        if run_index:
+            index_result = self._refresh_index(context=context)
             messages.append(index_result.display_summary("索引刷新"))
-            if self.config.cleanup_after_index:
-                cleanup_result = self.cleanup_index()
-                messages.append(
-                    cleanup_result.display_summary("失效快捷方式清理")
-                )
+        if context is not None:
+            context.raise_if_cancelled()
+        if run_cleanup:
+            cleanup_result = self._cleanup_index(context=context)
+            messages.append(cleanup_result.display_summary("失效快捷方式清理"))
         return messages

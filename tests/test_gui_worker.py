@@ -580,7 +580,16 @@ class ActionWorkerTests(unittest.TestCase):
         window._background_bindings = {}
         window._background_generations = {}
         window._background_pending = {}
-        window._submit_background = Mock()
+        window._download_lifecycle_identity = "download_lifecycle:queue-test"
+        window._download_post_bindings = {}
+        window._download_post_completed_keys = set()
+        window.controller._download_lifecycle_active = True
+        window.controller.config = SimpleNamespace(
+            screenshot_post_mode="none",
+            index_post_mode="queue",
+            cleanup_after_index=False,
+        )
+        window._submit_background = Mock(return_value="queue-post-task")
 
         MainWindow._run_post_actions_background(window, "queue", None)
 
@@ -1127,7 +1136,10 @@ class ActionWorkerTests(unittest.TestCase):
             preview=SimpleNamespace(compact="A4"),
             backup_path=None,
         )
-        run = SimpleNamespace(process=SimpleNamespace(pid=9876))
+        run = SimpleNamespace(
+            process=SimpleNamespace(pid=9876),
+            task_log=Path("Data/DownloadTask_A4.log"),
+        )
         window.controller.create_task.return_value = task
         window.controller.start_current_download = Mock(return_value=run)
 

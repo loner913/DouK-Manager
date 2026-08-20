@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -20,13 +21,25 @@ from unittest.mock import Mock, patch
 
 from openpyxl import Workbook, load_workbook
 
+from douk_manager.background import (
+    CancellationToken,
+    TaskFailure,
+    TaskRejectedError,
+    TaskState,
+    TaskWorker,
+)
 from douk_manager.config import AppConfig
 from douk_manager.controller import ControllerError, ManagerController
 from douk_manager.core.backup import BackupService
 from douk_manager.core.engine import EngineError, EngineService, _WindowsEngineMutex
 from douk_manager.core.json_store import read_json, write_json_atomic
 from douk_manager.core.settings_tasks import EarliestRule, SettingsTaskService
-from douk_manager.vendor import collector_server
+from douk_manager.gui import MainWindow
+from douk_manager.integrations import indexer as indexer_module
+from douk_manager.integrations.indexer import IndexService
+from douk_manager.integrations.screenshots import ScreenshotService
+from douk_manager.operation import OperationContext, TaskCancelled
+from douk_manager.vendor import collector_server, screenshot_organizer
 from tests.helpers import make_test_paths
 
 try:
@@ -37,6 +50,31 @@ except ImportError:
 
 def file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def index_service_output(mode: str) -> str:
+    summary: dict[str, object] = {
+        "Mode": mode,
+        "SourceRoot": "synthetic-source",
+        "IndexRoot": "synthetic-index",
+        "SourceFoldersScanned": 1,
+        "IgnoredSourceFolders": 0,
+        "EmptySourceFolders": 0,
+        "MovedOrDeletedTargetFolders": 0,
+        "EmptySourceShortcutsDetected": 0,
+        "MissingTargetShortcutsDetected": 0,
+        "PlannedShortcutDeletions": 0,
+        "DeletedEmptySourceShortcuts": 0,
+        "DeletedMissingTargetShortcuts": 0,
+        "DeletedShortcutsTotal": 0,
+        "ShortcutDeleteFailures": 0,
+        "RemainingEmptySourceShortcuts": 0,
+        "RemainingMissingTargetShortcuts": 0,
+        "ShortcutReadFailures": 0,
+    }
+    if mode == "Refresh":
+        summary.update(Created=5, Updated=6, Unchanged=7, IndexFailures=0)
+    return "synthetic index details\nDOUK_INDEX_SUMMARY_JSON=" + json.dumps(summary)
 
 
 def make_controller(root: Path, *, engine_running: bool) -> ManagerController:
@@ -106,6 +144,65 @@ class ControllerRuntimeSafetyTests(unittest.TestCase):
         controller.engine.current = None
         controller.engine.external_running.return_value = False
         return controller
+
+    def _post_action_controller(
+        self,
+        *,
+        screenshot_mode: str = "batch",
+        index_mode: str = "batch",
+        cleanup: bool = True,
+        lifecycle_active: bool = True,
+    ) -> ManagerController:
+        controller = ManagerController.__new__(ManagerController)
+        controller.startup_state = self._startup_state().READY
+        controller.read_only_reason = ""
+        controller._download_lifecycle_active = lifecycle_active
+        controller.config = SimpleNamespace(
+            screenshot_post_mode=screenshot_mode,
+            index_post_mode=index_mode,
+            cleanup_after_index=cleanup,
+        )
+        controller.paths = SimpleNamespace(
+            screenshot_inbox=Path("synthetic-screenshots"),
+            video_root=Path("synthetic-videos"),
+            index_root=Path("synthetic-index"),
+            index_refresh_logs=Path("synthetic-refresh-logs"),
+            index_cleanup_logs=Path("synthetic-cleanup-logs"),
+        )
+        controller.logger = Mock()
+        controller.screenshots = Mock()
+        controller.screenshots.execute.return_value = SimpleNamespace(moved=2)
+        controller.indexer = Mock()
+        refresh_result = Mock(name="refresh_result")
+        refresh_result.display_lines.return_value = ("refresh numeric log",)
+        refresh_result.display_summary.return_value = "refresh numeric summary"
+        cleanup_result = Mock(name="cleanup_result")
+        cleanup_result.display_lines.return_value = ("cleanup numeric log",)
+        cleanup_result.display_summary.return_value = "cleanup numeric summary"
+        controller.indexer.refresh.return_value = refresh_result
+        controller.indexer.cleanup.return_value = cleanup_result
+        return controller
+
+    @staticmethod
+    def _create_screenshot_inputs(
+        root: Path,
+        *,
+        count: int = 1,
+    ) -> tuple[Path, Path, tuple[Path, ...], tuple[Path, ...]]:
+        inbox = root / "screenshots"
+        accounts = root / "accounts"
+        inbox.mkdir()
+        accounts.mkdir()
+        sources: list[Path] = []
+        destinations: list[Path] = []
+        for number in range(1, count + 1):
+            destination = accounts / f"UID100{number}_A{number}account_works"
+            destination.mkdir()
+            source = inbox / f"A{number}.jpg"
+            source.write_bytes(f"screenshot-{number}".encode("ascii"))
+            sources.append(source)
+            destinations.append(destination / source.name)
+        return inbox, accounts, tuple(sources), tuple(destinations)
 
     def test_degraded_read_only_rejects_every_dangerous_entry_point(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -471,6 +568,752 @@ class ControllerRuntimeSafetyTests(unittest.TestCase):
             controller.stop_collector()
             controller.collector.start.assert_called_once_with()
             controller.collector.stop.assert_called_once_with()
+
+    def test_post_actions_reject_invalid_timing_before_any_sub_operation(self) -> None:
+        for timing in ("none", "manual", "", "BATCH"):
+            with self.subTest(timing=timing):
+                controller = self._post_action_controller(
+                    screenshot_mode=timing,
+                    index_mode=timing,
+                )
+
+                with self.assertRaises(ControllerError):
+                    controller.run_post_actions(timing)
+
+                controller.screenshots.execute.assert_not_called()
+                controller.indexer.refresh.assert_not_called()
+                controller.indexer.cleanup.assert_not_called()
+
+    def test_post_actions_reject_inactive_download_lifecycle_before_sub_operations(
+        self,
+    ) -> None:
+        controller = self._post_action_controller(lifecycle_active=False)
+
+        with self.assertRaises(ControllerError):
+            controller.run_post_actions("batch")
+
+        controller.screenshots.execute.assert_not_called()
+        controller.indexer.refresh.assert_not_called()
+        controller.indexer.cleanup.assert_not_called()
+
+    def test_post_actions_recheck_ready_state_and_enabled_config(self) -> None:
+        state = self._startup_state()
+        for unavailable in (state.DEGRADED_READ_ONLY, state.CLOSING):
+            with self.subTest(state=unavailable):
+                controller = self._post_action_controller()
+                controller.startup_state = unavailable
+
+                with self.assertRaises(ControllerError):
+                    controller.run_post_actions("batch")
+
+                controller.screenshots.execute.assert_not_called()
+                controller.indexer.refresh.assert_not_called()
+                controller.indexer.cleanup.assert_not_called()
+
+        controller = self._post_action_controller(
+            screenshot_mode="none",
+            index_mode="queue",
+            cleanup=True,
+        )
+
+        self.assertEqual(controller.run_post_actions("batch"), [])
+        controller.screenshots.execute.assert_not_called()
+        controller.indexer.refresh.assert_not_called()
+        controller.indexer.cleanup.assert_not_called()
+
+    def test_post_actions_pass_one_context_through_screenshot_index_and_cleanup(
+        self,
+    ) -> None:
+        controller = self._post_action_controller()
+        context = OperationContext()
+        calls: list[tuple[str, OperationContext | None]] = []
+
+        def screenshot(*_args, context=None):
+            calls.append(("screenshot", context))
+            return SimpleNamespace(moved=2)
+
+        def refresh(*_args, context=None):
+            calls.append(("refresh", context))
+            return controller.indexer.refresh.return_value
+
+        def cleanup(*_args, context=None):
+            calls.append(("cleanup", context))
+            return controller.indexer.cleanup.return_value
+
+        controller.screenshots.execute.side_effect = screenshot
+        controller.indexer.refresh.side_effect = refresh
+        controller.indexer.cleanup.side_effect = cleanup
+
+        messages = controller.run_post_actions("batch", context=context)
+
+        self.assertEqual(
+            calls,
+            [("screenshot", context), ("refresh", context), ("cleanup", context)],
+        )
+        self.assertEqual(
+            messages,
+            [
+                "截图归档：2张",
+                "refresh numeric summary",
+                "cleanup numeric summary",
+            ],
+        )
+
+    def test_post_actions_cancel_between_sub_operations_prevents_later_work(
+        self,
+    ) -> None:
+        controller = self._post_action_controller()
+        context = OperationContext()
+
+        def screenshot(*_args, context=None):
+            self.assertIs(context, context_token)
+            self.assertTrue(context.request_cancel())
+            return SimpleNamespace(moved=2)
+
+        context_token = context
+        controller.screenshots.execute.side_effect = screenshot
+
+        with self.assertRaises(TaskCancelled):
+            controller.run_post_actions("batch", context=context)
+
+        controller.screenshots.execute.assert_called_once()
+        controller.indexer.refresh.assert_not_called()
+        controller.indexer.cleanup.assert_not_called()
+
+    def test_cancel_winning_during_ready_gate_is_reported_as_cancelled(self) -> None:
+        signature = inspect.signature(ManagerController.run_post_actions)
+        self.assertIn("context", signature.parameters)
+
+        controller = self._post_action_controller()
+        context = OperationContext()
+        gate_entered = threading.Event()
+        release_gate = threading.Event()
+        original_state = controller._current_startup_state
+        errors: list[BaseException] = []
+
+        def gated_state():
+            gate_entered.set()
+            if not release_gate.wait(timeout=3):
+                raise AssertionError("test did not release READY gate")
+            return original_state()
+
+        controller._current_startup_state = gated_state
+
+        def run() -> None:
+            try:
+                controller.run_post_actions("batch", context=context)
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        self.assertTrue(gate_entered.wait(timeout=3), "READY gate was not reached")
+        controller.startup_state = self._startup_state().CLOSING
+        self.assertTrue(context.request_cancel())
+        release_gate.set()
+        thread.join(timeout=3)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], TaskCancelled)
+        controller.screenshots.execute.assert_not_called()
+        controller.indexer.refresh.assert_not_called()
+        controller.indexer.cleanup.assert_not_called()
+
+    def test_critical_post_actions_continue_after_state_enters_closing(self) -> None:
+        controller = self._post_action_controller()
+        context = OperationContext()
+        calls: list[str] = []
+
+        def screenshot(*_args, context=None):
+            self.assertIs(context, context_token)
+            context.enter_critical_phase()
+            controller.startup_state = self._startup_state().CLOSING
+            self.assertFalse(context.request_cancel())
+            calls.append("screenshot")
+            return SimpleNamespace(moved=2)
+
+        def refresh(*_args, context=None):
+            self.assertIs(context, context_token)
+            calls.append("refresh")
+            return controller.indexer.refresh.return_value
+
+        def cleanup(*_args, context=None):
+            self.assertIs(context, context_token)
+            calls.append("cleanup")
+            return controller.indexer.cleanup.return_value
+
+        context_token = context
+        controller.screenshots.execute.side_effect = screenshot
+        controller.indexer.refresh.side_effect = refresh
+        controller.indexer.cleanup.side_effect = cleanup
+
+        messages = controller.run_post_actions("batch", context=context)
+
+        self.assertEqual(calls, ["screenshot", "refresh", "cleanup"])
+        self.assertEqual(len(messages), 3)
+        self.assertTrue(context.critical_to_completion)
+
+    def test_critical_failure_in_closing_remains_failed_not_cancelled(self) -> None:
+        controller = self._post_action_controller()
+        context = OperationContext()
+
+        def screenshot(*_args, context=None):
+            self.assertIs(context, context_token)
+            context.enter_critical_phase()
+            controller.startup_state = self._startup_state().CLOSING
+            return SimpleNamespace(moved=2)
+
+        context_token = context
+        controller.screenshots.execute.side_effect = screenshot
+        controller.indexer.refresh.side_effect = RuntimeError("synthetic index failure")
+        settlements: list[tuple[object, ...]] = []
+        worker = TaskWorker(
+            "post-actions",
+            1,
+            lambda worker_context: controller.run_post_actions(
+                "batch", context=worker_context
+            ),
+            CancellationToken(),
+            operation_context=context,
+        )
+        worker.settled.connect(lambda *args: settlements.append(args))
+
+        worker.run()
+
+        self.assertEqual(len(settlements), 1)
+        self.assertIs(settlements[0][2], TaskState.FAILED)
+        self.assertIsInstance(settlements[0][3], TaskFailure)
+        self.assertEqual(settlements[0][3].error_type, "RuntimeError")
+        self.assertIn("synthetic index failure", settlements[0][3].message)
+        self.assertTrue(context.critical_to_completion)
+        self.assertTrue(context.terminal_sealed)
+        self.assertFalse(context.request_cancel())
+        controller.indexer.cleanup.assert_not_called()
+
+    def test_screenshot_service_cancel_during_either_scan_never_calls_safe_move(
+        self,
+    ) -> None:
+        for blocked_scan in (1, 2):
+            with self.subTest(
+                blocked_scan=blocked_scan
+            ), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                inbox, accounts, sources, destinations = self._create_screenshot_inputs(
+                    root
+                )
+                context = OperationContext()
+                scan_reached = threading.Event()
+                release_scan = threading.Event()
+                errors: list[BaseException] = []
+                real_scan = screenshot_organizer.scan_all
+                scan_calls = 0
+
+                def gated_scan(*args):
+                    nonlocal scan_calls
+                    scan_calls += 1
+                    if scan_calls == blocked_scan:
+                        scan_reached.set()
+                        if not release_scan.wait(timeout=3):
+                            raise AssertionError("test did not release screenshot scan")
+                    return real_scan(*args)
+
+                def execute() -> None:
+                    try:
+                        ScreenshotService().execute(
+                            inbox,
+                            accounts,
+                            context=context,
+                        )
+                    except BaseException as exc:
+                        errors.append(exc)
+
+                with (
+                    patch.object(
+                        screenshot_organizer,
+                        "scan_all",
+                        side_effect=gated_scan,
+                    ),
+                    patch.object(
+                        screenshot_organizer,
+                        "safe_move",
+                        wraps=screenshot_organizer.safe_move,
+                    ) as safe_move,
+                ):
+                    thread = threading.Thread(target=execute)
+                    thread.start()
+                    try:
+                        self.assertTrue(
+                            scan_reached.wait(timeout=3),
+                            f"screenshot scan {blocked_scan} did not reach barrier",
+                        )
+                        self.assertTrue(context.request_cancel())
+                    finally:
+                        release_scan.set()
+                        thread.join(timeout=3)
+
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(len(errors), 1)
+                self.assertIsInstance(errors[0], TaskCancelled)
+                safe_move.assert_not_called()
+                self.assertFalse(context.critical_to_completion)
+                self.assertTrue(all(path.is_file() for path in sources))
+                self.assertTrue(all(not path.exists() for path in destinations))
+
+    def test_index_service_cancel_after_command_build_never_runs_subprocess(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            script = root / "Refresh-DoukIndex.ps1"
+            script.write_text("# synthetic", encoding="ascii")
+            context = OperationContext()
+            command_ready = threading.Event()
+            release_command = threading.Event()
+            errors: list[BaseException] = []
+            real_raise = context.raise_if_cancelled
+
+            def gated_raise() -> None:
+                command_ready.set()
+                if not release_command.wait(timeout=3):
+                    raise AssertionError("test did not release index command gate")
+                real_raise()
+
+            def refresh() -> None:
+                try:
+                    IndexService().refresh(
+                        source,
+                        root / "index",
+                        root / "logs",
+                        context=context,
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            with (
+                patch("douk_manager.integrations.indexer.os.name", "nt"),
+                patch(
+                    "douk_manager.integrations.indexer.resource_path",
+                    return_value=script,
+                ),
+                patch.object(context, "raise_if_cancelled", side_effect=gated_raise),
+                patch(
+                    "douk_manager.integrations.indexer.subprocess.run"
+                ) as subprocess_run,
+            ):
+                thread = threading.Thread(target=refresh)
+                thread.start()
+                try:
+                    self.assertTrue(
+                        command_ready.wait(timeout=3),
+                        "index command did not reach cancellation gate",
+                    )
+                    self.assertTrue(context.request_cancel())
+                finally:
+                    release_command.set()
+                    thread.join(timeout=3)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], TaskCancelled)
+            subprocess_run.assert_not_called()
+            self.assertFalse(context.critical_to_completion)
+
+    def test_empty_screenshot_then_cancel_prevents_index_critical_and_subprocess(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inbox = root / "screenshots"
+            accounts = root / "accounts"
+            inbox.mkdir()
+            accounts.mkdir()
+            controller = self._post_action_controller(cleanup=False)
+            controller.paths = SimpleNamespace(
+                screenshot_inbox=inbox,
+                video_root=accounts,
+                index_root=root / "index",
+                index_refresh_logs=root / "refresh-logs",
+                index_cleanup_logs=root / "cleanup-logs",
+            )
+            controller.screenshots = ScreenshotService()
+            controller.indexer = IndexService()
+            context = OperationContext()
+            screenshot_finished = threading.Event()
+            between_operations = threading.Event()
+            release_between = threading.Event()
+            errors: list[BaseException] = []
+            real_execute = controller.screenshots.execute
+            real_raise = context.raise_if_cancelled
+            boundary_consumed = False
+
+            def execute_screenshots(*args, **kwargs):
+                result = real_execute(*args, **kwargs)
+                screenshot_finished.set()
+                return result
+
+            def gated_raise() -> None:
+                nonlocal boundary_consumed
+                if screenshot_finished.is_set() and not boundary_consumed:
+                    boundary_consumed = True
+                    between_operations.set()
+                    if not release_between.wait(timeout=3):
+                        raise AssertionError("test did not release post-action boundary")
+                real_raise()
+
+            def run_post_actions() -> None:
+                try:
+                    controller.run_post_actions("batch", context=context)
+                except BaseException as exc:
+                    errors.append(exc)
+
+            with (
+                patch.object(
+                    controller.screenshots,
+                    "execute",
+                    side_effect=execute_screenshots,
+                ) as execute,
+                patch.object(context, "raise_if_cancelled", side_effect=gated_raise),
+                patch.object(
+                    screenshot_organizer,
+                    "safe_move",
+                    wraps=screenshot_organizer.safe_move,
+                ) as safe_move,
+                patch(
+                    "douk_manager.integrations.indexer.subprocess.run"
+                ) as subprocess_run,
+            ):
+                thread = threading.Thread(target=run_post_actions)
+                thread.start()
+                try:
+                    self.assertTrue(
+                        between_operations.wait(timeout=3),
+                        "post action did not reach screenshot/index boundary",
+                    )
+                    self.assertTrue(context.request_cancel())
+                finally:
+                    release_between.set()
+                    thread.join(timeout=3)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], TaskCancelled)
+            execute.assert_called_once()
+            safe_move.assert_not_called()
+            subprocess_run.assert_not_called()
+            self.assertFalse(context.critical_to_completion)
+
+    def test_screenshot_service_critical_wins_and_completes_all_real_moves(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inbox, accounts, sources, destinations = self._create_screenshot_inputs(
+                root,
+                count=2,
+            )
+            expected_bytes = tuple(path.read_bytes() for path in sources)
+            context = OperationContext()
+            first_move_reached = threading.Event()
+            release_first_move = threading.Event()
+            errors: list[BaseException] = []
+            results: list[object] = []
+            real_safe_move = screenshot_organizer.safe_move
+            move_calls = 0
+
+            def gated_safe_move(plan):
+                nonlocal move_calls
+                move_calls += 1
+                self.assertTrue(context.critical_to_completion)
+                if move_calls == 1:
+                    first_move_reached.set()
+                    if not release_first_move.wait(timeout=3):
+                        raise AssertionError("test did not release first safe move")
+                return real_safe_move(plan)
+
+            def execute() -> None:
+                try:
+                    results.append(
+                        ScreenshotService().execute(
+                            inbox,
+                            accounts,
+                            context=context,
+                        )
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            with patch.object(
+                screenshot_organizer,
+                "safe_move",
+                side_effect=gated_safe_move,
+            ) as safe_move:
+                thread = threading.Thread(target=execute)
+                thread.start()
+                try:
+                    self.assertTrue(
+                        first_move_reached.wait(timeout=3),
+                        "first safe move did not reach critical gate",
+                    )
+                    self.assertFalse(context.request_cancel())
+                finally:
+                    release_first_move.set()
+                    thread.join(timeout=3)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0].moved, 2)
+            self.assertEqual(safe_move.call_count, 2)
+            self.assertTrue(context.critical_to_completion)
+            self.assertTrue(all(not path.exists() for path in sources))
+            self.assertEqual(
+                tuple(path.read_bytes() for path in destinations),
+                expected_bytes,
+            )
+
+    def test_index_service_critical_wins_runs_subprocess_and_parses_summary(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            script = root / "Refresh-DoukIndex.ps1"
+            script.write_text("# synthetic", encoding="ascii")
+            context = OperationContext()
+            process_reached = threading.Event()
+            release_process = threading.Event()
+            errors: list[BaseException] = []
+            results: list[object] = []
+
+            def run_subprocess(*_args, **_kwargs):
+                self.assertTrue(context.critical_to_completion)
+                process_reached.set()
+                if not release_process.wait(timeout=3):
+                    raise AssertionError("test did not release index subprocess")
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=index_service_output("Refresh"),
+                    stderr="",
+                )
+
+            def refresh() -> None:
+                try:
+                    results.append(
+                        IndexService().refresh(
+                            source,
+                            root / "index",
+                            root / "logs",
+                            context=context,
+                        )
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            with (
+                patch("douk_manager.integrations.indexer.os.name", "nt"),
+                patch(
+                    "douk_manager.integrations.indexer.resource_path",
+                    return_value=script,
+                ),
+                patch(
+                    "douk_manager.integrations.indexer.subprocess.run",
+                    side_effect=run_subprocess,
+                ) as subprocess_run,
+                patch.object(
+                    indexer_module,
+                    "parse_index_output",
+                    wraps=indexer_module.parse_index_output,
+                ) as parse_output,
+            ):
+                thread = threading.Thread(target=refresh)
+                thread.start()
+                try:
+                    self.assertTrue(
+                        process_reached.wait(timeout=3),
+                        "index subprocess did not reach critical gate",
+                    )
+                    self.assertFalse(context.request_cancel())
+                finally:
+                    release_process.set()
+                    thread.join(timeout=3)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0].output, "synthetic index details")
+            self.assertEqual(results[0].summary["Created"], 5)
+            subprocess_run.assert_called_once()
+            parse_output.assert_called_once()
+            self.assertTrue(context.critical_to_completion)
+
+    def test_controller_real_post_services_share_context_through_all_operations(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inbox, accounts, sources, destinations = self._create_screenshot_inputs(
+                root
+            )
+            script = root / "index-operation.ps1"
+            script.write_text("# synthetic", encoding="ascii")
+            controller = self._post_action_controller()
+            controller.paths = SimpleNamespace(
+                screenshot_inbox=inbox,
+                video_root=accounts,
+                index_root=root / "index",
+                index_refresh_logs=root / "refresh-logs",
+                index_cleanup_logs=root / "cleanup-logs",
+            )
+            controller.screenshots = ScreenshotService()
+            controller.indexer = IndexService()
+            context = OperationContext()
+            real_execute = controller.screenshots.execute
+            completed = (
+                SimpleNamespace(
+                    returncode=0,
+                    stdout=index_service_output("Refresh"),
+                    stderr="",
+                ),
+                SimpleNamespace(
+                    returncode=0,
+                    stdout=index_service_output("ManualCleanup"),
+                    stderr="",
+                ),
+            )
+
+            def execute_then_close(*args, **kwargs):
+                result = real_execute(*args, **kwargs)
+                self.assertTrue(context.critical_to_completion)
+                controller.startup_state = self._startup_state().CLOSING
+                self.assertFalse(context.request_cancel())
+                return result
+
+            with (
+                patch("douk_manager.integrations.indexer.os.name", "nt"),
+                patch(
+                    "douk_manager.integrations.indexer.resource_path",
+                    return_value=script,
+                ),
+                patch(
+                    "douk_manager.integrations.indexer.subprocess.run",
+                    side_effect=completed,
+                ) as subprocess_run,
+                patch.object(
+                    indexer_module,
+                    "parse_index_output",
+                    wraps=indexer_module.parse_index_output,
+                ) as parse_output,
+                patch.object(
+                    controller.screenshots,
+                    "execute",
+                    side_effect=execute_then_close,
+                ) as execute,
+                patch.object(
+                    controller.indexer,
+                    "refresh",
+                    wraps=controller.indexer.refresh,
+                ) as refresh,
+                patch.object(
+                    controller.indexer,
+                    "cleanup",
+                    wraps=controller.indexer.cleanup,
+                ) as cleanup,
+            ):
+                messages = controller.run_post_actions("batch", context=context)
+
+            self.assertIs(execute.call_args.kwargs["context"], context)
+            self.assertIs(refresh.call_args.kwargs["context"], context)
+            self.assertIs(cleanup.call_args.kwargs["context"], context)
+            self.assertEqual(subprocess_run.call_count, 2)
+            self.assertEqual(parse_output.call_count, 2)
+            self.assertEqual(len(messages), 3)
+            self.assertIn("快捷方式新建5", messages[1])
+            self.assertIn("重新扫描完成", messages[2])
+            self.assertTrue(context.critical_to_completion)
+            self.assertFalse(sources[0].exists())
+            self.assertEqual(destinations[0].read_bytes(), b"screenshot-1")
+
+    def test_post_admission_none_retires_identity_generation_binding_and_queue(
+        self,
+    ) -> None:
+        state = self._startup_state()
+        controller = SimpleNamespace(
+            startup_state=state.READY,
+            _download_lifecycle_active=True,
+            config=SimpleNamespace(
+                screenshot_post_mode="batch",
+                index_post_mode="none",
+                cleanup_after_index=False,
+            ),
+            logger=Mock(),
+            release_download_lifecycle=Mock(),
+        )
+        controller.release_download_lifecycle.side_effect = lambda: setattr(
+            controller,
+            "_download_lifecycle_active",
+            False,
+        )
+        run = SimpleNamespace(task_log=Path("logs/DownloadTask_20260820.log"))
+        lifecycle_identity = "download_lifecycle:admission-none"
+        window = SimpleNamespace(
+            controller=controller,
+            queue_output=object(),
+            queue_pause_button=object(),
+            queue_cancel_button=object(),
+            queue_pending=[Path("A2.json")],
+            queue_current=run,
+            queue_active=True,
+            _download_lifecycle_identity=lifecycle_identity,
+            _download_post_bindings={},
+            _download_post_completed_keys={"stale-lifecycle-key"},
+            _background_bindings={"unrelated-task": object()},
+            _background_generations={"unrelated-generation": 7},
+            _record_queue_elapsed=Mock(),
+            _cancel_shutdown_for_new_work=Mock(),
+            _append_info=Mock(),
+            coordinator=SimpleNamespace(
+                start=Mock(side_effect=TaskRejectedError("synthetic conflict"))
+            ),
+            statusBar=Mock(
+                return_value=SimpleNamespace(showMessage=Mock())
+            ),
+        )
+        window._submit_background = Mock(
+            side_effect=lambda *args, **kwargs: MainWindow._submit_background(
+                window,
+                *args,
+                **kwargs,
+            )
+        )
+        window._release_download_lifecycle = lambda: (
+            MainWindow._release_download_lifecycle(window)
+        )
+
+        MainWindow._run_post_actions_background(window, "batch", run)
+
+        deduplicate_key = MainWindow._download_post_action_key(
+            lifecycle_identity,
+            "batch",
+            run,
+        )
+        window._submit_background.assert_called_once()
+        window.coordinator.start.assert_called_once()
+        self.assertNotIn(deduplicate_key, window._download_post_bindings)
+        self.assertNotIn(deduplicate_key, window._background_generations)
+        self.assertEqual(
+            window._background_generations,
+            {"unrelated-generation": 7},
+        )
+        self.assertEqual(set(window._background_bindings), {"unrelated-task"})
+        self.assertEqual(window._download_post_completed_keys, set())
+        self.assertIsNone(window._download_lifecycle_identity)
+        self.assertEqual(window.queue_pending, [])
+        self.assertIsNone(window.queue_current)
+        self.assertFalse(window.queue_active)
+        self.assertFalse(controller._download_lifecycle_active)
+        controller.release_download_lifecycle.assert_called_once_with()
 
     def test_reconfigure_can_repair_paths_without_an_existing_startup_backup(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

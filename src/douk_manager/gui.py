@@ -113,6 +113,19 @@ class DownloadSummaryTaskBinding:
     business_finalized: bool = False
 
 
+@dataclass
+class DownloadPostActionTaskBinding:
+    timing: str
+    run: Any | None
+    deduplicate_key: str
+    generation: int
+    task_id: str | None = None
+    outcome: TaskState | None = None
+    terminal_consumed: bool = False
+    removed_consumed: bool = False
+    queue_decision_consumed: bool = False
+
+
 def _status_label(status: AccountStatus | str) -> str:
     labels = {
         AccountStatus.DOWNLOADED: "有新作品下载",
@@ -258,6 +271,9 @@ class MainWindow(QMainWindow):
         self.background_output: QTextEdit | None = None
         self.background_success: Callable[[object], None] | None = None
         self._download_summary_binding: DownloadSummaryTaskBinding | None = None
+        self._download_lifecycle_identity: str | None = None
+        self._download_post_bindings: dict[str, DownloadPostActionTaskBinding] = {}
+        self._download_post_completed_keys: set[str] = set()
         self.queue_run_source = ""
         self.queue_started_at: datetime | None = None
         self.current_task_started_at: datetime | None = None
@@ -2070,6 +2086,13 @@ class MainWindow(QMainWindow):
         if self.queue_started_at is None:
             self.queue_started_at = now
             self.queue_elapsed_label.setText("本次队列耗时：00:00:00（运行中）")
+        if getattr(self, "_download_lifecycle_identity", None) is None:
+            self._download_lifecycle_identity = (
+                f"download_lifecycle:{MainWindow._canonical_task_log(run.task_log)}"
+            )
+            getattr(self, "_download_post_bindings", {}).clear()
+            getattr(self, "_download_post_completed_keys", set()).clear()
+        run._download_lifecycle_identity = self._download_lifecycle_identity
         self.current_task_started_at = now
         self.task_elapsed_label.setText("当前任务耗时：00:00:00（运行中）")
 
@@ -2417,8 +2440,171 @@ class MainWindow(QMainWindow):
         self._record_task_elapsed(run, "已完成")
         self._run_post_actions_background("batch", run)
 
-    def _run_post_actions_background(self, timing: str, run) -> None:
+    @staticmethod
+    def _post_action_resource_keys(config: object, timing: str) -> frozenset[str]:
+        resources: set[str] = set()
+        if getattr(config, "screenshot_post_mode", None) == timing:
+            resources.update(("screenshots", "video_tree"))
+        if getattr(config, "index_post_mode", None) == timing:
+            resources.update(("video_tree", "index"))
+        return frozenset(resources)
+
+    @staticmethod
+    def _download_post_action_key(
+        lifecycle_identity: str,
+        timing: str,
+        run: object | None,
+    ) -> str:
+        if timing == "batch":
+            if run is None:
+                raise ValueError("batch post actions require an EngineRun")
+            run_identity = MainWindow._canonical_task_log(run.task_log)
+            return f"download_post_actions:{lifecycle_identity}:batch:{run_identity}"
+        if timing == "queue":
+            return f"download_post_actions:{lifecycle_identity}:queue"
+        raise ValueError(f"unsupported post-action timing: {timing}")
+
+    def _download_post_binding_is_current(
+        self, binding: DownloadPostActionTaskBinding
+    ) -> bool:
+        return (
+            getattr(self, "_download_post_bindings", {}).get(
+                binding.deduplicate_key
+            )
+            is binding
+            and getattr(self, "_background_generations", {}).get(
+                binding.deduplicate_key
+            )
+            == binding.generation
+        )
+
+    def _stop_download_post_queue(
+        self,
+        binding: DownloadPostActionTaskBinding,
+        *,
+        cancelled: bool = False,
+        closing: bool = False,
+    ) -> None:
+        if binding.queue_decision_consumed:
+            return
+        binding.queue_decision_consumed = True
+        getattr(self, "_download_post_completed_keys", set()).add(
+            binding.deduplicate_key
+        )
+        if not closing:
+            self._record_queue_elapsed(
+                "后续动作已取消" if cancelled else "后续动作失败"
+            )
+            self._append_info(
+                self.queue_output,
+                (
+                    "后续动作已取消；队列已停止，剩余任务不会启动。"
+                    if cancelled
+                    else (
+                        "【失败】队列后续动作失败；队列已停止，请检查上方错误。"
+                        if binding.timing == "queue"
+                        else "【失败】后续动作失败；队列已停止，剩余任务不会启动。"
+                    )
+                ),
+            )
+        self.queue_pending.clear()
+        self.queue_current = None
+        self.queue_active = False
+        self._release_download_lifecycle()
+
+    def _settle_download_post_action(
+        self,
+        binding: DownloadPostActionTaskBinding,
+        outcome: TaskState,
+        payload: object,
+    ) -> None:
+        if (
+            not MainWindow._download_post_binding_is_current(self, binding)
+            or binding.terminal_consumed
+            or binding.removed_consumed
+        ):
+            return
+        binding.terminal_consumed = True
+        binding.outcome = outcome
         if getattr(self.controller, "startup_state", None) is StartupState.CLOSING:
+            MainWindow._stop_download_post_queue(
+                self, binding, cancelled=outcome is TaskState.CANCELLED, closing=True
+            )
+            return
+        if outcome is TaskState.CANCELLED:
+            MainWindow._stop_download_post_queue(self, binding, cancelled=True)
+            return
+        if outcome is not TaskState.SUCCEEDED:
+            MainWindow._stop_download_post_queue(self, binding)
+            return
+        if binding.queue_decision_consumed:
+            return
+
+        binding.queue_decision_consumed = True
+        getattr(self, "_download_post_completed_keys", set()).add(
+            binding.deduplicate_key
+        )
+        messages = payload
+        if messages:
+            self._append_info(self.queue_output, *messages)
+        if binding.timing == "queue":
+            if self.queue_summaries_complete and self.queue_summaries_reliable:
+                summary_conclusion = "每个任务的账号汇总均完整且可靠。"
+            else:
+                summary_conclusion = (
+                    "至少一个任务的账号汇总不完整或不可靠；请查看上方信息及任务日志。"
+                )
+            self.controller.logger.info("下载队列执行结束：%s", summary_conclusion)
+            post_lines = [
+                line.strip()
+                for message in (messages or [])
+                for line in str(message).splitlines()
+                if line.strip()
+            ]
+            for line in post_lines:
+                self.controller.logger.info("队列后续动作：%s", line)
+            self._append_info(
+                self.queue_output,
+                f"队列执行结束。{summary_conclusion}",
+            )
+            self._record_queue_elapsed("已完成")
+            self.queue_active = False
+            self.queue_current = None
+            self._release_download_lifecycle()
+            self._begin_shutdown_countdown_if_requested()
+            return
+        self.queue_current = None
+        self._start_next_queue_item()
+
+    def _remove_download_post_action(
+        self, binding: DownloadPostActionTaskBinding
+    ) -> None:
+        if (
+            not MainWindow._download_post_binding_is_current(self, binding)
+            or binding.removed_consumed
+        ):
+            return
+        binding.removed_consumed = True
+        if getattr(self.controller, "startup_state", None) is StartupState.CLOSING:
+            MainWindow._stop_download_post_queue(self, binding, closing=True)
+        elif not binding.terminal_consumed:
+            self.controller.logger.error(
+                "下载后续动作在 Coordinator 终态前被移除：%s",
+                binding.deduplicate_key,
+            )
+            MainWindow._stop_download_post_queue(self, binding)
+        bindings = getattr(self, "_download_post_bindings", {})
+        if bindings.get(binding.deduplicate_key) is binding:
+            bindings.pop(binding.deduplicate_key, None)
+        generations = getattr(self, "_background_generations", {})
+        if generations.get(binding.deduplicate_key) == binding.generation:
+            generations.pop(binding.deduplicate_key, None)
+
+    def _run_post_actions_background(self, timing: str, run) -> None:
+        if (
+            getattr(self.controller, "startup_state", StartupState.READY)
+            is not StartupState.READY
+        ):
             return
         if not hasattr(self, "_background_bindings"):
             messages = self._run(
@@ -2441,75 +2627,117 @@ class MainWindow(QMainWindow):
             self._start_next_queue_item()
             return
 
-        spec = TaskSpec(
-            task_type="download_post_actions",
-            display_name="下载后续动作",
-            resource_keys=frozenset(
-                {"screenshots", "video_tree", "index"}
-            ),
-            deduplicate_key="download_post_actions",
-            cancellable=False,
-            close_policy=ClosePolicy.WAIT,
-            refresh_targets=("runtime_status", "download_results"),
+        lifecycle_identity = getattr(self, "_download_lifecycle_identity", None)
+        lifecycle_active = getattr(
+            self.controller, "_download_lifecycle_active", False
         )
-
-        def success(messages: object) -> None:
-            if messages:
-                self._append_info(self.queue_output, *messages)
-            if timing == "queue":
-                if self.queue_summaries_complete and self.queue_summaries_reliable:
-                    summary_conclusion = "每个任务的账号汇总均完整且可靠。"
-                else:
-                    summary_conclusion = (
-                        "至少一个任务的账号汇总不完整或不可靠；请查看上方信息及任务日志。"
-                    )
-                self.controller.logger.info(
-                    "下载队列执行结束：%s", summary_conclusion
-                )
-                post_lines = [
-                    line.strip()
-                    for message in (messages or [])
-                    for line in str(message).splitlines()
-                    if line.strip()
-                ]
-                for line in post_lines:
-                    self.controller.logger.info("队列后续动作：%s", line)
-                self._append_info(
-                    self.queue_output,
-                    f"队列执行结束。{summary_conclusion}",
-                )
-                self._record_queue_elapsed("已完成")
-                self.queue_active = False
-                self.queue_current = None
-                self._release_download_lifecycle()
-                self._begin_shutdown_countdown_if_requested()
-                return
-            self.queue_current = None
-            self._start_next_queue_item()
-
-        def failure(_payload: object) -> None:
-            self._record_queue_elapsed("后续动作失败")
-            self._append_info(
-                self.queue_output,
-                (
-                    "【失败】队列后续动作失败；队列已停止，请检查上方错误。"
-                    if timing == "queue"
-                    else "【失败】后续动作失败；队列已停止，剩余任务不会启动。"
-                ),
+        if not lifecycle_active:
+            self.controller.logger.info(
+                "忽略已释放下载生命周期的迟到后续动作请求：timing=%s",
+                timing,
+            )
+            return
+        if timing not in {"batch", "queue"} or lifecycle_identity is None:
+            self.controller.logger.error(
+                "下载后续动作缺少有效生命周期：timing=%s identity=%s",
+                timing,
+                lifecycle_identity,
             )
             self.queue_pending.clear()
             self.queue_current = None
             self.queue_active = False
             self._release_download_lifecycle()
+            return
+        if (
+            timing == "batch"
+            and run is not None
+            and getattr(run, "_download_lifecycle_identity", lifecycle_identity)
+            != lifecycle_identity
+        ):
+            self.controller.logger.info(
+                "忽略其他下载生命周期的迟到后续动作请求：%s",
+                run.task_log,
+            )
+            return
 
-        self._submit_background(
+        deduplicate_key = MainWindow._download_post_action_key(
+            lifecycle_identity, timing, run
+        )
+        bindings = getattr(self, "_download_post_bindings", None)
+        if bindings is None:
+            bindings = {}
+            self._download_post_bindings = bindings
+        completed = getattr(self, "_download_post_completed_keys", None)
+        if completed is None:
+            completed = set()
+            self._download_post_completed_keys = completed
+        if deduplicate_key in bindings or deduplicate_key in completed:
+            self.controller.logger.info(
+                "忽略重复下载后续动作请求：%s", deduplicate_key
+            )
+            return
+
+        generation = getattr(self, "_background_generations", {}).get(
+            deduplicate_key, 0
+        ) + 1
+        binding = DownloadPostActionTaskBinding(
+            timing=timing,
+            run=run,
+            deduplicate_key=deduplicate_key,
+            generation=generation,
+        )
+        bindings[deduplicate_key] = binding
+        config = self.controller.config
+        spec = TaskSpec(
+            task_type="download_post_actions",
+            display_name="下载后续动作",
+            resource_keys=MainWindow._post_action_resource_keys(config, timing),
+            deduplicate_key=deduplicate_key,
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            refresh_targets=("runtime_status", "download_results"),
+            dynamic_cancellation=True,
+        )
+        task_id = self._submit_background(
             spec,
-            lambda _token: self.controller.run_post_actions(timing),
+            lambda context: self.controller.run_post_actions(
+                timing, context=context
+            ),
             output=self.queue_output,
             buttons=(self.queue_pause_button, self.queue_cancel_button),
-            on_success=success,
-            on_failure=failure,
+            on_success=lambda payload: MainWindow._settle_download_post_action(
+                self, binding, TaskState.SUCCEEDED, payload
+            ),
+            on_failure=lambda payload: MainWindow._settle_download_post_action(
+                self, binding, TaskState.FAILED, payload
+            ),
+            on_cancelled=lambda payload: MainWindow._settle_download_post_action(
+                self, binding, TaskState.CANCELLED, payload
+            ),
+            on_removed=lambda: MainWindow._remove_download_post_action(
+                self, binding
+            ),
+            generation_key=deduplicate_key,
         )
+        if task_id is None:
+            bindings.pop(deduplicate_key, None)
+            self.controller.logger.error(
+                "下载后续动作未获 Coordinator admission：%s", deduplicate_key
+            )
+            self._record_queue_elapsed("后续动作未启动")
+            self.queue_pending.clear()
+            self.queue_current = None
+            self.queue_active = False
+            self._release_download_lifecycle()
+            return
+        binding.task_id = task_id
+        live_binding = getattr(self, "_background_bindings", {}).get(task_id)
+        if live_binding is not None:
+            binding.generation = live_binding.generation
+        else:
+            getattr(self, "_background_generations", {}).setdefault(
+                deduplicate_key, binding.generation
+            )
 
     def _shutdown_option_changed(self, state: int) -> None:
         checked = bool(state)
@@ -2594,13 +2822,33 @@ class MainWindow(QMainWindow):
         )
 
     @staticmethod
+    def _canonical_task_log(task_log: object) -> str:
+        path = os.path.abspath(os.path.normpath(os.fspath(task_log)))
+        return os.path.normcase(path)
+
+    @staticmethod
     def _download_summary_key(run) -> str:
-        task_log = os.path.abspath(os.path.normpath(os.fspath(run.task_log)))
-        return f"download_summary:{os.path.normcase(task_log)}"
+        return f"download_summary:{MainWindow._canonical_task_log(run.task_log)}"
 
     def _download_summary_is_active(self) -> bool:
         binding = getattr(self, "_download_summary_binding", None)
         return binding is not None and not binding.removed_consumed
+
+    def _download_post_owns_run(self, run: object) -> bool:
+        return any(
+            binding.run is run and not binding.removed_consumed
+            for binding in getattr(self, "_download_post_bindings", {}).values()
+        )
+
+    def _download_run_blocks_close(self) -> bool:
+        run = getattr(self, "queue_current", None)
+        if run is None:
+            return False
+        if getattr(run, "running", False) or getattr(
+            run, "result_review_waiting", False
+        ):
+            return True
+        return not MainWindow._download_post_owns_run(self, run)
 
     def _download_summary_matches_run(self, run) -> bool:
         deduplicate_key = MainWindow._download_summary_key(run)
@@ -3035,6 +3283,15 @@ class MainWindow(QMainWindow):
         release = getattr(self.controller, "release_download_lifecycle", None)
         if release is not None:
             release()
+        generations = getattr(self, "_background_generations", {})
+        for key, binding in tuple(
+            getattr(self, "_download_post_bindings", {}).items()
+        ):
+            if generations.get(key) == binding.generation:
+                generations.pop(key, None)
+        self._download_lifecycle_identity = None
+        getattr(self, "_download_post_bindings", {}).clear()
+        getattr(self, "_download_post_completed_keys", set()).clear()
 
     def _poll_processes(self) -> None:
         self._update_elapsed_labels()
@@ -3549,7 +3806,9 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
     def closeEvent(self, event) -> None:  # noqa: N802
-        if self.queue_current is not None or MainWindow._download_summary_is_active(self):
+        if MainWindow._download_run_blocks_close(
+            self
+        ) or MainWindow._download_summary_is_active(self):
             QMessageBox.information(
                 self,
                 "下载任务尚未汇总完成",
@@ -3572,8 +3831,8 @@ class MainWindow(QMainWindow):
             return
         if self.coordinator.has_active_tasks():
             self._close_pending = True
-            self.controller.begin_closing()
             self.coordinator.begin_closing()
+            self.controller.begin_closing()
             self._apply_action_gate()
             QMessageBox.information(
                 self,

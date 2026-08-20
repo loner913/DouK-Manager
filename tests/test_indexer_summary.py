@@ -4,6 +4,7 @@ import json
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from douk_manager.controller import ManagerController
 from douk_manager.integrations.indexer import IndexError, IndexResult, parse_index_output
@@ -97,10 +98,19 @@ class IndexSummaryTests(unittest.TestCase):
             index_post_mode="queue",
             cleanup_after_index=True,
         )
+        controller._download_lifecycle_active = True
+        controller.paths = SimpleNamespace(
+            video_root=Path("synthetic-videos"),
+            index_root=Path("synthetic-index"),
+            index_refresh_logs=Path("synthetic-refresh-logs"),
+            index_cleanup_logs=Path("synthetic-cleanup-logs"),
+        )
+        controller.logger = Mock()
+        controller.indexer = Mock()
         refresh_result = IndexResult(0, "", _summary())
         cleanup_result = IndexResult(0, "", _summary(Mode="ManualCleanup"))
-        controller.refresh_index = lambda: refresh_result
-        controller.cleanup_index = lambda: cleanup_result
+        controller.indexer.refresh.return_value = refresh_result
+        controller.indexer.cleanup.return_value = cleanup_result
 
         messages = controller.run_post_actions("queue")
 

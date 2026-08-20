@@ -1022,6 +1022,628 @@ class DownloadSummaryCoordinatorCorrectionTests(unittest.TestCase):
         closing_window._submit_background.assert_not_called()
 
 
+class DownloadPostActionsCoordinatorCorrectionTests(unittest.TestCase):
+    @staticmethod
+    def _post_window(
+        *,
+        screenshot_mode: str = "none",
+        index_mode: str = "none",
+        cleanup: bool = False,
+        lifecycle_identity: str = "download_lifecycle:c:/data/downloadtask_first.log",
+    ) -> tuple[SimpleNamespace, SimpleNamespace]:
+        run = SimpleNamespace(
+            task_log=Path("Data/DownloadTask_current.log"),
+            running=False,
+            result_review_waiting=False,
+            process=SimpleNamespace(returncode=0),
+        )
+        controller = SimpleNamespace(
+            startup_state=StartupState.READY,
+            config=SimpleNamespace(
+                screenshot_post_mode=screenshot_mode,
+                index_post_mode=index_mode,
+                cleanup_after_index=cleanup,
+            ),
+            _download_lifecycle_active=True,
+            run_post_actions=Mock(return_value=[]),
+            release_download_lifecycle=Mock(),
+            logger=Mock(),
+        )
+        window = SimpleNamespace(
+            controller=controller,
+            coordinator=SimpleNamespace(
+                has_active_tasks=Mock(return_value=False),
+                begin_closing=Mock(return_value=True),
+            ),
+            _background_bindings={},
+            _background_generations={},
+            _background_pending={},
+            _download_summary_binding=None,
+            _download_lifecycle_identity=lifecycle_identity,
+            _download_post_bindings={},
+            _download_post_completed_keys=set(),
+            _submit_background=Mock(return_value="post-task"),
+            _append_info=Mock(),
+            _refresh_background_targets=Mock(),
+            _start_next_queue_item=Mock(),
+            _record_queue_elapsed=Mock(),
+            _release_download_lifecycle=Mock(),
+            _begin_shutdown_countdown_if_requested=Mock(),
+            _apply_action_gate=Mock(),
+            _close_pending=False,
+            queue_output=object(),
+            queue_pause_button=SimpleNamespace(setEnabled=Mock()),
+            queue_cancel_button=SimpleNamespace(setEnabled=Mock()),
+            queue_pending=[Path("next.json")],
+            queue_current=run,
+            queue_active=True,
+            queue_summaries_complete=True,
+            queue_summaries_reliable=True,
+            queue_shutdown_requested=False,
+            background_thread=None,
+        )
+        return window, run
+
+    @staticmethod
+    def _capture_post_submission(
+        window: SimpleNamespace,
+        timing: str,
+        run: object | None,
+    ):
+        MainWindow._run_post_actions_background(window, timing, run)
+        return window._submit_background.call_args
+
+    def test_post_task_specs_freeze_exact_resource_matrix_and_cancel_contract(
+        self,
+    ) -> None:
+        cases = (
+            ("batch", "none", "none", False, frozenset()),
+            ("queue", "none", "none", True, frozenset()),
+            (
+                "batch",
+                "batch",
+                "none",
+                False,
+                frozenset({"screenshots", "video_tree"}),
+            ),
+            (
+                "queue",
+                "queue",
+                "none",
+                False,
+                frozenset({"screenshots", "video_tree"}),
+            ),
+            (
+                "batch",
+                "none",
+                "batch",
+                False,
+                frozenset({"video_tree", "index"}),
+            ),
+            (
+                "queue",
+                "none",
+                "queue",
+                True,
+                frozenset({"video_tree", "index"}),
+            ),
+            (
+                "batch",
+                "batch",
+                "batch",
+                True,
+                frozenset({"screenshots", "video_tree", "index"}),
+            ),
+            (
+                "queue",
+                "queue",
+                "batch",
+                True,
+                frozenset({"screenshots", "video_tree"}),
+            ),
+            (
+                "queue",
+                "queue",
+                "queue",
+                True,
+                frozenset({"screenshots", "video_tree", "index"}),
+            ),
+        )
+        for timing, screenshot_mode, index_mode, cleanup, expected in cases:
+            with self.subTest(
+                timing=timing,
+                screenshot=screenshot_mode,
+                index=index_mode,
+                cleanup=cleanup,
+            ):
+                window, run = self._post_window(
+                    screenshot_mode=screenshot_mode,
+                    index_mode=index_mode,
+                    cleanup=cleanup,
+                )
+                submitted = self._capture_post_submission(
+                    window, timing, run if timing == "batch" else None
+                )
+                spec = submitted.args[0]
+                self.assertEqual(spec.task_type, "download_post_actions")
+                self.assertEqual(spec.resource_keys, expected)
+                self.assertTrue(spec.cancellable)
+                self.assertTrue(spec.dynamic_cancellation)
+                self.assertIs(spec.close_policy, ClosePolicy.CANCEL)
+                self.assertEqual(
+                    spec.refresh_targets,
+                    ("runtime_status", "download_results"),
+                )
+
+    def test_post_action_key_is_canonical_and_scoped_to_lifecycle_run_and_timing(
+        self,
+    ) -> None:
+        run_a = SimpleNamespace(task_log=Path("Data/../Data/DownloadTask_A.log"))
+        run_a_equivalent = SimpleNamespace(task_log=Path("data/downloadtask_a.log"))
+        run_b = SimpleNamespace(task_log=Path("Data/DownloadTask_B.log"))
+
+        first = MainWindow._download_post_action_key(
+            "download_lifecycle:first", "batch", run_a
+        )
+        equivalent = MainWindow._download_post_action_key(
+            "download_lifecycle:first", "batch", run_a_equivalent
+        )
+        second_run = MainWindow._download_post_action_key(
+            "download_lifecycle:first", "batch", run_b
+        )
+        queue_post = MainWindow._download_post_action_key(
+            "download_lifecycle:first", "queue", None
+        )
+        second_lifecycle = MainWindow._download_post_action_key(
+            "download_lifecycle:second", "batch", run_a
+        )
+
+        self.assertEqual(first, equivalent)
+        self.assertEqual(len({first, second_run, queue_post, second_lifecycle}), 4)
+
+    def test_none_resources_still_use_lifecycle_dedup_and_ready_state_gate(
+        self,
+    ) -> None:
+        window, run = self._post_window()
+
+        submitted = self._capture_post_submission(window, "batch", run)
+        MainWindow._run_post_actions_background(window, "batch", run)
+
+        spec = submitted.args[0]
+        self.assertEqual(spec.resource_keys, frozenset())
+        self.assertEqual(window._submit_background.call_count, 1)
+        self.assertEqual(tuple(window._download_post_bindings), (spec.deduplicate_key,))
+        self.assertEqual(
+            window._background_generations,
+            {spec.deduplicate_key: 1},
+        )
+
+        for state in (
+            StartupState.BOOTSTRAPPING,
+            StartupState.SAFETY_CHECKING,
+            StartupState.DEGRADED_READ_ONLY,
+            StartupState.CLOSING,
+        ):
+            with self.subTest(state=state):
+                blocked, blocked_run = self._post_window()
+                blocked.controller.startup_state = state
+                identity = blocked._download_lifecycle_identity
+
+                MainWindow._run_post_actions_background(blocked, "batch", blocked_run)
+
+                blocked._submit_background.assert_not_called()
+                self.assertEqual(blocked._download_post_bindings, {})
+                self.assertEqual(blocked._background_generations, {})
+                self.assertEqual(blocked._download_lifecycle_identity, identity)
+                self.assertTrue(blocked.controller._download_lifecycle_active)
+                blocked._release_download_lifecycle.assert_not_called()
+                blocked._append_info.assert_not_called()
+
+    def test_post_resource_matrix_creates_only_real_coordinator_conflicts(
+        self,
+    ) -> None:
+        screenshot_window, screenshot_run = self._post_window(
+            screenshot_mode="batch",
+            lifecycle_identity="download_lifecycle:screenshots",
+        )
+        screenshot_spec = self._capture_post_submission(
+            screenshot_window, "batch", screenshot_run
+        ).args[0]
+        index_window, index_run = self._post_window(
+            index_mode="batch",
+            lifecycle_identity="download_lifecycle:index",
+        )
+        index_spec = self._capture_post_submission(
+            index_window, "batch", index_run
+        ).args[0]
+        empty_window, empty_run = self._post_window(
+            lifecycle_identity="download_lifecycle:empty"
+        )
+        empty_spec = self._capture_post_submission(
+            empty_window, "batch", empty_run
+        ).args[0]
+        unrelated = TaskSpec(
+            task_type="unrelated_reader",
+            display_name="unrelated reader",
+            resource_keys=frozenset({"result_logs", "collector_process"}),
+            deduplicate_key="unrelated_reader",
+        )
+
+        coordinator = BackgroundTaskCoordinator()
+        coordinator._records["screenshots"] = TaskRecord(
+            task_id="screenshots",
+            spec=screenshot_spec,
+            generation=1,
+            token=CancellationToken(),
+            thread=None,
+            worker=None,
+            state=TaskState.RUNNING,
+        )
+        with self.assertRaisesRegex(TaskRejectedError, "video_tree"):
+            coordinator._validate_start(index_spec)
+        coordinator._validate_start(unrelated)
+
+        coordinator._records.clear()
+        coordinator._records["index"] = TaskRecord(
+            task_id="index",
+            spec=index_spec,
+            generation=1,
+            token=CancellationToken(),
+            thread=None,
+            worker=None,
+            state=TaskState.RUNNING,
+        )
+        with self.assertRaisesRegex(TaskRejectedError, "(index|video_tree)"):
+            coordinator._validate_start(screenshot_spec)
+        coordinator._validate_start(unrelated)
+
+        coordinator._records.clear()
+        coordinator._records["unrelated"] = TaskRecord(
+            task_id="unrelated",
+            spec=unrelated,
+            generation=1,
+            token=CancellationToken(),
+            thread=None,
+            worker=None,
+            state=TaskState.RUNNING,
+        )
+        coordinator._validate_start(empty_spec)
+
+    def test_post_action_uses_same_context_and_duplicate_callbacks_decide_once(
+        self,
+    ) -> None:
+        window, run = self._post_window(
+            screenshot_mode="batch",
+            index_mode="batch",
+            cleanup=True,
+        )
+
+        submitted = self._capture_post_submission(window, "batch", run)
+        MainWindow._run_post_actions_background(window, "batch", run)
+
+        self.assertEqual(window._submit_background.call_count, 1)
+        context = OperationContext()
+        submitted.args[1](context)
+        window.controller.run_post_actions.assert_called_once_with(
+            "batch", context=context
+        )
+
+        submitted.kwargs["on_success"]([])
+        submitted.kwargs["on_success"]([])
+        submitted.kwargs["on_removed"]()
+        submitted.kwargs["on_removed"]()
+
+        window._start_next_queue_item.assert_called_once_with()
+        self.assertEqual(len(window._download_post_completed_keys), 1)
+        self.assertEqual(window._download_post_bindings, {})
+
+    def test_success_removal_and_late_duplicate_leave_no_lifecycle_state(self) -> None:
+        window, _run = self._post_window()
+        window.queue_pending = []
+
+        def release_controller_lifecycle() -> None:
+            window.controller._download_lifecycle_active = False
+
+        window.controller.release_download_lifecycle.side_effect = (
+            release_controller_lifecycle
+        )
+        window._release_download_lifecycle = lambda: (
+            MainWindow._release_download_lifecycle(window)
+        )
+
+        submitted = self._capture_post_submission(window, "queue", None)
+        spec = submitted.args[0]
+        self.assertEqual(window._background_generations[spec.deduplicate_key], 1)
+
+        submitted.kwargs["on_success"]([])
+        submitted.kwargs["on_removed"]()
+        MainWindow._run_post_actions_background(window, "queue", None)
+
+        self.assertEqual(window._submit_background.call_count, 1)
+        self.assertEqual(window._download_post_bindings, {})
+        self.assertEqual(window._download_post_completed_keys, set())
+        self.assertEqual(window._background_generations, {})
+        self.assertIsNone(window._download_lifecycle_identity)
+        self.assertFalse(window.controller._download_lifecycle_active)
+        self.assertFalse(window.queue_active)
+        self.assertIsNone(window.queue_current)
+        self.assertEqual(window.queue_pending, [])
+        window.controller.release_download_lifecycle.assert_called_once_with()
+
+    def test_post_admission_failure_releases_lifecycle_without_dangling_state(
+        self,
+    ) -> None:
+        window, run = self._post_window()
+        window._submit_background.return_value = None
+
+        def release_controller_lifecycle() -> None:
+            window.controller._download_lifecycle_active = False
+
+        window.controller.release_download_lifecycle.side_effect = (
+            release_controller_lifecycle
+        )
+        window._release_download_lifecycle = lambda: (
+            MainWindow._release_download_lifecycle(window)
+        )
+
+        MainWindow._run_post_actions_background(window, "batch", run)
+
+        window._submit_background.assert_called_once()
+        self.assertEqual(window._download_post_bindings, {})
+        self.assertEqual(window._download_post_completed_keys, set())
+        self.assertEqual(window._background_generations, {})
+        self.assertIsNone(window._download_lifecycle_identity)
+        self.assertFalse(window.controller._download_lifecycle_active)
+        self.assertFalse(window.queue_active)
+        self.assertIsNone(window.queue_current)
+        self.assertEqual(window.queue_pending, [])
+        window.controller.release_download_lifecycle.assert_called_once_with()
+
+    def test_cancel_failure_and_closing_each_stop_once_without_advancing(self) -> None:
+        for terminal in ("on_cancelled", "on_failure"):
+            with self.subTest(terminal=terminal):
+                window, run = self._post_window()
+                submitted = self._capture_post_submission(window, "batch", run)
+
+                submitted.kwargs[terminal](object())
+                submitted.kwargs[terminal](object())
+                submitted.kwargs["on_removed"]()
+                submitted.kwargs["on_removed"]()
+
+                self.assertFalse(window.queue_active)
+                self.assertEqual(window.queue_pending, [])
+                self.assertIsNone(window.queue_current)
+                window._start_next_queue_item.assert_not_called()
+                window._release_download_lifecycle.assert_called_once_with()
+                window._refresh_background_targets.assert_not_called()
+                window.controller._download_lifecycle_active = False
+                window._download_lifecycle_identity = None
+                window._download_post_completed_keys.clear()
+                MainWindow._run_post_actions_background(window, "batch", run)
+                self.assertEqual(window._submit_background.call_count, 1)
+                window._release_download_lifecycle.assert_called_once_with()
+
+        window, run = self._post_window()
+        submitted = self._capture_post_submission(window, "batch", run)
+        window.controller.startup_state = StartupState.CLOSING
+
+        submitted.kwargs["on_success"]([])
+        submitted.kwargs["on_removed"]()
+        submitted.kwargs["on_removed"]()
+
+        window._append_info.assert_not_called()
+        window._start_next_queue_item.assert_not_called()
+        window._begin_shutdown_countdown_if_requested.assert_not_called()
+        window._refresh_background_targets.assert_not_called()
+        window._release_download_lifecycle.assert_called_once_with()
+
+    def test_batch_post_close_enters_closing_but_running_download_still_rejects(
+        self,
+    ) -> None:
+        window, run = self._post_window()
+        self._capture_post_submission(window, "batch", run)
+        order: list[str] = []
+        window.coordinator.has_active_tasks.return_value = True
+        window.coordinator.begin_closing.side_effect = lambda: order.append(
+            "coordinator"
+        ) or False
+
+        def begin_controller_closing() -> None:
+            order.append("controller")
+            window.controller.startup_state = StartupState.CLOSING
+
+        window.controller.begin_closing = Mock(side_effect=begin_controller_closing)
+        window.controller.engine = SimpleNamespace(current=None)
+        window.controller.collector = SimpleNamespace(process=None)
+        window.controller.stop_collector = Mock()
+        event = SimpleNamespace(ignore=Mock(), accept=Mock())
+
+        with patch("douk_manager.gui.QMessageBox.information"):
+            MainWindow.closeEvent(window, event)
+
+        self.assertEqual(order, ["coordinator", "controller"])
+        event.ignore.assert_called_once_with()
+        event.accept.assert_not_called()
+        self.assertTrue(window._close_pending)
+
+        blocked, blocked_run = self._post_window()
+        blocked_run.running = True
+        blocked.controller.begin_closing = Mock()
+        blocked.controller.engine = SimpleNamespace(current=blocked_run)
+        blocked.controller.collector = SimpleNamespace(process=None)
+        blocked.controller.stop_collector = Mock()
+        blocked_event = SimpleNamespace(ignore=Mock(), accept=Mock())
+
+        with patch("douk_manager.gui.QMessageBox.information"):
+            MainWindow.closeEvent(blocked, blocked_event)
+
+        blocked_event.ignore.assert_called_once_with()
+        blocked.controller.begin_closing.assert_not_called()
+        blocked.coordinator.begin_closing.assert_not_called()
+
+        different, stale_run = self._post_window()
+        self._capture_post_submission(different, "batch", stale_run)
+        different.queue_current = SimpleNamespace(
+            task_log=Path("Data/DownloadTask_next.log"),
+            running=False,
+            result_review_waiting=False,
+            process=SimpleNamespace(returncode=0),
+        )
+        different.controller.begin_closing = Mock()
+        different.controller.engine = SimpleNamespace(current=None)
+        different.controller.collector = SimpleNamespace(process=None)
+        different.controller.stop_collector = Mock()
+        different_event = SimpleNamespace(ignore=Mock(), accept=Mock())
+
+        with patch("douk_manager.gui.QMessageBox.information"):
+            MainWindow.closeEvent(different, different_event)
+
+        different_event.ignore.assert_called_once_with()
+        different.controller.begin_closing.assert_not_called()
+        different.coordinator.begin_closing.assert_not_called()
+
+    def test_real_post_close_cancel_and_critical_wait_have_one_terminal(self) -> None:
+        app = QCoreApplication.instance() or QCoreApplication([])
+        for first_actor, expected_outcome in (
+            ("close", TaskState.CANCELLED),
+            ("critical", TaskState.SUCCEEDED),
+        ):
+            with self.subTest(first_actor=first_actor):
+                coordinator = BackgroundTaskCoordinator()
+                window, run = self._post_window()
+                arbitration_barrier = threading.Barrier(2)
+                allow_critical = threading.Event()
+                critical_attempted = threading.Event()
+                critical_entered = threading.Event()
+                release_action = threading.Event()
+                action_done = threading.Event()
+                window.coordinator = coordinator
+                window._cancel_shutdown_for_new_work = Mock()
+                window.statusBar = Mock(
+                    return_value=SimpleNamespace(showMessage=Mock())
+                )
+                window._background_binding_is_current = (
+                    lambda binding, generation: MainWindow._background_binding_is_current(
+                        window, binding, generation
+                    )
+                )
+                window._submit_background = (
+                    lambda *args, **kwargs: MainWindow._submit_background(
+                        window, *args, **kwargs
+                    )
+                )
+                window._release_download_lifecycle = (
+                    lambda: MainWindow._release_download_lifecycle(window)
+                )
+                window.controller.engine = SimpleNamespace(current=None)
+                window.controller.collector = SimpleNamespace(process=None)
+                window.controller.stop_collector = Mock()
+
+                def run_post_actions(
+                    timing: str, *, context: OperationContext
+                ) -> list[str]:
+                    self.assertEqual(timing, "batch")
+                    try:
+                        arbitration_barrier.wait(2.0)
+                        if not allow_critical.wait(2.0):
+                            raise RuntimeError("critical arbitration event timed out")
+                        context.enter_critical_phase()
+                        critical_entered.set()
+                        if not release_action.wait(2.0):
+                            raise RuntimeError("post action release event timed out")
+                        context.raise_if_cancelled()
+                        return []
+                    finally:
+                        critical_attempted.set()
+                        action_done.set()
+
+                window.controller.run_post_actions = run_post_actions
+                close_order: list[str] = []
+                original_begin_closing = coordinator.begin_closing
+
+                def begin_coordinator_closing() -> bool:
+                    close_order.append("coordinator")
+                    return original_begin_closing()
+
+                coordinator.begin_closing = begin_coordinator_closing
+
+                def begin_controller_closing() -> None:
+                    close_order.append("controller")
+                    window.controller.startup_state = StartupState.CLOSING
+
+                window.controller.begin_closing = begin_controller_closing
+                settlements: list[tuple[object, ...]] = []
+                removals: list[str] = []
+                coordinator.task_settled.connect(
+                    lambda *args: settlements.append(args)
+                )
+                coordinator.task_removed.connect(removals.append)
+                coordinator.task_settled.connect(
+                    lambda *args: MainWindow._on_background_task_settled(
+                        window, *args
+                    )
+                )
+                coordinator.task_removed.connect(
+                    lambda task_id: MainWindow._on_background_task_removed(
+                        window, task_id
+                    )
+                )
+
+                MainWindow._run_post_actions_background(window, "batch", run)
+                self.assertEqual(len(coordinator._records), 1)
+                record = next(iter(coordinator._records.values()))
+                thread = record.thread
+                self.assertIsNotNone(thread)
+                destroyed: list[bool] = []
+                thread.destroyed.connect(lambda *_: destroyed.append(True))
+                close_event = SimpleNamespace(ignore=Mock(), accept=Mock())
+
+                arbitration_barrier.wait(2.0)
+                if first_actor == "critical":
+                    allow_critical.set()
+                    self.assertTrue(critical_entered.wait(2.0))
+                    self.assertTrue(record.operation_context.critical_to_completion)
+                    self.assertFalse(record.operation_context.cancel_requested)
+                    with patch("douk_manager.gui.QMessageBox.information"):
+                        MainWindow.closeEvent(window, close_event)
+                else:
+                    with patch("douk_manager.gui.QMessageBox.information"):
+                        MainWindow.closeEvent(window, close_event)
+                    self.assertTrue(record.operation_context.cancel_requested)
+                    self.assertFalse(record.operation_context.critical_to_completion)
+                    allow_critical.set()
+                    self.assertTrue(critical_attempted.wait(2.0))
+
+                self.assertEqual(close_order, ["coordinator", "controller"])
+                self.assertIs(window.controller.startup_state, StartupState.CLOSING)
+                close_event.ignore.assert_called_once_with()
+                release_action.set()
+                self.assertTrue(action_done.wait(2.0))
+                for _ in range(1000):
+                    app.processEvents()
+                    if not coordinator.has_active_tasks():
+                        break
+                for _ in range(1000):
+                    QCoreApplication.sendPostedEvents(
+                        None, QEvent.Type.DeferredDelete
+                    )
+                    app.processEvents()
+                    if destroyed:
+                        break
+
+                self.assertFalse(coordinator.has_active_tasks())
+                self.assertEqual(len(settlements), 1)
+                self.assertIs(settlements[0][2], expected_outcome)
+                self.assertEqual(removals, [record.task_id])
+                self.assertEqual(destroyed, [True])
+                self.assertFalse(coordinator.findChildren(QThread))
+                self.assertEqual(window._download_post_bindings, {})
+                window._start_next_queue_item.assert_not_called()
+                window._refresh_background_targets.assert_not_called()
+                window._begin_shutdown_countdown_if_requested.assert_not_called()
+                window.controller.release_download_lifecycle.assert_called_once_with()
+
+
 class PhaseTwoReadOnlyTaskTests(unittest.TestCase):
     @staticmethod
     def _history_run(path: str, *, complete: bool = True) -> DownloadTaskHistory:
