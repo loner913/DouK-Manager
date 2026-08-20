@@ -239,24 +239,23 @@ def construct_real_main_window() -> MainWindow:
 
 
 def required_main_window_calls(window: MainWindow, entry: str) -> None:
-    calls = {
-        "collector_stop": window._stop_collector,
-        "collector_migration": window._migrate_collector,
-        "index_self_test": window._cleanup_index_self_test,
-        "task_scan": window.refresh_tasks,
-        "engine_preview": window._preview_engine_update,
-    }
-    if entry == "manual_backup":
+    if entry == "collector_stop":
+        window._stop_collector()
+    elif entry == "collector_migration":
+        window._migrate_collector()
+    elif entry == "manual_backup":
         with patch(
             "douk_manager.gui.QMessageBox.question", return_value=QMessageBox.Yes
         ):
             window._manual_backup()
-        return
-    try:
-        action = calls[entry]
-    except KeyError as exc:
-        raise ValueError(f"unknown required MainWindow entry: {entry}") from exc
-    action()
+    elif entry == "index_self_test":
+        window._cleanup_index_self_test()
+    elif entry == "task_scan":
+        window.refresh_tasks()
+    elif entry == "engine_preview":
+        window._preview_engine_update()
+    else:
+        raise ValueError(f"unknown required MainWindow entry: {entry}")
 
 
 class _ExitedProcess:
