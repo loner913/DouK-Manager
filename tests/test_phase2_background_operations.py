@@ -3361,5 +3361,118 @@ class PhaseOneFreezeTests(unittest.TestCase):
         self.assertEqual(settlements[0][2], TaskState.SUCCEEDED)
 
 
+class Phase2QtProbeExecutionContractTests(unittest.TestCase):
+    def test_one_round_uses_one_real_window_and_real_qthreads_for_all_entries(
+        self,
+    ) -> None:
+        from tests import phase2_qt_lifecycle_probe as probe
+
+        evidence = probe.run_round(1)
+
+        self.assertEqual(evidence["status"], "passed")
+        self.assertEqual(evidence["window_type"], "douk_manager.gui.MainWindow")
+        self.assertEqual(
+            evidence["coordinator_type"],
+            "douk_manager.background.BackgroundTaskCoordinator",
+        )
+        self.assertEqual(evidence["window_instances"], 1)
+        self.assertEqual(
+            evidence["required_entry_calls"],
+            [
+                "collector_stop",
+                "collector_migration",
+                "manual_backup",
+                "index_self_test",
+                "task_scan",
+                "engine_preview",
+            ],
+        )
+        self.assertEqual(
+            evidence["summary_post_sequence"],
+            [
+                "summary_started",
+                "summary_settled",
+                "summary_removed",
+                "post_started_after_summary_removal",
+                "post_settled",
+                "post_removed",
+            ],
+        )
+        required_task_types = {
+            "download_summary",
+            "download_post_actions",
+            "collector_stop",
+            "collector_migration",
+            "full_volume_backup",
+            "index_cleanup_self_test",
+            "task_list_snapshot",
+            "engine_update_preview",
+        }
+        tasks = evidence["tasks"]
+        self.assertTrue(required_task_types.issubset({task["task_type"] for task in tasks}))
+        self.assertEqual(len({task["task_id"] for task in tasks}), len(tasks))
+        for task in tasks:
+            self.assertTrue(task["thread_started"])
+            self.assertTrue(task["thread_running_after_start"])
+            self.assertEqual(task["worker_type"], "douk_manager.background.TaskWorker")
+            self.assertEqual(task["thread_type"], "PySide6.QtCore.QThread")
+            self.assertEqual(task["action_thread_name"], task["thread_name"])
+            self.assertEqual(task["settled_count"], 1)
+            self.assertEqual(task["removed_count"], 1)
+            self.assertEqual(task["thread_finished_count"], 1)
+            self.assertEqual(task["thread_destroyed_count"], 1)
+            self.assertEqual(task["worker_destroyed_count"], 1)
+        self.assertEqual(evidence["active_records_after"], 0)
+        self.assertEqual(evidence["bindings_after"], 0)
+        self.assertEqual(evidence["pending_after"], 0)
+        self.assertEqual(evidence["qthreads_after"], 0)
+        self.assertEqual(set(evidence["validated_real_specs"]), required_task_types)
+        self.assertEqual(evidence["generic_protocol"]["mode"], "cancel_before_critical")
+        self.assertTrue(evidence["generic_protocol"]["cancellation_accepted"])
+        self.assertEqual(evidence["generic_protocol"]["actual_outcome"], "CANCELLED")
+        self.assertEqual(
+            evidence["generic_protocol"]["finished_observation"],
+            [
+                {
+                    "observer": "direct_before_coordinator",
+                    "record_present": True,
+                    "terminal_seen": True,
+                    "thread_finished_seen": False,
+                }
+            ],
+        )
+        self.assertEqual(evidence["closing_protocol"]["mode"], "cancel_before_critical")
+        self.assertEqual(evidence["closing_protocol"]["actual_outcome"], "CANCELLED")
+        self.assertTrue(evidence["closing_protocol"]["ui_unchanged"])
+        self.assertTrue(evidence["closing_protocol"]["late_refresh_suppressed"])
+        self.assertTrue(evidence["closing_protocol"]["closing_entry_rejected"])
+        self.assertEqual(evidence["round_cleanup"]["active_records_after_cleanup"], 0)
+        self.assertEqual(evidence["round_cleanup"]["qthreads_after_cleanup"], 0)
+        self.assertEqual(evidence["round_cleanup"]["errors"], [])
+        self.assertEqual(evidence["window_cleanup"]["window_destroyed_count"], 1)
+
+    def test_adjacent_round_proves_critical_wins_and_closing_suppresses_ui(self) -> None:
+        from tests import phase2_qt_lifecycle_probe as probe
+
+        evidence = probe.run_round(2)
+
+        self.assertEqual(evidence["status"], "passed")
+        self.assertEqual(evidence["window_instances"], 1)
+        self.assertEqual(evidence["generic_protocol"]["mode"], "critical_before_cancel")
+        self.assertFalse(evidence["generic_protocol"]["cancellation_accepted"])
+        self.assertEqual(evidence["generic_protocol"]["actual_outcome"], "SUCCEEDED")
+        self.assertEqual(evidence["closing_protocol"]["mode"], "critical_before_cancel")
+        self.assertEqual(
+            evidence["closing_protocol"]["arbitration"],
+            {"cancel_requested": False, "critical_to_completion": True},
+        )
+        self.assertEqual(evidence["closing_protocol"]["actual_outcome"], "SUCCEEDED")
+        self.assertTrue(evidence["closing_protocol"]["ui_unchanged"])
+        self.assertTrue(evidence["closing_protocol"]["late_refresh_suppressed"])
+        self.assertTrue(evidence["closing_protocol"]["closing_entry_rejected"])
+        self.assertEqual(evidence["round_cleanup"]["errors"], [])
+        self.assertEqual(evidence["window_cleanup"]["window_destroyed_count"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
