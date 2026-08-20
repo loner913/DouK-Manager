@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -47,6 +48,12 @@ from douk_manager.core.download_summary import AccountStatus, format_summary_for
 from douk_manager.core.engine import ENGINE_MODE_MONITOR, assess_process_exit
 from douk_manager.core.power import request_normal_shutdown
 from douk_manager.core.result_history import ResultPageSnapshot
+from douk_manager.core.result_dashboard import (
+    DashboardFileFingerprint,
+    DashboardTaskIndex,
+    DashboardTaskIndexEntry,
+    ResultDashboardSnapshot,
+)
 from douk_manager.core.settings_tasks import EarliestRule
 from douk_manager.core.task_order import move_to_index
 from douk_manager.ui_messages import format_information
@@ -134,6 +141,20 @@ def _status_label(status: AccountStatus | str) -> str:
         AccountStatus.PRIVATE: "私密账号",
         AccountStatus.ERROR: "处理异常",
         AccountStatus.INTERRUPTED: "处理中断",
+    }
+    return labels.get(status, str(status))
+
+
+def _dashboard_status_label(status: AccountStatus | str) -> str:
+    labels = {
+        AccountStatus.DOWNLOADED: "有新作品下载",
+        AccountStatus.ALL_SKIPPED: "作品均被引擎跳过",
+        AccountStatus.NO_ELIGIBLE_WORKS: "无符合条件作品",
+        AccountStatus.PRIVATE: "私密账号",
+        AccountStatus.ERROR: "处理异常，需核对",
+        AccountStatus.INTERRUPTED: "处理中断",
+        "pre_start_error": "进入处理前异常",
+        "not_started": "未开始",
     }
     return labels.get(status, str(status))
 
@@ -247,6 +268,12 @@ class MainWindow(QMainWindow):
         self._background_generations: dict[str, int] = {}
         self._background_pending: dict[str, PendingBackgroundRequest] = {}
         self._result_snapshot: ResultPageSnapshot | None = None
+        self._dashboard_index: DashboardTaskIndex | None = None
+        self._dashboard_snapshot: ResultDashboardSnapshot | None = None
+        self._dashboard_entries: dict[str, DashboardTaskIndexEntry] = {}
+        self._dashboard_user_selected = False
+        self._dashboard_syncing_selector = False
+        self._dashboard_index_load_pending: bool | None = None
         self._collector_stop_task_id: str | None = None
         self.startup_generation = 0
         self._startup_task_id: str | None = None
@@ -345,6 +372,19 @@ class MainWindow(QMainWindow):
             widget.setEnabled(diagnostic_enabled)
         for widget in self._safe_widgets:
             widget.setEnabled(safe_enabled)
+        dashboard_enabled = state is StartupState.READY
+        if hasattr(self, "dashboard_refresh_button"):
+            self.dashboard_refresh_button.setEnabled(dashboard_enabled)
+            self.dashboard_task_selector.setEnabled(dashboard_enabled)
+            self.dashboard_native_selector.setEnabled(dashboard_enabled)
+        if hasattr(self, "dashboard_open_task_button"):
+            self.dashboard_open_task_button.setEnabled(
+                dashboard_enabled and self._dashboard_current_entry() is not None
+            )
+        if hasattr(self, "dashboard_open_native_button"):
+            self.dashboard_open_native_button.setEnabled(
+                dashboard_enabled and self.dashboard_native_selector.count() > 0
+            )
 
     def begin_startup_check(self) -> bool:
         if self.controller.startup_state is StartupState.CLOSING:
@@ -546,6 +586,9 @@ class MainWindow(QMainWindow):
         self.result_page = self._result_tab()
         tabs.addTab(self.result_page, "下载结果")
         self.result_tab_index = tabs.indexOf(self.result_page)
+        self.dashboard_page = self._result_dashboard_tab()
+        tabs.addTab(self.dashboard_page, "结果看板")
+        self.dashboard_tab_index = tabs.indexOf(self.dashboard_page)
         tabs.currentChanged.connect(self._tab_changed)
         corner = QWidget()
         corner_layout = QHBoxLayout(corner)
@@ -573,6 +616,11 @@ class MainWindow(QMainWindow):
             and self.controller.startup_state is StartupState.READY
         ):
             self.refresh_results()
+        if (
+            index == getattr(self, "dashboard_tab_index", -1)
+            and self.controller.startup_state is StartupState.READY
+        ):
+            self.refresh_result_dashboard()
 
     def _overview_tab(self) -> QWidget:
         page = QWidget()
@@ -1200,6 +1248,515 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.result_last_refresh)
         return page
 
+    def _result_dashboard_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        header = QHBoxLayout()
+        header.addWidget(QLabel("任务"))
+        self.dashboard_task_selector = QComboBox()
+        self._mark_safe_widget(self.dashboard_task_selector)
+        self.dashboard_task_selector.setMinimumContentsLength(34)
+        self.dashboard_task_selector.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.dashboard_task_selector.currentIndexChanged.connect(
+            self._dashboard_task_selected
+        )
+        header.addWidget(self.dashboard_task_selector, 1)
+        self.dashboard_refresh_button = QPushButton("刷新")
+        self._mark_safe_widget(self.dashboard_refresh_button)
+        self.dashboard_refresh_button.setToolTip("强制重新读取任务索引和当前任务日志")
+        self.dashboard_refresh_button.clicked.connect(
+            lambda _checked=False: self.refresh_result_dashboard(force_refresh=True)
+        )
+        header.addWidget(self.dashboard_refresh_button)
+        self.dashboard_open_task_button = QPushButton("打开任务日志")
+        self._mark_safe_widget(self.dashboard_open_task_button)
+        self.dashboard_open_task_button.clicked.connect(self._open_dashboard_task_log)
+        self.dashboard_open_task_button.setEnabled(False)
+        header.addWidget(self.dashboard_open_task_button)
+        self.dashboard_native_selector = QComboBox()
+        self._mark_safe_widget(self.dashboard_native_selector)
+        self.dashboard_native_selector.setMinimumContentsLength(18)
+        header.addWidget(self.dashboard_native_selector)
+        self.dashboard_open_native_button = QPushButton("打开原始日志")
+        self._mark_safe_widget(self.dashboard_open_native_button)
+        self.dashboard_open_native_button.clicked.connect(
+            self._open_dashboard_native_log
+        )
+        self.dashboard_open_native_button.setEnabled(False)
+        header.addWidget(self.dashboard_open_native_button)
+        layout.addLayout(header)
+
+        self.dashboard_message = QLabel("等待加载")
+        self.dashboard_message.setWordWrap(True)
+        self.dashboard_message.setObjectName("dashboardMessage")
+        layout.addWidget(self.dashboard_message)
+        self.dashboard_current_task = QLabel("当前显示：无")
+        self.dashboard_current_task.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.dashboard_current_task.setWordWrap(True)
+        layout.addWidget(self.dashboard_current_task)
+
+        metrics = QGridLayout()
+        metric_names = (
+            ("planned", "计划账号"),
+            ("started", "实际开始"),
+            ("complete", "完整性"),
+            ("reliable", "可靠性"),
+            ("anomaly", "附加异常"),
+            ("unstarted", "未进入处理"),
+        )
+        self.dashboard_metric_values: dict[str, QLabel] = {}
+        for position, (key, title) in enumerate(metric_names):
+            card = QFrame()
+            card.setObjectName("dashboardMetric")
+            card.setFrameShape(QFrame.Shape.StyledPanel)
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(10, 7, 10, 7)
+            name_label = QLabel(title)
+            name_label.setObjectName("dashboardMetricTitle")
+            value_label = QLabel("—")
+            value_label.setObjectName("dashboardMetricValue")
+            value_label.setWordWrap(True)
+            card_layout.addWidget(name_label)
+            card_layout.addWidget(value_label)
+            self.dashboard_metric_values[key] = value_label
+            metrics.addWidget(card, position // 3, position % 3)
+        layout.addLayout(metrics)
+
+        detail_layout = QHBoxLayout()
+        distribution_box = QGroupBox("六类主状态分布")
+        distribution_layout = QVBoxLayout(distribution_box)
+        self.dashboard_distribution = QTableWidget(len(AccountStatus), 3)
+        self.dashboard_distribution.setHorizontalHeaderLabels(
+            ("主状态", "数量", "占实际开始")
+        )
+        self.dashboard_distribution.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.dashboard_distribution.setSelectionMode(
+            QAbstractItemView.SelectionMode.NoSelection
+        )
+        self.dashboard_distribution.verticalHeader().setVisible(False)
+        self.dashboard_distribution.horizontalHeader().setStretchLastSection(True)
+        self.dashboard_distribution.setFixedHeight(210)
+        distribution_layout.addWidget(self.dashboard_distribution)
+        detail_layout.addWidget(distribution_box, 1)
+
+        integrity_box = QGroupBox("完整性与证据")
+        integrity_layout = QVBoxLayout(integrity_box)
+        self.dashboard_integrity = QLabel("尚未加载")
+        self.dashboard_integrity.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+        )
+        self.dashboard_integrity.setWordWrap(True)
+        self.dashboard_integrity.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        integrity_layout.addWidget(self.dashboard_integrity)
+        detail_layout.addWidget(integrity_box, 1)
+        layout.addLayout(detail_layout)
+
+        account_box = QGroupBox("账号明细")
+        account_layout = QVBoxLayout(account_box)
+        self.dashboard_account_table = QTableWidget(0, 4)
+        self.dashboard_account_table.setHorizontalHeaderLabels(
+            ("账号", "主状态", "异常附加", "证据来源")
+        )
+        self.dashboard_account_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.dashboard_account_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.dashboard_account_table.horizontalHeader().setStretchLastSection(True)
+        self.dashboard_account_table.setFixedHeight(230)
+        account_layout.addWidget(self.dashboard_account_table)
+        layout.addWidget(account_box)
+        return page
+
+    @staticmethod
+    def _dashboard_key(path: Path | str) -> str:
+        return os.path.normcase(str(Path(path).resolve()))
+
+    def _dashboard_current_entry(self) -> DashboardTaskIndexEntry | None:
+        if not hasattr(self, "dashboard_task_selector"):
+            return None
+        value = self.dashboard_task_selector.currentData()
+        if not value:
+            return None
+        return getattr(self, "_dashboard_entries", {}).get(str(value))
+
+    def refresh_result_dashboard(
+        self,
+        *,
+        force_refresh: bool = False,
+        auto_refresh: bool = False,
+    ) -> None:
+        if (
+            self.controller.startup_state is not StartupState.READY
+            or not hasattr(self, "dashboard_task_selector")
+        ):
+            return
+        self.dashboard_message.setText("正在刷新任务索引…")
+        spec = TaskSpec(
+            task_type="result_dashboard_index",
+            display_name="刷新结果看板任务索引",
+            resource_keys=frozenset({"result_logs"}),
+            deduplicate_key="result_dashboard_index",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            dynamic_cancellation=True,
+        )
+        self._submit_coalesced_background(
+            spec,
+            lambda context: self.controller.result_dashboard_index(
+                force_refresh=force_refresh, context=context
+            ),
+            buttons=(self.dashboard_refresh_button, self.dashboard_task_selector),
+            on_success=lambda index: self._apply_dashboard_index(
+                index,
+                force_refresh=force_refresh,
+                auto_refresh=auto_refresh,
+            ),
+            on_failure=lambda payload: self._dashboard_load_failed(
+                payload, "刷新任务索引失败"
+            ),
+            on_removed=self._dashboard_index_removed,
+            generation_key="result_dashboard_index",
+        )
+
+    def _apply_dashboard_index(
+        self,
+        index: DashboardTaskIndex,
+        *,
+        force_refresh: bool,
+        auto_refresh: bool,
+    ) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        previous = self._dashboard_current_entry()
+        previous_key = (
+            self._dashboard_key(previous.task_log) if previous is not None else None
+        )
+        entries = {
+            self._dashboard_key(entry.task_log): entry for entry in index.entries
+        }
+        default_key = (
+            self._dashboard_key(index.default_task)
+            if index.default_task is not None
+            else None
+        )
+        preserve_previous = previous_key in entries and (
+            getattr(self, "_dashboard_user_selected", False)
+            or force_refresh
+            or not auto_refresh
+        )
+        selected_key = previous_key if preserve_previous else default_key
+
+        self._dashboard_index = index
+        self._dashboard_entries = entries
+        self._dashboard_index_load_pending = force_refresh
+        self._dashboard_syncing_selector = True
+        self.dashboard_task_selector.blockSignals(True)
+        try:
+            self.dashboard_task_selector.clear()
+            for entry in index.entries:
+                when = (
+                    entry.ended_at.strftime("%Y-%m-%d %H:%M:%S")
+                    if entry.ended_at is not None
+                    else "时间未知"
+                )
+                name = entry.task_template or entry.task_log.name
+                suffix = {
+                    "ready": "",
+                    "pending": " [汇总中]",
+                    "unavailable": " [不可展示]",
+                }[entry.state]
+                self.dashboard_task_selector.addItem(
+                    f"{when} / {name}{suffix}", self._dashboard_key(entry.task_log)
+                )
+            if selected_key is not None:
+                selected_index = self.dashboard_task_selector.findData(selected_key)
+                if selected_index >= 0:
+                    self.dashboard_task_selector.setCurrentIndex(selected_index)
+        finally:
+            self.dashboard_task_selector.blockSignals(False)
+            self._dashboard_syncing_selector = False
+
+        self.dashboard_open_task_button.setEnabled(
+            self._dashboard_current_entry() is not None
+        )
+        if not index.entries:
+            self._dashboard_index_load_pending = None
+            self.dashboard_message.setText("没有可用的 DownloadTask 任务日志。")
+            if self._dashboard_snapshot is None:
+                self._reset_dashboard_view()
+            return
+        self.dashboard_message.setText("任务索引已更新，正在等待读取所选任务…")
+
+    def _dashboard_index_removed(self) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        if any(
+            binding.generation_key == "result_dashboard_index"
+            for binding in self._background_bindings.values()
+        ):
+            return
+        pending = getattr(self, "_dashboard_index_load_pending", None)
+        if pending is None:
+            return
+        self._dashboard_index_load_pending = None
+        self._load_dashboard_selection(force_refresh=bool(pending))
+
+    def _dashboard_task_selected(self, _index: int) -> None:
+        if getattr(self, "_dashboard_syncing_selector", False):
+            return
+        self._dashboard_user_selected = True
+        self.dashboard_open_task_button.setEnabled(
+            self._dashboard_current_entry() is not None
+        )
+        self._load_dashboard_selection(force_refresh=False)
+
+    def _load_dashboard_selection(self, *, force_refresh: bool) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        entry = self._dashboard_current_entry()
+        if entry is None:
+            self.dashboard_message.setText("没有选中的任务日志。")
+            return
+        if not entry.displayable:
+            prefix = "所选任务正在等待汇总" if entry.state == "pending" else "所选任务不可展示"
+            stable = self._dashboard_snapshot
+            suffix = (
+                f" 下方保留最后稳定任务 {stable.task_log.name} 的结果。"
+                if stable is not None
+                else ""
+            )
+            self.dashboard_message.setText(f"{prefix}：{entry.reason}{suffix}")
+            self.dashboard_native_selector.clear()
+            self.dashboard_open_native_button.setEnabled(False)
+            if stable is None:
+                self._reset_dashboard_view()
+            return
+
+        requested_path = entry.task_log
+        expected_fingerprint = entry.fingerprint
+        self.dashboard_message.setText(f"正在加载 {requested_path.name}…")
+        spec = TaskSpec(
+            task_type="result_dashboard_task",
+            display_name="读取结果看板任务",
+            resource_keys=frozenset({"result_logs"}),
+            deduplicate_key="result_dashboard_task",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            dynamic_cancellation=True,
+        )
+        self._submit_coalesced_background(
+            spec,
+            lambda context: self.controller.result_dashboard_snapshot(
+                requested_path,
+                expected_fingerprint=expected_fingerprint,
+                force_refresh=force_refresh,
+                context=context,
+            ),
+            buttons=(self.dashboard_refresh_button,),
+            on_success=lambda snapshot: self._render_dashboard_snapshot_if_current(
+                snapshot, requested_path, expected_fingerprint
+            ),
+            on_failure=lambda payload: self._dashboard_load_failed(
+                payload, f"读取 {requested_path.name} 失败"
+            ),
+            generation_key="result_dashboard_task",
+        )
+
+    def _render_dashboard_snapshot_if_current(
+        self,
+        snapshot: ResultDashboardSnapshot,
+        requested_path: Path,
+        expected_fingerprint: DashboardFileFingerprint,
+    ) -> bool:
+        if self.controller.startup_state is not StartupState.READY:
+            return False
+        entry = self._dashboard_current_entry()
+        if (
+            entry is None
+            or self._dashboard_key(entry.task_log) != self._dashboard_key(requested_path)
+            or self._dashboard_key(snapshot.task_log) != self._dashboard_key(requested_path)
+            or entry.fingerprint != expected_fingerprint
+            or snapshot.fingerprint != expected_fingerprint
+        ):
+            return False
+        self._dashboard_snapshot = snapshot
+        self._render_dashboard_snapshot(snapshot)
+        return True
+
+    def _render_dashboard_snapshot(self, snapshot: ResultDashboardSnapshot) -> None:
+        ended = (
+            snapshot.ended_at.strftime("%Y-%m-%d %H:%M:%S")
+            if snapshot.ended_at is not None
+            else "结束时间未知"
+        )
+        template = snapshot.task_template or "任务模板未知"
+        self.dashboard_current_task.setText(
+            f"当前显示：{template} / {ended} / {snapshot.task_log.name}"
+        )
+        self.dashboard_message.setText(
+            "加载完成"
+            + (
+                f"；另有 {self._dashboard_index.pending_count} 个任务正在运行或等待汇总。"
+                if self._dashboard_index is not None
+                and self._dashboard_index.pending_count
+                else ""
+            )
+        )
+        unknown = "未知"
+        self.dashboard_metric_values["planned"].setText(
+            str(snapshot.planned_count) if snapshot.planned_count is not None else unknown
+        )
+        self.dashboard_metric_values["started"].setText(
+            str(snapshot.started_count) if snapshot.started_count is not None else unknown
+        )
+        self.dashboard_metric_values["complete"].setText(
+            "完整" if snapshot.complete is True else "不完整" if snapshot.complete is False else unknown
+        )
+        self.dashboard_metric_values["reliable"].setText(
+            "可靠" if snapshot.reliable else "不可靠"
+        )
+        self.dashboard_metric_values["anomaly"].setText(
+            str(snapshot.completed_with_anomaly_count)
+            if snapshot.completed_with_anomaly_count is not None
+            else unknown
+        )
+        unstarted_parts = []
+        if snapshot.pre_start_error_count is not None:
+            unstarted_parts.append(f"前置异常 {snapshot.pre_start_error_count}")
+        if snapshot.not_started_count is not None:
+            unstarted_parts.append(f"未开始 {snapshot.not_started_count}")
+        if snapshot.unattributed_planned_count is not None:
+            unstarted_parts.append(f"无法归类 {snapshot.unattributed_planned_count}")
+        self.dashboard_metric_values["unstarted"].setText(
+            " / ".join(unstarted_parts) or unknown
+        )
+
+        for row_index, status in enumerate(AccountStatus):
+            count = snapshot.count_for(status)
+            denominator = snapshot.started_count
+            if snapshot.reliable and count is not None and denominator is not None:
+                percentage = f"{count / denominator:.1%}" if denominator else "不适用"
+            else:
+                percentage = unknown
+            for column, value in enumerate(
+                (_dashboard_status_label(status), str(count) if count is not None else unknown, percentage)
+            ):
+                self.dashboard_distribution.setItem(
+                    row_index, column, QTableWidgetItem(value)
+                )
+
+        integrity = [
+            f"账号明细：{'完整' if snapshot.details_complete else '不完整或未知'}",
+            f"退出码：{snapshot.exit_code if snapshot.exit_code is not None else unknown}",
+            f"日志定位：{snapshot.locator_method or unknown}",
+            f"持续时间：{snapshot.duration_seconds} 秒"
+            if snapshot.duration_seconds is not None
+            else "持续时间：未知",
+        ]
+        if snapshot.reliability_reasons:
+            integrity.append("原因：" + "；".join(snapshot.reliability_reasons))
+        self.dashboard_integrity.setText("\n".join(integrity))
+
+        self.dashboard_account_table.setRowCount(len(snapshot.account_rows))
+        for row_index, account in enumerate(snapshot.account_rows):
+            values = (
+                f"A{account.a_number}",
+                _dashboard_status_label(account.status),
+                "是" if account.completed_with_anomaly else "否",
+                snapshot.task_log.name,
+            )
+            for column, value in enumerate(values):
+                self.dashboard_account_table.setItem(
+                    row_index, column, QTableWidgetItem(value)
+                )
+
+        self.dashboard_native_selector.clear()
+        seen_native: set[str] = set()
+        for segment in snapshot.native_log_segments:
+            key = self._dashboard_key(segment.path)
+            if key in seen_native:
+                continue
+            seen_native.add(key)
+            self.dashboard_native_selector.addItem(segment.path.name, str(segment.path))
+        self.dashboard_open_native_button.setEnabled(
+            self.dashboard_native_selector.count() > 0
+        )
+
+    def _reset_dashboard_view(self) -> None:
+        self.dashboard_current_task.setText("当前显示：无")
+        for label in self.dashboard_metric_values.values():
+            label.setText("—")
+        self.dashboard_distribution.clearContents()
+        self.dashboard_account_table.setRowCount(0)
+        self.dashboard_integrity.setText("尚无稳定结果")
+        self.dashboard_native_selector.clear()
+        self.dashboard_open_native_button.setEnabled(False)
+
+    def _dashboard_load_failed(self, payload: object, prefix: str) -> None:
+        if self.controller.startup_state is StartupState.CLOSING:
+            return
+        message = payload.message if isinstance(payload, TaskFailure) else str(payload)
+        stable = self._dashboard_snapshot
+        suffix = (
+            f" 下方保留最后稳定任务 {stable.task_log.name} 的结果。"
+            if stable is not None
+            else ""
+        )
+        self.dashboard_message.setText(f"{prefix}：{message}{suffix}")
+
+    def _open_dashboard_task_log(self) -> None:
+        entry = self._dashboard_current_entry()
+        if entry is None:
+            QMessageBox.information(self, "没有任务日志", "当前没有选中的任务日志。")
+            return
+        self._open_dashboard_log_path(entry.task_log, "任务日志")
+
+    def _open_dashboard_native_log(self) -> None:
+        value = self.dashboard_native_selector.currentData()
+        if not value:
+            QMessageBox.information(self, "没有原始日志", "当前任务没有原始日志路径证据。")
+            return
+        self._open_dashboard_log_path(Path(str(value)), "原始日志")
+
+    def _open_dashboard_log_path(self, path: Path, label: str) -> None:
+        if not path.is_file():
+            QMessageBox.information(self, f"{label}不存在", f"{label}不存在：\n{path}")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+            QMessageBox.information(self, f"无法打开{label}", f"无法打开{label}：\n{path}")
+
+    def _defer_dashboard_refresh_until_results_idle(self) -> None:
+        if (
+            self.controller.startup_state is not StartupState.READY
+            or not hasattr(self, "dashboard_task_selector")
+        ):
+            return
+        active = next(
+            (
+                binding
+                for binding in self._background_bindings.values()
+                if binding.generation_key == "result_page_snapshot"
+            ),
+            None,
+        )
+        if active is None:
+            MainWindow.refresh_result_dashboard(self, auto_refresh=True)
+            return
+        previous = active.on_removed
+
+        def continue_after_old_page() -> None:
+            if previous is not None:
+                previous()
+            MainWindow._defer_dashboard_refresh_until_results_idle(self)
+
+        active.on_removed = continue_after_old_page
+
     @staticmethod
     def _spin(minimum: int, maximum: int, value: int) -> QSpinBox:
         spin = QSpinBox()
@@ -1479,6 +2036,8 @@ class MainWindow(QMainWindow):
             self.refresh_tasks()
         if "download_results" in targets and hasattr(self, "result_table"):
             self.refresh_results()
+        if "result_dashboard" in targets and hasattr(self, "dashboard_task_selector"):
+            self.refresh_result_dashboard(auto_refresh=True)
         if "runtime_status" in targets:
             self._refresh_status()
 
@@ -3067,6 +3626,7 @@ class MainWindow(QMainWindow):
             return
 
         self._refresh_background_targets(("download_results", "runtime_status"))
+        MainWindow._defer_dashboard_refresh_until_results_idle(self)
         if getattr(self.controller, "startup_state", None) is StartupState.CLOSING:
             MainWindow._finalize_download_summary_for_closing(self, binding)
             return
@@ -3996,5 +4556,13 @@ class MainWindow(QMainWindow):
             QTabBar::tab:selected { background: white; color: #1d4ed8; font-weight: 600; }
             QLabel[ok="true"] { color: #15803d; font-weight: 600; }
             QLabel[ok="false"] { color: #b91c1c; font-weight: 600; }
+            QLabel#dashboardMessage { color: #374151; padding: 4px 0; }
+            QFrame#dashboardMetric { background: white; border: 1px solid #cbd5e1;
+                                     border-radius: 6px; }
+            QLabel#dashboardMetricTitle { color: #4b5563; font-size: 12px; }
+            QLabel#dashboardMetricValue { color: #111827; font-size: 16px;
+                                           font-weight: 700; }
+            QTableWidget { background: white; border: 1px solid #cbd5e1;
+                           gridline-color: #e5e7eb; }
             """
         )
