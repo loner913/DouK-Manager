@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+from codecs import getincrementaldecoder
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
@@ -521,7 +522,8 @@ def _read_index_fragments(path: Path, size: int) -> tuple[str, str]:
     if newline < 0:
         raise ResultDashboardError("轻量索引范围内没有完整行。")
     tail_bytes = tail_bytes[newline + 1 :]
-    prefix = prefix_bytes.decode("utf-8-sig", errors="strict")
+    prefix_decoder = getincrementaldecoder("utf-8-sig")(errors="strict")
+    prefix = prefix_decoder.decode(prefix_bytes, final=False)
     tail = tail_bytes.decode("utf-8", errors="strict")
     _check_lines(prefix)
     _check_lines(tail)

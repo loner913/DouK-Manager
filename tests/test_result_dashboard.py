@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +26,7 @@ from douk_manager.core.result_dashboard import (
     ResultDashboardService,
 )
 from douk_manager.startup import StartupState
+from douk_manager.operation import OperationContext, TaskCancelled
 
 
 class ResultDashboardServiceTests(unittest.TestCase):
@@ -113,6 +115,20 @@ class ResultDashboardServiceTests(unittest.TestCase):
         self.assertEqual(by_path[partial].state, "pending")
         self.assertEqual(index.pending_count, 2)
 
+    def test_index_uses_summary_end_time_not_file_mtime(self) -> None:
+        older = self._complete_log(
+            "DownloadTask_mtime-newer.log", ended="2026-08-21 09:01:30"
+        )
+        newer = self._complete_log(
+            "DownloadTask_mtime-older.log", ended="2026-08-21 10:01:30"
+        )
+        future = datetime(2030, 1, 1).timestamp()
+        os.utime(older, (future, future))
+
+        index = self.service.task_index()
+
+        self.assertEqual(index.default_task, newer)
+
     def test_selected_task_maps_counts_rows_integrity_and_native_log_without_reading_it(self) -> None:
         task = self._complete_log("DownloadTask_complete.log")
         native = self.root / "native.log"
@@ -198,6 +214,24 @@ class ResultDashboardServiceTests(unittest.TestCase):
         self.assertIn("有 1 个计划账号无法可靠归类。", snapshot.reliability_reasons)
         self.assertEqual(len(snapshot.account_rows), 4)
 
+    def test_exit_code_zero_without_account_conclusion_is_not_success(self) -> None:
+        task = self._task(
+            "DownloadTask_exit-zero-only.log",
+            "【下载账号汇总】\n进程结束时间：2026-08-21 09:02:00\n退出码：0\n"
+            "结果不完整：用户停止、异常退出、日志截断、计划账号未全部完成，"
+            "或其他证据不足导致无法确认完整任务结果。\n",
+        )
+
+        snapshot = self.service.selected_task(task)
+
+        self.assertEqual(snapshot.exit_code, 0)
+        self.assertIsNone(snapshot.complete)
+        self.assertFalse(snapshot.reliable)
+        self.assertEqual(
+            snapshot.reliability_reasons,
+            ("任务日志未提供可靠汇总结论。",),
+        )
+
     def test_cache_hits_same_fingerprint_invalidates_on_change_and_force_bypasses(self) -> None:
         task = self._complete_log("DownloadTask_cache.log")
         first = self.service.selected_task(task)
@@ -254,6 +288,74 @@ class ResultDashboardServiceTests(unittest.TestCase):
             snapshot.fingerprint.normalized_path,
             os.path.normcase(str(task.resolve())),
         )
+
+    def test_index_prefix_incremental_decoder_accepts_split_utf8_character(self) -> None:
+        complete = self._complete_log("DownloadTask_source.log").read_text(
+            encoding="utf-8"
+        )
+        summary = complete[complete.index("【下载账号汇总】") :]
+        header = "Task template: split.json\n"
+        ascii_padding = "x" * (65535 - len(header.encode("utf-8")))
+        task = self._task(
+            "DownloadTask_split-utf8.log",
+            header + ascii_padding + "汉\n" + summary,
+        )
+
+        entry = next(
+            item for item in self.service.task_index().entries if item.task_log == task
+        )
+
+        self.assertTrue(entry.displayable)
+        self.assertEqual(entry.task_template, "split.json")
+
+    def test_oversize_and_invalid_encoding_are_structured_unavailable_entries(self) -> None:
+        oversize = self.logs / "DownloadTask_oversize.log"
+        with oversize.open("wb") as handle:
+            handle.truncate(16 * 1024 * 1024 + 1)
+        invalid = self.logs / "DownloadTask_invalid.log"
+        invalid.write_bytes(b"\xff\xfe\xff")
+
+        by_path = {entry.task_log: entry for entry in self.service.task_index().entries}
+
+        self.assertEqual(by_path[oversize].state, "unavailable")
+        self.assertIn("安全读取上限", by_path[oversize].reason)
+        self.assertEqual(by_path[invalid].state, "unavailable")
+        self.assertIn("无法读取任务索引", by_path[invalid].reason)
+
+    def test_cancelled_index_and_parse_stop_at_cooperative_checkpoints(self) -> None:
+        task = self._complete_log("DownloadTask_cancel.log")
+        context = OperationContext()
+        self.assertTrue(context.request_cancel())
+
+        with self.assertRaises(TaskCancelled):
+            self.service.task_index(context=context)
+        with self.assertRaises(TaskCancelled):
+            self.service.selected_task(task, context=context)
+
+    def test_concurrent_same_fingerprint_returns_consistent_snapshots(self) -> None:
+        task = self._complete_log("DownloadTask_concurrent.log")
+        barrier = threading.Barrier(3)
+        snapshots = []
+        errors = []
+
+        def read() -> None:
+            try:
+                barrier.wait()
+                snapshots.append(self.service.selected_task(task))
+            except Exception as exc:  # pragma: no cover - retained for assertion
+                errors.append(exc)
+
+        threads = [threading.Thread(target=read) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(2.0)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(len(snapshots), 2)
+        self.assertEqual(snapshots[0], snapshots[1])
 
 
 class ResultDashboardControllerTests(unittest.TestCase):
