@@ -330,6 +330,7 @@ class ActionWorkerTests(unittest.TestCase):
         window.shutdown_timer = None
         window._download_summary_binding = None
         window._background_generations = {}
+        window._diagnostic_widgets = []
         window.coordinator = BackgroundTaskCoordinator(window)
         window._close_pending = False
         window._append_info = Mock()

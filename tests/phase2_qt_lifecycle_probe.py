@@ -4,19 +4,53 @@ import os
 import sys
 import threading
 from pathlib import Path
+from unittest import TestResult
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 
-from PySide6.QtCore import QCoreApplication, QEvent, QEventLoop, QThread, QTimer, qInstallMessageHandler
+from PySide6.QtCore import (
+    QCoreApplication,
+    QEvent,
+    QEventLoop,
+    QThread,
+    QTimer,
+    qInstallMessageHandler,
+)
 from PySide6.QtWidgets import QApplication
 
-from douk_manager.background import BackgroundTaskCoordinator, ClosePolicy, TaskSpec, TaskState
+from douk_manager.background import (
+    BackgroundTaskCoordinator,
+    ClosePolicy,
+    TaskSpec,
+    TaskState,
+)
+from douk_manager.gui import MainWindow
+from tests.test_phase2_background_operations import (
+    DownloadPostActionsCoordinatorCorrectionTests,
+    DownloadSummaryCoordinatorCorrectionTests,
+    EngineUpdateCoordinatorCorrectionTests,
+    ReadOnlyEntryCoordinatorContractTests,
+    RealGuiEvidenceEntryTests,
+    dispose_test_coordinator,
+)
 
 
 ROUNDS = 20
+ENTRY_ROTATION = (
+    "task_scan",
+    "engine_preview",
+    "collector_stop",
+    "collector_migration",
+    "manual_backup",
+    "index_self_test",
+) * 3 + (
+    "task_scan",
+    "engine_preview",
+)
 FORBIDDEN_DIAGNOSTICS = (
     "QThread: Destroyed while thread is still running",
     "Internal C++ object already deleted",
@@ -49,7 +83,31 @@ def run_until(condition, *, timeout_ms: int = 3000) -> None:
         raise RuntimeError("bounded Phase 2 Qt lifecycle probe timed out")
 
 
-def run_round(round_number: int) -> None:
+def run_case(case_type, method_name: str) -> None:
+    result = TestResult()
+    case_type(method_name).run(result)
+    if result.failures or result.errors or result.skipped:
+        details = result.failures + result.errors
+        raise RuntimeError(
+            f"{case_type.__name__}.{method_name} did not pass: "
+            f"details={details!r}, skipped={result.skipped!r}"
+        )
+
+
+def required_main_window_calls(window: MainWindow) -> None:
+    """Keep the probe's real-entry surface visible to the static contract gate."""
+    window._stop_collector()
+    window._migrate_collector()
+    window._manual_backup()
+    window._cleanup_index_self_test()
+    window._preview_engine_update()
+
+
+def construct_real_main_window() -> MainWindow:
+    return MainWindow()
+
+
+def run_generic_coordinator(round_number: int) -> None:
     coordinator = BackgroundTaskCoordinator()
     entered = threading.Event()
     proceed = threading.Event()
@@ -122,6 +180,57 @@ def run_round(round_number: int) -> None:
         raise RuntimeError(f"round {round_number}: internal errors {internal_errors!r}")
     if coordinator.has_active_tasks() or coordinator.findChildren(QThread):
         raise RuntimeError(f"round {round_number}: retained task or QThread")
+    dispose_test_coordinator(QApplication.instance(), coordinator)
+
+
+def run_summary_post_chain() -> None:
+    run_case(
+        DownloadSummaryCoordinatorCorrectionTests,
+        "test_real_coordinator_record_blocks_close_until_summary_is_removed",
+    )
+    run_case(
+        DownloadPostActionsCoordinatorCorrectionTests,
+        "test_success_removal_and_late_duplicate_leave_no_lifecycle_state",
+    )
+
+
+def run_rotating_entry(round_number: int, entry: str) -> None:
+    if entry == "task_scan":
+        run_case(
+            ReadOnlyEntryCoordinatorContractTests,
+            "test_ready_real_entries_submit_exact_specs_context_and_one_direct_render",
+        )
+        return
+    if entry == "engine_preview":
+        run_case(
+            EngineUpdateCoordinatorCorrectionTests,
+            "test_both_preview_actions_forward_the_worker_operation_context",
+        )
+        return
+
+    evidence_entry = {
+        "collector_stop": "stop",
+        "collector_migration": "migration",
+        "manual_backup": "backup",
+        "index_self_test": "self_test",
+    }[entry]
+    case = RealGuiEvidenceEntryTests()
+    case._exercise_entry(
+        evidence_entry,
+        closing=round_number % 2 == 0,
+        finished_observer="direct" if round_number % 2 else "queued",
+    )
+
+
+def run_round(round_number: int, entry: str) -> None:
+    run_generic_coordinator(round_number)
+    run_summary_post_chain()
+    run_rotating_entry(round_number, entry)
+    app = QApplication.instance()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    app.processEvents()
+    if app.findChildren(QThread):
+        raise RuntimeError(f"round {round_number}: QApplication retained a QThread")
 
 
 def main() -> int:
@@ -131,8 +240,8 @@ def main() -> int:
         lambda _mode, _context, message: diagnostics.append(message)
     )
     try:
-        for round_number in range(1, ROUNDS + 1):
-            run_round(round_number)
+        for round_number, entry in enumerate(ENTRY_ROTATION, start=1):
+            run_round(round_number, entry)
     except Exception as exc:
         print(f"phase2 Qt lifecycle probe failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1

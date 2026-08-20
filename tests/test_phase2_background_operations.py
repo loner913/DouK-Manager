@@ -5,6 +5,7 @@ import os
 import tempfile
 import threading
 import unittest
+import weakref
 from dataclasses import FrozenInstanceError, is_dataclass
 from datetime import datetime
 from pathlib import Path
@@ -14,7 +15,23 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QCoreApplication, QEvent, QThread
+from PySide6.QtCore import (
+    QCoreApplication,
+    QEvent,
+    QEventLoop,
+    QObject,
+    QThread,
+    QTimer,
+    Qt,
+    Slot,
+)
+from PySide6.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QTextEdit,
+)
 
 from douk_manager.background import (
     BackgroundTaskCoordinator,
@@ -39,7 +56,23 @@ from douk_manager.core.result_history import (
 from douk_manager.core.download_summary import AccountStatus
 from douk_manager.core.backup import BackupService, BackupError
 from douk_manager.core.engine_update import EngineUpdateService
+from douk_manager.integrations.collector import MigrationResult
+from douk_manager.integrations.indexer import IndexResult
 from douk_manager.startup import StartupState
+from tests.helpers import make_test_paths
+
+
+_QT_APPLICATION = QApplication.instance() or QApplication([])
+
+
+class _ThreadFinishedObserver(QObject):
+    def __init__(self, callback: Any, parent: QObject) -> None:
+        super().__init__(parent)
+        self._callback = callback
+
+    @Slot()
+    def observe(self) -> None:
+        self._callback()
 
 try:
     from douk_manager.operation import OperationContext, OperationProgress
@@ -2792,6 +2825,526 @@ class PhaseTwoReadOnlyTaskTests(unittest.TestCase):
                 with self.assertRaises(TaskCancelled):
                     service.apply(archive, context=context)
             move.assert_not_called()
+
+
+class RealGuiEvidenceEntryTests(unittest.TestCase):
+    _ENTRIES = ("stop", "migration", "backup", "self_test")
+
+    @classmethod
+    def _run_until(cls, condition: Any, *, timeout_ms: int = 4000) -> None:
+        if condition():
+            return
+        loop = QEventLoop()
+        timed_out: list[bool] = []
+        poll = QTimer()
+        poll.setInterval(1)
+        timeout = QTimer()
+        timeout.setSingleShot(True)
+
+        def check() -> None:
+            if condition():
+                poll.stop()
+                loop.quit()
+
+        timeout.timeout.connect(lambda: (timed_out.append(True), loop.quit()))
+        poll.timeout.connect(check)
+        poll.start()
+        timeout.start(timeout_ms)
+        loop.exec()
+        poll.stop()
+        timeout.stop()
+        if timed_out or not condition():
+            raise AssertionError("bounded real GUI evidence event loop timed out")
+
+    @staticmethod
+    def _expected_spec(entry: str) -> dict[str, object]:
+        common = {
+            "critical_write_started": False,
+            "allow_during_closing": False,
+        }
+        expected = {
+            "stop": {
+                "task_type": "collector_stop",
+                "display_name": "停止账号采集服务",
+                "resource_keys": frozenset({"collector_process"}),
+                "deduplicate_key": "collector_stop",
+                "cancellable": False,
+                "close_policy": ClosePolicy.WAIT,
+                "refresh_targets": ("runtime_status",),
+                "dynamic_cancellation": False,
+            },
+            "migration": {
+                "task_type": "collector_migration",
+                "display_name": "迁移旧采集器数据",
+                "resource_keys": frozenset(
+                    {"collector_process", "collector_data", "settings", "screenshots"}
+                ),
+                "deduplicate_key": "collector_migration",
+                "cancellable": False,
+                "close_policy": ClosePolicy.WAIT,
+                "refresh_targets": ("runtime_status",),
+                "dynamic_cancellation": False,
+            },
+            "backup": {
+                "task_type": "full_volume_backup",
+                "display_name": "完整 Volume 备份",
+                "resource_keys": frozenset({"volume", "settings"}),
+                "deduplicate_key": "full_volume_backup",
+                "cancellable": True,
+                "close_policy": ClosePolicy.CANCEL,
+                "refresh_targets": ("runtime_status",),
+                "dynamic_cancellation": True,
+            },
+            "self_test": {
+                "task_type": "index_cleanup_self_test",
+                "display_name": "自检索引清理",
+                "resource_keys": frozenset({"index"}),
+                "deduplicate_key": "index_operation",
+                "cancellable": True,
+                "close_policy": ClosePolicy.CANCEL,
+                "refresh_targets": (),
+                "dynamic_cancellation": True,
+            },
+        }[entry]
+        return {**expected, **common}
+
+    @staticmethod
+    def _make_controller(
+        base: Path,
+        entry: str,
+        entered: threading.Event,
+        release: threading.Event,
+        calls: dict[str, list[object]],
+    ) -> tuple[ManagerController, object]:
+        paths = make_test_paths(base)
+        migration = MigrationResult((), (), 0, 0, 1, 1, 0, 0)
+        backup_path = paths.backups / "synthetic-full-backup"
+        self_test = IndexResult(0, "synthetic cleanup self-test")
+        payloads: dict[str, object] = {
+            "stop": None,
+            "migration": migration,
+            "backup": backup_path,
+            "self_test": self_test,
+        }
+        controller = ManagerController.__new__(ManagerController)
+        controller.paths = paths
+        controller.config = SimpleNamespace(
+            collector_port=18765,
+            old_screenshot_dir=os.fspath(base / "old-collector-screenshots"),
+        )
+        controller.logger = Mock()
+        controller.startup_state = StartupState.READY
+        controller.read_only_reason = ""
+        controller.startup_backup = paths.backups / "startup-backup"
+        controller._download_lifecycle_active = False
+        controller._last_collector_running = entry == "stop"
+        controller._last_engine_running = False
+        controller.engine = SimpleNamespace(
+            current=None,
+            external_running=Mock(return_value=False),
+        )
+
+        collector = SimpleNamespace(
+            process=object() if entry == "stop" else None,
+            running=False,
+            health=Mock(return_value=False),
+        )
+
+        def controlled_service(
+            result: object,
+            *,
+            enter_critical: bool = False,
+            clear_collector: bool = False,
+        ) -> Any:
+            def run(*args: object, **kwargs: object) -> object:
+                calls["service_args"].append((args, kwargs))
+                context = kwargs.get("context")
+                if enter_critical:
+                    assert context is not None
+                    context.enter_critical_phase()
+                calls["thread_names"].append(QThread.currentThread().objectName())
+                entered.set()
+                if not release.wait(timeout=3):
+                    raise AssertionError("real GUI evidence service was not released")
+                if clear_collector:
+                    collector.process = None
+                return result
+
+            return run
+
+        collector.stop = controlled_service(None, clear_collector=True)
+        collector.migrate_old_data = controlled_service(migration)
+        controller.collector = collector
+        controller.backup = SimpleNamespace(
+            create_full_snapshot=controlled_service(backup_path)
+        )
+        controller.indexer = SimpleNamespace(
+            cleanup_self_test=controlled_service(self_test, enter_critical=True)
+        )
+
+        if entry == "stop":
+            original = controller.require_managed_runtime_control
+
+            def observe_runtime_gate(operation: str, *, managed: bool) -> None:
+                calls["gate"].append(("runtime", operation, managed))
+                original(operation, managed=managed)
+
+            controller.require_managed_runtime_control = observe_runtime_gate
+        elif entry in ("migration", "backup"):
+            original = controller.require_safe_write
+
+            def observe_safe_write_gate() -> None:
+                calls["gate"].append(("safe_write",))
+                original()
+
+            controller.require_safe_write = observe_safe_write_gate
+        else:
+            original = controller.require_operational_ready
+
+            def observe_ready_gate(operation: str) -> None:
+                calls["gate"].append(("ready", operation))
+                original(operation)
+
+            controller.require_operational_ready = observe_ready_gate
+        return controller, payloads[entry]
+
+    @staticmethod
+    def _make_window(controller: ManagerController) -> MainWindow:
+        window = MainWindow.__new__(MainWindow)
+        QMainWindow.__init__(window)
+        window.controller = controller
+        window.coordinator = BackgroundTaskCoordinator(window)
+        window._background_bindings = {}
+        window._background_generations = {}
+        window._background_pending = {}
+        window.shutdown_timer = None
+        window.queue_output = QTextEdit(window)
+        window.collector_output = QTextEdit(window)
+        window.overview_output = QTextEdit(window)
+        window.post_output = QTextEdit(window)
+        window.collector_stop_button = QPushButton(window)
+        window.collector_migrate_button = QPushButton(window)
+        window.manual_backup_button = QPushButton(window)
+        window.refresh_index_button = QPushButton(window)
+        window.cleanup_index_button = QPushButton(window)
+        window.cleanup_test_button = QPushButton(window)
+        window._append_info = Mock()
+        window._replace_info = Mock()
+        window._refresh_status = Mock()
+        window.coordinator.task_settled.connect(window._on_background_task_settled)
+        window.coordinator.task_progress.connect(window._on_background_task_progress)
+        window.coordinator.task_removed.connect(window._on_background_task_removed)
+        buttons = {
+            "stop": [window.collector_stop_button],
+            "migration": [window.collector_migrate_button],
+            "backup": [window.manual_backup_button],
+            "self_test": [
+                window.refresh_index_button,
+                window.cleanup_index_button,
+                window.cleanup_test_button,
+            ],
+        }
+        window._evidence_buttons = buttons
+        window._safe_widgets = []
+        window._path_widgets = []
+        window._diagnostic_widgets = []
+        window._dangerous_widgets = [
+            button for entry_buttons in buttons.values() for button in entry_buttons
+        ]
+        return window
+
+    @staticmethod
+    def _invoke(window: MainWindow, entry: str) -> None:
+        if entry == "backup":
+            with patch(
+                "douk_manager.gui.QMessageBox.question",
+                return_value=QMessageBox.Yes,
+            ):
+                window._manual_backup()
+            return
+        {
+            "stop": window._stop_collector,
+            "migration": window._migrate_collector,
+            "self_test": window._cleanup_index_self_test,
+        }[entry]()
+
+    def _exercise_entry(
+        self,
+        entry: str,
+        *,
+        closing: bool,
+        finished_observer: str,
+    ) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        calls: dict[str, list[object]] = {
+            "gate": [],
+            "service_args": [],
+            "thread_names": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            controller, success_payload = self._make_controller(
+                Path(directory), entry, entered, release, calls
+            )
+            window = self._make_window(controller)
+            coordinator = window.coordinator
+            settlements: list[tuple[object, ...]] = []
+            removals: list[str] = []
+            observations: list[tuple[object, ...]] = []
+            worker_destroyed: list[bool] = []
+            thread_destroyed: list[bool] = []
+            finished_seen: list[bool] = []
+            record: TaskRecord | None = None
+            worker: TaskWorker | None = None
+            thread: QThread | None = None
+            observer: _ThreadFinishedObserver | None = None
+            coordinator_ref = weakref.ref(coordinator)
+
+            task_id_holder: list[str] = []
+
+            def observe_settled(*args: object) -> None:
+                settlements.append(args)
+                observations.append(("terminal",))
+
+            def observe_removed(task_id: str) -> None:
+                removals.append(task_id)
+                observations.append(("removed",))
+
+            coordinator.task_settled.connect(observe_settled)
+            coordinator.task_removed.connect(observe_removed)
+            try:
+                if finished_observer == "direct":
+                    def observe_preconnected_finished() -> None:
+                        task_id = task_id_holder[0]
+                        current_coordinator = coordinator_ref()
+                        current_record = current_coordinator._records[task_id]
+                        observations.append(
+                            (
+                                "finished-before-coordinator",
+                                current_record.terminal_seen,
+                                current_record.thread_finished_seen,
+                                task_id in coordinator._records,
+                            )
+                        )
+                        finished_seen.append(True)
+
+                    observer = _ThreadFinishedObserver(
+                        observe_preconnected_finished, window
+                    )
+
+                    def create_observed_thread(parent: QObject) -> QThread:
+                        observed_thread = QThread(parent)
+                        observed_thread.finished.connect(
+                            observer.observe, Qt.ConnectionType.DirectConnection
+                        )
+                        return observed_thread
+
+                    with patch(
+                        "douk_manager.background.QThread",
+                        side_effect=create_observed_thread,
+                    ):
+                        self._invoke(window, entry)
+                else:
+                    self._invoke(window, entry)
+                self.assertEqual(len(coordinator._records), 1)
+                record = next(iter(coordinator._records.values()))
+                worker = record.worker
+                thread = record.thread
+                self.assertIsNotNone(worker)
+                self.assertIsNotNone(thread)
+                assert worker is not None
+                assert thread is not None
+                task_id = record.task_id
+                task_id_holder.append(task_id)
+                expected_spec = self._expected_spec(entry)
+                self.assertEqual(
+                    set(expected_spec), set(TaskSpec.__dataclass_fields__)
+                )
+                for field_name, value in expected_spec.items():
+                    self.assertEqual(getattr(record.spec, field_name), value)
+                self.assertEqual(record.generation, 1)
+                self.assertEqual(
+                    window._background_generations[record.spec.deduplicate_key], 1
+                )
+                binding = window._background_bindings[task_id]
+                self.assertIs(binding.spec, record.spec)
+                self.assertEqual(binding.generation, record.generation)
+                buttons = window._evidence_buttons[entry]
+                self.assertTrue(all(not button.isEnabled() for button in buttons))
+                self.assertTrue(entered.wait(timeout=3))
+                self.assertEqual(
+                    calls["thread_names"],
+                    [f"douk-{record.spec.task_type}-{task_id[:8]}"],
+                )
+                expected_gate = {
+                    "stop": [("runtime", "停止账号采集服务", True)],
+                    "migration": [("safe_write",)],
+                    "backup": [("safe_write",)],
+                    "self_test": [("ready", "执行索引清理自检")],
+                }[entry]
+                self.assertEqual(calls["gate"], expected_gate)
+                self.assertEqual(len(calls["service_args"]), 1)
+                if record.spec.dynamic_cancellation:
+                    self.assertIsNotNone(record.operation_context)
+                    service_kwargs = calls["service_args"][0][1]
+                    self.assertIs(service_kwargs["context"], record.operation_context)
+                else:
+                    self.assertIsNone(record.operation_context)
+                    self.assertNotIn("context", calls["service_args"][0][1])
+
+                worker.destroyed.connect(lambda *_args: worker_destroyed.append(True))
+                thread.destroyed.connect(lambda *_args: thread_destroyed.append(True))
+                record_ref = weakref.ref(record)
+
+                if finished_observer != "direct":
+                    def observe_finished() -> None:
+                        current_record = record_ref()
+                        current_coordinator = coordinator_ref()
+                        observations.append(
+                            (
+                                "finished-queued",
+                                current_record.thread_finished_seen,
+                                task_id in current_coordinator._records,
+                            )
+                        )
+                        finished_seen.append(True)
+
+                    observer = _ThreadFinishedObserver(observe_finished, window)
+                    thread.finished.connect(
+                        observer.observe, Qt.ConnectionType.QueuedConnection
+                    )
+
+                if closing:
+                    self.assertFalse(coordinator.begin_closing())
+                    self.assertTrue(controller.begin_closing())
+                    window._apply_action_gate()
+                release.set()
+                self._run_until(
+                    lambda: len(removals) == 1
+                    and worker_destroyed == [True]
+                    and thread_destroyed == [True]
+                    and finished_seen == [True]
+                    and not coordinator.has_active_tasks()
+                    and not coordinator.findChildren(QThread)
+                )
+                QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                _QT_APPLICATION.processEvents()
+
+                expected_outcome = (
+                    TaskState.CANCELLED
+                    if closing and entry == "backup"
+                    else TaskState.SUCCEEDED
+                )
+                expected_payload = (
+                    "background operation was cancelled"
+                    if expected_outcome is TaskState.CANCELLED
+                    else success_payload
+                )
+                self.assertEqual(
+                    settlements,
+                    [(task_id, 1, expected_outcome, expected_payload)],
+                )
+                self.assertEqual(removals, [task_id])
+                self.assertEqual(worker_destroyed, [True])
+                self.assertEqual(thread_destroyed, [True])
+                if finished_observer == "direct":
+                    self.assertEqual(
+                        observations,
+                        [
+                            ("terminal",),
+                            ("finished-before-coordinator", True, False, True),
+                            ("removed",),
+                        ],
+                    )
+                else:
+                    self.assertEqual(
+                        observations,
+                        [
+                            ("terminal",),
+                            ("removed",),
+                            ("finished-queued", True, False),
+                        ],
+                    )
+                self.assertEqual(coordinator._records, {})
+                self.assertEqual(window._background_bindings, {})
+                self.assertEqual(window._background_pending, {})
+                self.assertFalse(coordinator.findChildren(QThread))
+                self.assertTrue(
+                    all(button.isEnabled() is not closing for button in buttons)
+                )
+                if entry in ("migration", "backup"):
+                    self.assertTrue(controller.paths.lock_file.is_file())
+
+                if closing:
+                    window._append_info.assert_not_called()
+                    window._replace_info.assert_not_called()
+                    window._refresh_status.assert_not_called()
+                    generations = dict(window._background_generations)
+                    self._invoke(window, entry)
+                    self.assertEqual(coordinator._records, {})
+                    self.assertEqual(window._background_bindings, {})
+                    self.assertEqual(window._background_pending, {})
+                    self.assertEqual(window._background_generations, generations)
+                    self.assertEqual(len(calls["gate"]), 1)
+                    self.assertEqual(len(calls["service_args"]), 1)
+                    window._refresh_status.assert_not_called()
+                    window._append_info.assert_called_once()
+                    self.assertTrue(
+                        window._append_info.call_args.args[-1].startswith("【未启动】")
+                    )
+                    window._replace_info.assert_not_called()
+                else:
+                    if entry in ("stop", "backup"):
+                        window._append_info.assert_called_once()
+                        window._replace_info.assert_not_called()
+                    else:
+                        window._replace_info.assert_called_once()
+                        window._append_info.assert_not_called()
+                    if record.spec.refresh_targets:
+                        window._refresh_status.assert_called_once_with()
+                    else:
+                        window._refresh_status.assert_not_called()
+            finally:
+                release.set()
+                if coordinator.has_active_tasks() or coordinator.findChildren(QThread):
+                    self._run_until(
+                        lambda: not coordinator.has_active_tasks()
+                        and not coordinator.findChildren(QThread)
+                    )
+                QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                _QT_APPLICATION.processEvents()
+                if record is not None:
+                    record.worker = None
+                    record.thread = None
+                worker = None
+                thread = None
+                observer = None
+                dispose_test_coordinator(_QT_APPLICATION, coordinator)
+                window.coordinator = None
+                window_destroyed: list[bool] = []
+                window.destroyed.connect(lambda *_args: window_destroyed.append(True))
+                window.deleteLater()
+                QCoreApplication.sendPostedEvents(window, QEvent.Type.DeferredDelete)
+                _QT_APPLICATION.processEvents()
+                self.assertEqual(window_destroyed, [True])
+
+    def test_four_real_entries_use_exact_specs_controller_gates_and_qthreads(self) -> None:
+        for index, entry in enumerate(self._ENTRIES):
+            with self.subTest(entry=entry):
+                self._exercise_entry(
+                    entry,
+                    closing=False,
+                    finished_observer="direct" if index % 2 == 0 else "queued",
+                )
+
+    def test_four_real_entries_drop_late_ui_and_reject_new_work_while_closing(self) -> None:
+        for index, entry in enumerate(self._ENTRIES):
+            with self.subTest(entry=entry):
+                self._exercise_entry(
+                    entry,
+                    closing=True,
+                    finished_observer="queued" if index % 2 == 0 else "direct",
+                )
 
 
 class PhaseOneFreezeTests(unittest.TestCase):
