@@ -14,6 +14,8 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import QCoreApplication, QEvent, QThread
+
 from douk_manager.background import (
     BackgroundTaskCoordinator,
     CancellationToken,
@@ -451,6 +453,573 @@ class MainWindowBackgroundBindingTests(unittest.TestCase):
             window, task_id, 1, OperationProgress("scan", "closing")
         )
         self.assertFalse(progressed.called)
+
+
+class DownloadSummaryCoordinatorCorrectionTests(unittest.TestCase):
+    @staticmethod
+    def _summary_window(task_log: Path) -> tuple[SimpleNamespace, SimpleNamespace]:
+        run = SimpleNamespace(
+            task_log=task_log,
+            running=False,
+            completion_marker=None,
+            pause_after_exit=False,
+        )
+        window = SimpleNamespace(
+            controller=SimpleNamespace(
+                startup_state=StartupState.READY,
+                summarize_download=Mock(return_value="summary-payload"),
+                logger=Mock(),
+            ),
+            _background_bindings={},
+            _background_generations={},
+            _download_summary_binding=None,
+            _submit_background=Mock(return_value="summary-task"),
+            _append_info=Mock(),
+            _refresh_background_targets=Mock(),
+            _finish_run_after_summary=Mock(),
+            _close_result_wrapper=Mock(return_value=True),
+            queue_output=object(),
+            queue_cancel_requested=False,
+            queue_pending=[Path("next.json")],
+            queue_current=run,
+            queue_active=True,
+            _release_download_lifecycle=Mock(),
+            _record_task_elapsed=Mock(),
+            _record_queue_elapsed=Mock(),
+            _cleanup_completion_marker=Mock(),
+        )
+        return window, run
+
+    @staticmethod
+    def _start_and_capture(window: SimpleNamespace, run: SimpleNamespace):
+        with patch(
+            "douk_manager.gui.QThread",
+            side_effect=AssertionError("legacy dedicated summary QThread was used"),
+        ):
+            MainWindow._start_download_summary(
+                window,
+                run,
+                0,
+                SimpleNamespace(normal_exit=True),
+            )
+        binding = window._download_summary_binding
+        if binding is not None:
+            window._background_generations[binding.deduplicate_key] = binding.generation
+        return window._submit_background.call_args
+
+    def test_summary_uses_exact_coordinator_contract_and_removed_only_continuation(
+        self,
+    ) -> None:
+        window, run = self._summary_window(Path("Data/DownloadTask_20260820.log"))
+
+        submitted = self._start_and_capture(window, run)
+        binding = window._download_summary_binding
+
+        spec, action = submitted.args
+        self.assertEqual(spec.task_type, "download_summary")
+        self.assertEqual(spec.resource_keys, frozenset({"task_logs", "result_logs"}))
+        self.assertTrue(spec.deduplicate_key.startswith("download_summary:"))
+        self.assertFalse(spec.cancellable)
+        self.assertIs(spec.close_policy, ClosePolicy.WAIT)
+        self.assertEqual(spec.refresh_targets, ())
+        self.assertEqual(action(None), "summary-payload")
+        window.controller.summarize_download.assert_called_once()
+
+        summary = SimpleNamespace(complete=True, reliable=True)
+        with patch(
+            "douk_manager.gui.format_summary_for_ui", return_value=("summary complete",)
+        ):
+            submitted.kwargs["on_success"](summary)
+            submitted.kwargs["on_success"](summary)
+
+        self.assertIs(run._summary_result, summary)
+        window._finish_run_after_summary.assert_not_called()
+        window._refresh_background_targets.assert_not_called()
+
+        submitted.kwargs["on_removed"]()
+        submitted.kwargs["on_removed"]()
+
+        window._refresh_background_targets.assert_called_once_with(
+            ("download_results", "runtime_status")
+        )
+        window._finish_run_after_summary.assert_called_once()
+        self.assertEqual(binding.task_id, "summary-task")
+        self.assertEqual(binding.generation, 1)
+        self.assertTrue(binding.terminal_consumed)
+        self.assertTrue(binding.removed_consumed)
+        self.assertIsNone(window._download_summary_binding)
+
+    def test_real_coordinator_record_blocks_close_until_summary_is_removed(
+        self,
+    ) -> None:
+        app = QCoreApplication.instance() or QCoreApplication([])
+        entered = threading.Event()
+        release = threading.Event()
+        action_done = threading.Event()
+        coordinator = BackgroundTaskCoordinator()
+        window, run = self._summary_window(Path("Data/DownloadTask_real_record.log"))
+        window.coordinator = coordinator
+        window._background_pending = {}
+        window._cancel_shutdown_for_new_work = Mock()
+        window._apply_action_gate = Mock()
+        window.statusBar = Mock(
+            return_value=SimpleNamespace(showMessage=Mock())
+        )
+        window._background_binding_is_current = lambda binding, generation: (
+            MainWindow._background_binding_is_current(window, binding, generation)
+        )
+
+        def summarize(*_args: object) -> dict[str, bool]:
+            entered.set()
+            try:
+                if not release.wait(2.0):
+                    raise RuntimeError("summary release event timed out")
+                return {"complete": True, "reliable": True}
+            finally:
+                action_done.set()
+
+        window.controller.summarize_download = summarize
+        window._submit_background = lambda *args, **kwargs: MainWindow._submit_background(
+            window, *args, **kwargs
+        )
+        coordinator.task_settled.connect(
+            lambda *args: MainWindow._on_background_task_settled(window, *args)
+        )
+        coordinator.task_removed.connect(
+            lambda task_id: MainWindow._on_background_task_removed(window, task_id)
+        )
+
+        with patch("douk_manager.gui.format_summary_for_ui", return_value=("done",)):
+            MainWindow._start_download_summary(
+                window,
+                run,
+                0,
+                SimpleNamespace(normal_exit=True),
+            )
+            self.assertTrue(entered.wait(2.0))
+            self.assertEqual(len(coordinator._records), 1)
+            record = next(iter(coordinator._records.values()))
+            thread = record.thread
+            self.assertIsNotNone(thread)
+            thread_destroyed: list[bool] = []
+            thread.destroyed.connect(lambda *_: thread_destroyed.append(True))
+            binding = window._download_summary_binding
+            self.assertEqual(binding.task_id, record.task_id)
+            self.assertEqual(binding.generation, record.generation)
+            self.assertEqual(record.spec.task_type, "download_summary")
+            self.assertEqual(
+                record.spec.resource_keys,
+                frozenset({"task_logs", "result_logs"}),
+            )
+
+            MainWindow._start_download_summary(
+                window,
+                run,
+                0,
+                SimpleNamespace(normal_exit=True),
+            )
+            self.assertEqual(len(coordinator._records), 1)
+
+            close_event = SimpleNamespace(ignore=Mock(), accept=Mock())
+            window.queue_current = None
+            with patch("douk_manager.gui.QMessageBox.information"):
+                MainWindow.closeEvent(window, close_event)
+            window.queue_current = run
+            close_event.ignore.assert_called_once_with()
+            close_event.accept.assert_not_called()
+            self.assertIs(window.controller.startup_state, StartupState.READY)
+            self.assertFalse(coordinator.is_closing)
+
+            release.set()
+            self.assertTrue(action_done.wait(2.0))
+            for _ in range(1000):
+                app.processEvents()
+                if not coordinator.has_active_tasks() and window._download_summary_binding is None:
+                    break
+            for _ in range(1000):
+                QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                app.processEvents()
+                if thread_destroyed:
+                    break
+
+        self.assertFalse(coordinator.has_active_tasks())
+        self.assertIsNone(window._download_summary_binding)
+        self.assertEqual(thread_destroyed, [True])
+        self.assertFalse(coordinator.findChildren(QThread))
+        window._finish_run_after_summary.assert_called_once_with(
+            run, binding.assessment
+        )
+
+    def test_real_gui_result_reader_and_summary_conflicts_recover_both_ways(
+        self,
+    ) -> None:
+        app = QCoreApplication.instance() or QCoreApplication([])
+        coordinator = BackgroundTaskCoordinator()
+        window, run = self._summary_window(Path("Data/DownloadTask_conflict.log"))
+        window.coordinator = coordinator
+        window._background_pending = {}
+        window._cancel_shutdown_for_new_work = Mock()
+        window._apply_action_gate = Mock()
+        window.statusBar = Mock(
+            return_value=SimpleNamespace(showMessage=Mock())
+        )
+        window._background_binding_is_current = lambda binding, generation: (
+            MainWindow._background_binding_is_current(window, binding, generation)
+        )
+        window._submit_background = lambda *args, **kwargs: MainWindow._submit_background(
+            window, *args, **kwargs
+        )
+        window._submit_coalesced_background = (
+            lambda *args, **kwargs: MainWindow._submit_coalesced_background(
+                window, *args, **kwargs
+            )
+        )
+        window.result_table = object()
+        window.result_refresh_button = None
+        window._render_result_snapshot = Mock()
+        window.task_smart_private = SimpleNamespace(isChecked=Mock(return_value=True))
+        window.task_expression = SimpleNamespace(text=Mock(return_value="A1"))
+        window.task_private_days = SimpleNamespace(value=Mock(return_value=7))
+        window.task_output = object()
+        window.task_preview_button = object()
+
+        reader_entered = threading.Event()
+        reader_release = threading.Event()
+        reader_done = threading.Event()
+        second_reader_done = threading.Event()
+        reader_calls: list[int] = []
+
+        def result_snapshot(*, limit: int, context: object) -> dict[str, int]:
+            self.assertEqual(limit, 500)
+            self.assertIsNotNone(context)
+            reader_calls.append(len(reader_calls) + 1)
+            if len(reader_calls) == 1:
+                reader_entered.set()
+                try:
+                    if not reader_release.wait(2.0):
+                        raise RuntimeError("reader release event timed out")
+                finally:
+                    reader_done.set()
+            else:
+                second_reader_done.set()
+            return {"reader": len(reader_calls)}
+
+        summary_entered = threading.Event()
+        summary_release = threading.Event()
+        summary_done = threading.Event()
+        summary_calls: list[Path] = []
+
+        def summarize(target_run: object, *_args: object) -> dict[str, bool]:
+            summary_calls.append(target_run.task_log)
+            summary_entered.set()
+            try:
+                if not summary_release.wait(2.0):
+                    raise RuntimeError("summary release event timed out")
+                return {"complete": True, "reliable": True}
+            finally:
+                summary_done.set()
+
+        window.controller.result_snapshot = result_snapshot
+        window.controller.preview_private_skip = Mock()
+        window.controller.summarize_download = summarize
+        settlements: list[tuple[object, ...]] = []
+        removals: list[str] = []
+        coordinator.task_settled.connect(lambda *args: settlements.append(args))
+        coordinator.task_removed.connect(removals.append)
+        coordinator.task_settled.connect(
+            lambda *args: MainWindow._on_background_task_settled(window, *args)
+        )
+        coordinator.task_removed.connect(
+            lambda task_id: MainWindow._on_background_task_removed(window, task_id)
+        )
+        retained_threads: list[QThread] = []
+        destroyed: list[str] = []
+
+        def retain_current_thread(label: str) -> str:
+            self.assertEqual(len(coordinator._records), 1)
+            record = next(iter(coordinator._records.values()))
+            self.assertIsNotNone(record.thread)
+            retained_threads.append(record.thread)
+            record.thread.destroyed.connect(lambda *_: destroyed.append(label))
+            return record.task_id
+
+        def drain_current_task(done: threading.Event) -> None:
+            self.assertTrue(done.wait(2.0))
+            for _ in range(1000):
+                app.processEvents()
+                if not coordinator.has_active_tasks():
+                    break
+            self.assertFalse(coordinator.has_active_tasks())
+            for _ in range(1000):
+                QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                app.processEvents()
+                if len(destroyed) == len(retained_threads):
+                    break
+
+        try:
+            MainWindow.refresh_results(window)
+            self.assertTrue(reader_entered.wait(2.0))
+            first_reader_id = retain_current_thread("reader-1")
+
+            MainWindow._start_download_summary(
+                window,
+                run,
+                0,
+                SimpleNamespace(normal_exit=True),
+            )
+            self.assertIsNone(window._download_summary_binding)
+            self.assertEqual(summary_calls, [])
+            self.assertTrue(window.queue_active)
+            self.assertIs(window.queue_current, run)
+            window._finish_run_after_summary.assert_not_called()
+
+            reader_release.set()
+            drain_current_task(reader_done)
+
+            with patch("douk_manager.gui.format_summary_for_ui", return_value=("done",)):
+                MainWindow._start_download_summary(
+                    window,
+                    run,
+                    0,
+                    SimpleNamespace(normal_exit=True),
+                )
+                self.assertTrue(summary_entered.wait(2.0))
+                summary_id = retain_current_thread("summary")
+
+                MainWindow.refresh_results(window)
+                MainWindow._preview_task(window)
+                self.assertEqual(reader_calls, [1])
+                window.controller.preview_private_skip.assert_not_called()
+                self.assertEqual(len(coordinator._records), 1)
+
+                summary_release.set()
+                drain_current_task(summary_done)
+
+            self.assertIsNone(window._download_summary_binding)
+            self.assertEqual(summary_calls, [run.task_log])
+            window._finish_run_after_summary.assert_called_once()
+
+            MainWindow.refresh_results(window)
+            self.assertTrue(second_reader_done.wait(2.0))
+            second_reader_id = retain_current_thread("reader-2")
+            drain_current_task(second_reader_done)
+        finally:
+            reader_release.set()
+            summary_release.set()
+            for _ in range(1000):
+                app.processEvents()
+                if not coordinator.has_active_tasks():
+                    break
+            for _ in range(1000):
+                QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                app.processEvents()
+                if len(destroyed) == len(retained_threads):
+                    break
+
+        self.assertEqual(reader_calls, [1, 2])
+        self.assertEqual(window._render_result_snapshot.call_count, 2)
+        expected_ids = [first_reader_id, summary_id, second_reader_id]
+        self.assertEqual([event[0] for event in settlements], expected_ids)
+        self.assertEqual(removals, expected_ids)
+        self.assertEqual(destroyed, ["reader-1", "summary", "reader-2"])
+        self.assertFalse(coordinator.findChildren(QThread))
+
+    def test_summary_and_result_readers_share_result_logs_resource(self) -> None:
+        window, run = self._summary_window(Path("Data/DownloadTask_20260820.log"))
+        summary_spec = self._start_and_capture(window, run).args[0]
+
+        result_window = SimpleNamespace(
+            result_table=object(),
+            result_refresh_button=None,
+            controller=SimpleNamespace(result_snapshot=Mock()),
+            _submit_coalesced_background=Mock(),
+        )
+        MainWindow.refresh_results(result_window)
+        result_spec = result_window._submit_coalesced_background.call_args.args[0]
+
+        private_window = SimpleNamespace(
+            task_smart_private=SimpleNamespace(isChecked=Mock(return_value=True)),
+            task_expression=SimpleNamespace(text=Mock(return_value="A1")),
+            task_private_days=SimpleNamespace(value=Mock(return_value=7)),
+            task_output=object(),
+            task_preview_button=object(),
+            controller=SimpleNamespace(preview_private_skip=Mock()),
+            _submit_coalesced_background=Mock(),
+        )
+        MainWindow._preview_task(private_window)
+        private_spec = private_window._submit_coalesced_background.call_args.args[0]
+
+        self.assertEqual(result_spec.resource_keys, frozenset({"result_logs"}))
+        self.assertEqual(private_spec.resource_keys, frozenset({"result_logs"}))
+
+        coordinator = BackgroundTaskCoordinator()
+        coordinator._records["reader"] = TaskRecord(
+            task_id="reader",
+            spec=result_spec,
+            generation=1,
+            token=CancellationToken(),
+            thread=None,
+            worker=None,
+            state=TaskState.RUNNING,
+        )
+        with self.assertRaisesRegex(TaskRejectedError, "result_logs"):
+            coordinator._validate_start(summary_spec)
+        coordinator._validate_start(
+            TaskSpec(
+                task_type="collector_probe",
+                display_name="collector probe",
+                resource_keys=frozenset({"collector_process"}),
+                deduplicate_key="collector_probe",
+            )
+        )
+
+        coordinator._records.clear()
+        coordinator._records["summary"] = TaskRecord(
+            task_id="summary",
+            spec=summary_spec,
+            generation=1,
+            token=CancellationToken(),
+            thread=None,
+            worker=None,
+            state=TaskState.RUNNING,
+        )
+        for reader_spec in (result_spec, private_spec):
+            with self.subTest(reader=reader_spec.task_type):
+                with self.assertRaisesRegex(TaskRejectedError, "result_logs"):
+                    coordinator._validate_start(reader_spec)
+        coordinator._records.clear()
+        coordinator._validate_start(result_spec)
+        coordinator._validate_start(private_spec)
+
+    def test_removed_without_terminal_fails_closed_and_ignores_late_terminal(
+        self,
+    ) -> None:
+        window, run = self._summary_window(Path("Data/DownloadTask_protocol.log"))
+        submitted = self._start_and_capture(window, run)
+        summary = SimpleNamespace(complete=True, reliable=True)
+
+        submitted.kwargs["on_removed"]()
+
+        self.assertFalse(window.queue_active)
+        self.assertIsNone(window.queue_current)
+        self.assertEqual(window.queue_pending, [])
+        window._release_download_lifecycle.assert_called_once_with()
+        window._finish_run_after_summary.assert_not_called()
+        window._refresh_background_targets.assert_called_once_with(
+            ("download_results", "runtime_status")
+        )
+        display_count = window._append_info.call_count
+
+        submitted.kwargs["on_success"](summary)
+        submitted.kwargs["on_removed"]()
+
+        self.assertEqual(window._append_info.call_count, display_count)
+        window._release_download_lifecycle.assert_called_once_with()
+        window._finish_run_after_summary.assert_not_called()
+        self.assertIsNone(window._download_summary_binding)
+
+    def test_closing_late_summary_callbacks_only_clean_up(self) -> None:
+        window, run = self._summary_window(Path("Data/DownloadTask_closing_late.log"))
+        submitted = self._start_and_capture(window, run)
+        window.controller.startup_state = StartupState.CLOSING
+
+        submitted.kwargs["on_success"](
+            SimpleNamespace(complete=True, reliable=True)
+        )
+        submitted.kwargs["on_removed"]()
+        submitted.kwargs["on_removed"]()
+
+        window._append_info.assert_not_called()
+        window._refresh_background_targets.assert_not_called()
+        window._finish_run_after_summary.assert_not_called()
+        window._release_download_lifecycle.assert_called_once_with()
+        self.assertFalse(window.queue_active)
+        self.assertIsNone(window.queue_current)
+        self.assertEqual(window.queue_pending, [])
+        self.assertIsNone(window._download_summary_binding)
+
+    def test_closing_during_removed_refresh_prevents_post_and_cleans_up(self) -> None:
+        window, run = self._summary_window(Path("Data/DownloadTask_refresh_race.log"))
+        submitted = self._start_and_capture(window, run)
+        with patch(
+            "douk_manager.gui.format_summary_for_ui", return_value=("complete",)
+        ):
+            submitted.kwargs["on_success"](
+                SimpleNamespace(complete=True, reliable=True)
+            )
+        window._refresh_background_targets.side_effect = lambda _targets: setattr(
+            window.controller, "startup_state", StartupState.CLOSING
+        )
+
+        submitted.kwargs["on_removed"]()
+
+        window._finish_run_after_summary.assert_not_called()
+        window._release_download_lifecycle.assert_called_once_with()
+        self.assertFalse(window.queue_active)
+        self.assertIsNone(window.queue_current)
+        self.assertEqual(window.queue_pending, [])
+        self.assertIsNone(window._download_summary_binding)
+
+    def test_stale_summary_generation_callbacks_are_ignored(self) -> None:
+        window, run = self._summary_window(Path("Data/DownloadTask_stale.log"))
+        submitted = self._start_and_capture(window, run)
+        binding = window._download_summary_binding
+        window._background_generations[binding.deduplicate_key] = binding.generation + 1
+
+        submitted.kwargs["on_success"](
+            SimpleNamespace(complete=True, reliable=True)
+        )
+        submitted.kwargs["on_removed"]()
+
+        self.assertFalse(binding.terminal_consumed)
+        self.assertFalse(binding.removed_consumed)
+        window._append_info.assert_not_called()
+        window._refresh_background_targets.assert_not_called()
+        window._finish_run_after_summary.assert_not_called()
+
+        window._background_generations[binding.deduplicate_key] = binding.generation
+        submitted.kwargs["on_failure"](
+            TaskFailure("RuntimeError", "current failure", "trace")
+        )
+        submitted.kwargs["on_removed"]()
+
+        self.assertTrue(binding.terminal_consumed)
+        self.assertTrue(binding.removed_consumed)
+        window._release_download_lifecycle.assert_called_once_with()
+        self.assertIsNone(window._download_summary_binding)
+
+    def test_per_run_dedup_is_canonical_and_closing_never_submits(self) -> None:
+        first_window, first_run = self._summary_window(
+            Path("Data/../Data/DownloadTask_20260820.log")
+        )
+        first_spec = self._start_and_capture(first_window, first_run).args[0]
+
+        equivalent_window, equivalent_run = self._summary_window(
+            Path("data/downloadtask_20260820.LOG")
+        )
+        equivalent_spec = self._start_and_capture(
+            equivalent_window, equivalent_run
+        ).args[0]
+
+        other_window, other_run = self._summary_window(
+            Path("Data/DownloadTask_20260821.log")
+        )
+        other_spec = self._start_and_capture(other_window, other_run).args[0]
+
+        self.assertEqual(first_spec.deduplicate_key, equivalent_spec.deduplicate_key)
+        self.assertNotEqual(first_spec.deduplicate_key, other_spec.deduplicate_key)
+
+        closing_window, closing_run = self._summary_window(
+            Path("Data/DownloadTask_closing.log")
+        )
+        closing_window.controller.startup_state = StartupState.CLOSING
+        MainWindow._start_download_summary(
+            closing_window,
+            closing_run,
+            0,
+            SimpleNamespace(normal_exit=True),
+        )
+        closing_window._submit_background.assert_not_called()
 
 
 class PhaseTwoReadOnlyTaskTests(unittest.TestCase):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,7 +29,7 @@ else:
     from douk_manager.core.engine import assess_process_exit
     from douk_manager.gui import ActionWorker, MainWindow, TaskTemplateList
     from douk_manager.startup import StartupSafetyResult, StartupStage, StartupState
-    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QThread, Qt
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication, QListWidgetItem, QMainWindow
 
@@ -58,11 +59,16 @@ class QueueInteractionSourceTests(unittest.TestCase):
     def test_download_summary_lifecycle_exists_without_gui_dependencies(self) -> None:
         source = self._gui_source()
 
+        self.assertIn("class DownloadSummaryTaskBinding", source)
         self.assertIn("def _start_download_summary", source)
-        self.assertIn("def _finish_download_summary", source)
+        self.assertIn('task_type="download_summary"', source)
+        self.assertIn('resource_keys=frozenset({"task_logs", "result_logs"})', source)
+        self.assertIn("on_removed=lambda: MainWindow._remove_download_summary", source)
         self.assertIn("正在汇总账号结果", source)
-        self.assertIn("self.download_summary_thread: QThread | None = None", source)
-        self.assertIn("self.download_summary_worker: ActionWorker | None = None", source)
+        self.assertIn("self._download_summary_binding", source)
+        self.assertNotIn("def _finish_download_summary", source)
+        self.assertNotIn("self.download_summary_thread", source)
+        self.assertNotIn("self.download_summary_worker", source)
 
     def test_process_exit_waits_for_summary_service_before_queue_advance(self) -> None:
         source = self._gui_source()
@@ -85,7 +91,7 @@ class QueueInteractionSourceTests(unittest.TestCase):
             )
         ]
 
-        self.assertIn("download_summary_thread", close_branch)
+        self.assertIn("_download_summary_is_active", close_branch)
         self.assertIn("账号结果汇总", close_branch)
 
     def test_all_formal_activation_and_start_entries_share_queue_gate(self) -> None:
@@ -209,46 +215,11 @@ class QueueInteractionSourceTests(unittest.TestCase):
             "engine_running",
             "monitor_running",
             "queue_active",
-            "download_summary_thread",
+            "summary_running",
             "background_thread",
         ):
             self.assertIn(token, tick_source)
         self.assertNotIn("if result is None", tick_source)
-
-
-class _FakeSignal:
-    def __init__(self) -> None:
-        self.callbacks: list[object] = []
-
-    def connect(self, callback: object) -> None:
-        self.callbacks.append(callback)
-
-
-class _FakeThread:
-    def __init__(self, parent: object) -> None:
-        self.parent = parent
-        self.started = _FakeSignal()
-        self.finished = _FakeSignal()
-        self.start_count = 0
-        self.quit = Mock()
-        self.deleteLater = Mock()
-
-    def start(self) -> None:
-        self.start_count += 1
-
-
-class _FakeWorker:
-    def __init__(self, action: object) -> None:
-        self.action = action
-        self.done = _FakeSignal()
-        self.result = None
-        self.error = None
-        self.thread = None
-        self.run = Mock()
-        self.deleteLater = Mock()
-
-    def moveToThread(self, thread: object) -> None:
-        self.thread = thread
 
 
 @unittest.skipIf(ActionWorker is None, "PySide6 is installed by the Windows build workflow")
@@ -310,11 +281,13 @@ class ActionWorkerTests(unittest.TestCase):
             running=False,
             process=SimpleNamespace(returncode=exit_code, pid=1234),
             task_template="A1-A2.json",
+            task_log=Path("Data/DownloadTask_20260820.log"),
             selected_accounts=2,
         )
         window = MainWindow.__new__(MainWindow)
         QMainWindow.__init__(window)
         window.controller = SimpleNamespace(
+            startup_state=StartupState.READY,
             logger=Mock(),
             engine=SimpleNamespace(
                 current=None,
@@ -355,11 +328,8 @@ class ActionWorkerTests(unittest.TestCase):
         )
         window.queue_pause_button = SimpleNamespace(setText=Mock())
         window.shutdown_timer = None
-        window.download_summary_thread = None
-        window.download_summary_worker = None
-        window.download_summary_run = None
-        window.download_summary_exit_code = None
-        window.download_summary_assessment = None
+        window._download_summary_binding = None
+        window._background_generations = {}
         window.coordinator = BackgroundTaskCoordinator(window)
         window._close_pending = False
         window._append_info = Mock()
@@ -367,7 +337,34 @@ class ActionWorkerTests(unittest.TestCase):
         window._run = lambda action, _output=None: action()
         window.refresh_all = Mock()
         window.refresh_results = Mock()
+        window._refresh_background_targets = Mock()
         return window
+
+    @staticmethod
+    def _capture_summary_submission(
+        window: MainWindow,
+        *,
+        exit_code: int = 0,
+    ):
+        window._submit_background = Mock(return_value="summary-task")
+        MainWindow._start_download_summary(
+            window,
+            window.queue_current,
+            exit_code,
+            assess_process_exit(exit_code),
+        )
+        binding = window._download_summary_binding
+        if binding is not None:
+            window._background_generations[binding.deduplicate_key] = binding.generation
+        return window._submit_background.call_args
+
+    @staticmethod
+    def _summary_success(window: MainWindow, submitted, summary: object) -> None:
+        submitted.kwargs["on_success"](summary)
+
+    @staticmethod
+    def _summary_removed(submitted) -> None:
+        submitted.kwargs["on_removed"]()
 
     def test_mouse_drag_checks_and_second_drag_unchecks_the_same_rows(self) -> None:
         widget = TaskTemplateList()
@@ -440,14 +437,6 @@ class ActionWorkerTests(unittest.TestCase):
         run.running = True
         run.pause_after_exit = False
         window.queue_paused = True
-        window.download_summary_worker = SimpleNamespace(
-            error=None,
-            result=SimpleNamespace(complete=True, reliable=True),
-        )
-        window.download_summary_thread = object()
-        window.download_summary_run = run
-        window.download_summary_exit_code = 0
-        window.download_summary_assessment = assess_process_exit(0)
         window.controller.dismiss_result_review.side_effect = lambda _run: setattr(
             _run, "running", False
         )
@@ -455,8 +444,11 @@ class ActionWorkerTests(unittest.TestCase):
             window
         )
 
+        submitted = self._capture_summary_submission(window)
+        summary = SimpleNamespace(complete=True, reliable=True)
         with patch.object(gui_module, "format_summary_for_ui", return_value=("汇总完成",)):
-            MainWindow._finish_download_summary(window)
+            self._summary_success(window, submitted, summary)
+        self._summary_removed(submitted)
 
         window.controller.dismiss_result_review.assert_called_once_with(run)
         self.assertTrue(window.queue_paused)
@@ -464,25 +456,23 @@ class ActionWorkerTests(unittest.TestCase):
         self.assertEqual(window.queue_pending, [Path("A3.json")])
         window.controller.activate_and_start.assert_not_called()
 
-    def test_one_poll_starts_one_summary_worker_without_advancing_queue(self) -> None:
+    def test_one_poll_starts_one_summary_task_without_advancing_queue(self) -> None:
         window = self._window_harness()
         current = window.queue_current
         pending = list(window.queue_pending)
+        window._submit_background = Mock(return_value="summary-task")
 
-        with (
-            patch.object(gui_module, "QThread", _FakeThread),
-            patch.object(gui_module, "ActionWorker", _FakeWorker),
-        ):
-            MainWindow._poll_processes(window)
-            MainWindow._poll_processes(window)
+        MainWindow._poll_processes(window)
+        MainWindow._poll_processes(window)
 
         self.assertIs(window.queue_current, current)
         self.assertEqual(window.queue_pending, pending)
         self.assertTrue(window.queue_active)
-        self.assertIsInstance(window.download_summary_thread, _FakeThread)
-        self.assertIsInstance(window.download_summary_worker, _FakeWorker)
-        self.assertEqual(window.download_summary_thread.start_count, 1)
-        window.download_summary_worker.action()
+        window._submit_background.assert_called_once()
+        spec, action = window._submit_background.call_args.args
+        self.assertEqual(spec.task_type, "download_summary")
+        self.assertEqual(spec.resource_keys, frozenset({"task_logs", "result_logs"}))
+        action(None)
         window.controller.summarize_download.assert_called_once()
         called_run, called_code, called_ended_at = (
             window.controller.summarize_download.call_args.args
@@ -493,14 +483,9 @@ class ActionWorkerTests(unittest.TestCase):
         window._start_next_queue_item.assert_not_called()
         window.controller.run_post_actions.assert_not_called()
 
-    def test_normal_summary_completion_runs_post_actions_then_advances(self) -> None:
+    def test_normal_summary_waits_for_removal_then_runs_post_and_advances(self) -> None:
         window = self._window_harness()
         summary = SimpleNamespace(complete=True, reliable=True)
-        window.download_summary_worker = SimpleNamespace(error=None, result=summary)
-        window.download_summary_thread = object()
-        window.download_summary_run = window.queue_current
-        window.download_summary_exit_code = 0
-        window.download_summary_assessment = assess_process_exit(0)
         events: list[object] = []
         window.controller.run_post_actions.side_effect = lambda timing: (
             events.append(("post", timing)) or ["截图归档完成"]
@@ -511,13 +496,27 @@ class ActionWorkerTests(unittest.TestCase):
         window._append_info.side_effect = lambda _output, *messages, **_kwargs: (
             events.append(("display", messages))
         )
+        submitted = self._capture_summary_submission(window)
 
         with patch.object(
             gui_module,
             "format_summary_for_ui",
             return_value=("下载进程：正常退出（退出码 0）", "账号汇总：完整"),
         ):
-            MainWindow._finish_download_summary(window)
+            self._summary_success(window, submitted, summary)
+
+        self.assertEqual(
+            events,
+            [
+                (
+                    "display",
+                    ("下载进程：正常退出（退出码 0）", "账号汇总：完整"),
+                )
+            ],
+        )
+        window.controller.run_post_actions.assert_not_called()
+
+        self._summary_removed(submitted)
 
         self.assertEqual(
             events,
@@ -534,22 +533,41 @@ class ActionWorkerTests(unittest.TestCase):
         self.assertTrue(window.queue_active)
         self.assertIsNone(window.queue_current)
         self.assertEqual(window.queue_pending, [Path("A3.json")])
-        window.refresh_all.assert_called_once_with()
+        window._refresh_background_targets.assert_called_once_with(
+            ("download_results", "runtime_status")
+        )
+
+    def test_marker_summary_retries_after_transient_admission_rejection(self) -> None:
+        window = self._window_harness()
+        run = window.queue_current
+        run.running = True
+        run.pause_after_exit = True
+        window._submit_background = Mock(side_effect=[None, "summary-task"])
+
+        with patch.object(MainWindow, "_completion_marker_code", return_value=0):
+            MainWindow._poll_processes(window)
+            MainWindow._poll_processes(window)
+
+        self.assertEqual(window._submit_background.call_count, 2)
+        first_spec = window._submit_background.call_args_list[0].args[0]
+        second_spec = window._submit_background.call_args_list[1].args[0]
+        self.assertEqual(first_spec.deduplicate_key, second_spec.deduplicate_key)
+        self.assertEqual(window._download_summary_binding.task_id, "summary-task")
+        window._start_next_queue_item.assert_not_called()
+        window.controller.run_post_actions.assert_not_called()
+        window.controller.release_download_lifecycle.assert_not_called()
 
     def test_incomplete_summary_is_folded_into_queue_completion_state(self) -> None:
         window = self._window_harness()
-        window.download_summary_worker = SimpleNamespace(
-            error=None,
-            result=SimpleNamespace(complete=False, reliable=True),
-        )
-        window.download_summary_thread = object()
-        window.download_summary_run = window.queue_current
-        window.download_summary_exit_code = 0
-        window.download_summary_assessment = assess_process_exit(0)
+        summary = SimpleNamespace(complete=False, reliable=True)
         window.controller.run_post_actions.return_value = []
+        submitted = self._capture_summary_submission(window)
 
         with patch.object(gui_module, "format_summary_for_ui", return_value=("部分汇总",)):
-            MainWindow._finish_download_summary(window)
+            self._summary_success(window, submitted, summary)
+
+        self.assertTrue(window.queue_summaries_complete)
+        self._summary_removed(submitted)
 
         self.assertFalse(window.queue_summaries_complete)
         self.assertTrue(window.queue_summaries_reliable)
@@ -576,21 +594,16 @@ class ActionWorkerTests(unittest.TestCase):
 
     def test_abnormal_summary_completion_displays_partial_result_and_stops(self) -> None:
         window = self._window_harness(exit_code=7)
-        window.download_summary_worker = SimpleNamespace(
-            error=None,
-            result=SimpleNamespace(complete=False, reliable=True),
-        )
-        window.download_summary_thread = object()
-        window.download_summary_run = window.queue_current
-        window.download_summary_exit_code = 7
-        window.download_summary_assessment = assess_process_exit(7)
+        summary = SimpleNamespace(complete=False, reliable=True)
+        submitted = self._capture_summary_submission(window, exit_code=7)
 
         with patch.object(
             gui_module,
             "format_summary_for_ui",
             return_value=("下载进程：异常退出（退出码 7）", "账号汇总：结果不完整"),
         ):
-            MainWindow._finish_download_summary(window)
+            self._summary_success(window, submitted, summary)
+        self._summary_removed(submitted)
 
         window._append_info.assert_called_once_with(
             window.queue_output,
@@ -606,15 +619,13 @@ class ActionWorkerTests(unittest.TestCase):
 
     def test_summary_error_stops_queue_without_advancing(self) -> None:
         window = self._window_harness()
-        window.download_summary_worker = SimpleNamespace(
-            error=SummaryWriteError("无法将账号汇总写入现有任务日志。"), result=None
-        )
-        window.download_summary_thread = object()
-        window.download_summary_run = window.queue_current
-        window.download_summary_exit_code = 0
-        window.download_summary_assessment = assess_process_exit(0)
+        submitted = self._capture_summary_submission(window)
+        error = SummaryWriteError("无法将账号汇总写入现有任务日志。")
 
-        MainWindow._finish_download_summary(window)
+        submitted.kwargs["on_failure"](
+            gui_module.TaskFailure(type(error).__name__, str(error), "synthetic traceback")
+        )
+        self._summary_removed(submitted)
 
         displayed = "\n".join(
             str(value)
@@ -627,34 +638,84 @@ class ActionWorkerTests(unittest.TestCase):
         self.assertEqual(window.queue_pending, [])
         window.controller.run_post_actions.assert_not_called()
         window._start_next_queue_item.assert_not_called()
-        window.controller.logger.exception.assert_called_once()
+        window.controller.logger.error.assert_called_once()
         window.controller.release_download_lifecycle.assert_called_once_with()
 
-    def test_completion_always_releases_dedicated_summary_state(self) -> None:
+    def test_completion_retires_summary_binding_without_restarting(self) -> None:
         window = self._window_harness(exit_code=2)
-        window.download_summary_worker = SimpleNamespace(
-            error=None,
-            result=SimpleNamespace(complete=False, reliable=True),
-        )
-        window.download_summary_thread = object()
-        window.download_summary_run = window.queue_current
-        window.download_summary_exit_code = 2
-        window.download_summary_assessment = assess_process_exit(2)
+        run = window.queue_current
+        summary = SimpleNamespace(complete=False, reliable=True)
+        submitted = self._capture_summary_submission(window, exit_code=2)
 
         with patch.object(gui_module, "format_summary_for_ui", return_value=("部分汇总",)):
-            MainWindow._finish_download_summary(window)
+            self._summary_success(window, submitted, summary)
+        self._summary_removed(submitted)
 
-        self.assertIsNone(window.download_summary_thread)
-        self.assertIsNone(window.download_summary_worker)
-        self.assertIsNone(window.download_summary_run)
-        self.assertIsNone(window.download_summary_exit_code)
-        self.assertIsNone(window.download_summary_assessment)
+        self.assertIsNone(window._download_summary_binding)
+        window._submit_background.reset_mock()
+        MainWindow._start_download_summary(
+            window, run, 2, assess_process_exit(2)
+        )
+        window._submit_background.assert_not_called()
+
+    def test_cancel_requested_during_wait_summary_finishes_without_post_or_next(
+        self,
+    ) -> None:
+        window = self._window_harness()
+        run = window.queue_current
+        window.queue_cancel_requested = True
+        submitted = self._capture_summary_submission(window)
+
+        with patch.object(gui_module, "format_summary_for_ui", return_value=("汇总完成",)):
+            self._summary_success(
+                window,
+                submitted,
+                SimpleNamespace(complete=True, reliable=True),
+            )
+
+        window.controller.release_download_lifecycle.assert_not_called()
+        self._summary_removed(submitted)
+
+        self.assertFalse(window.queue_active)
+        self.assertIsNone(window.queue_current)
+        self.assertEqual(window.queue_pending, [])
+        window.controller.run_post_actions.assert_not_called()
+        window._start_next_queue_item.assert_not_called()
+        window.controller.release_download_lifecycle.assert_called_once_with()
+        self.assertIsNone(window._download_summary_binding)
+
+    def test_pause_after_exit_waits_then_continues_only_once(self) -> None:
+        window = self._window_harness()
+        run = window.queue_current
+        run.completion_marker = Path("download.exit")
+        run.running = True
+        run.pause_after_exit = True
+        submitted = self._capture_summary_submission(window)
+
+        with patch.object(gui_module, "format_summary_for_ui", return_value=("汇总完成",)):
+            self._summary_success(
+                window,
+                submitted,
+                SimpleNamespace(complete=True, reliable=True),
+            )
+        self._summary_removed(submitted)
+
+        self.assertTrue(run.result_review_waiting)
+        window.controller.run_post_actions.assert_not_called()
+        window._start_next_queue_item.assert_not_called()
+
+        run.running = False
+        run.engine_exit_code = 0
+        MainWindow._poll_processes(window)
+        MainWindow._poll_processes(window)
+
+        window.controller.run_post_actions.assert_called_once_with("batch")
+        self.assertIsNone(window._download_summary_binding)
 
     def test_close_waits_until_summary_finished_callback_clears_state(self) -> None:
         window = self._window_harness()
-        window.download_summary_thread = SimpleNamespace(
-            isRunning=Mock(return_value=False)
-        )
+        window.queue_current = None
+        window._download_summary_binding = SimpleNamespace(removed_consumed=False)
         window.background_thread = None
         window.controller.stop_collector = Mock()
         event = SimpleNamespace(ignore=Mock(), accept=Mock())
@@ -667,10 +728,28 @@ class ActionWorkerTests(unittest.TestCase):
         event.accept.assert_not_called()
         window.controller.stop_collector.assert_not_called()
 
+    def test_closing_rejects_summary_post_and_next_entry_points(self) -> None:
+        window = self._window_harness()
+        run = window.queue_current
+        window.controller.startup_state = StartupState.CLOSING
+        window._submit_background = Mock()
+        window._run = Mock()
+
+        MainWindow._start_download_summary(
+            window, run, 0, assess_process_exit(0)
+        )
+        MainWindow._run_post_actions_background(window, "batch", run)
+        MainWindow._start_next_queue_item(window)
+
+        window._submit_background.assert_not_called()
+        window._run.assert_not_called()
+        window.controller.run_post_actions.assert_not_called()
+        window.controller.activate_and_start.assert_not_called()
+
     def test_close_rejects_running_current_before_summary_thread_exists(self) -> None:
         window = self._window_harness()
         window.queue_current.running = True
-        window.download_summary_thread = None
+        window._download_summary_binding = None
         window.background_thread = None
         window.controller.stop_collector = Mock()
         event = SimpleNamespace(ignore=Mock(), accept=Mock())
@@ -688,7 +767,7 @@ class ActionWorkerTests(unittest.TestCase):
     def test_close_rejects_exited_current_before_summary_poll(self) -> None:
         window = self._window_harness(exit_code=0)
         self.assertFalse(window.queue_current.running)
-        window.download_summary_thread = None
+        window._download_summary_binding = None
         window.background_thread = None
         window.controller.stop_collector = Mock()
         event = SimpleNamespace(ignore=Mock(), accept=Mock())
@@ -706,7 +785,7 @@ class ActionWorkerTests(unittest.TestCase):
     def test_close_accepts_when_no_current_run_or_background_work_exists(self) -> None:
         window = self._window_harness()
         window.queue_current = None
-        window.download_summary_thread = None
+        window._download_summary_binding = None
         window.background_thread = None
         window.controller.stop_collector = Mock()
         event = SimpleNamespace(ignore=Mock(), accept=Mock())
@@ -722,7 +801,7 @@ class ActionWorkerTests(unittest.TestCase):
     def test_close_in_closing_state_skips_unmanaged_collector(self) -> None:
         window = self._window_harness()
         window.queue_current = None
-        window.download_summary_thread = None
+        window._download_summary_binding = None
         window.background_thread = None
         controller = ManagerController.__new__(ManagerController)
         controller.startup_state = StartupState.CLOSING
@@ -748,7 +827,7 @@ class ActionWorkerTests(unittest.TestCase):
     def test_close_from_degraded_stops_managed_collector_before_accepting(self) -> None:
         window = self._window_harness()
         window.queue_current = None
-        window.download_summary_thread = None
+        window._download_summary_binding = None
         window.background_thread = None
         stopped: list[bool] = []
         controller = ManagerController.__new__(ManagerController)
@@ -782,7 +861,7 @@ class ActionWorkerTests(unittest.TestCase):
     def test_close_keeps_window_open_when_managed_collector_stop_fails(self) -> None:
         window = self._window_harness()
         window.queue_current = None
-        window.download_summary_thread = None
+        window._download_summary_binding = None
         window.background_thread = None
         controller = ManagerController.__new__(ManagerController)
         controller.startup_state = StartupState.READY
@@ -820,9 +899,11 @@ class ActionWorkerTests(unittest.TestCase):
         controller.engine = SimpleNamespace(current=None)
         controller.collector = SimpleNamespace(process=object())
         controller.logger = SimpleNamespace(info=lambda *_args: None)
+        stop_called = threading.Event()
 
         def stop_collector() -> None:
             controller.collector.process = None
+            stop_called.set()
 
         controller.stop_collector = stop_collector
         window.controller = controller
@@ -834,7 +915,7 @@ class ActionWorkerTests(unittest.TestCase):
         window._background_pending = {}
         window._collector_stop_task_id = None
         window.queue_current = None
-        window.download_summary_thread = None
+        window._download_summary_binding = None
         window.background_thread = None
         window.coordinator.task_settled.connect(window._on_background_task_settled)
         window.coordinator.task_removed.connect(window._on_background_task_removed)
@@ -843,14 +924,31 @@ class ActionWorkerTests(unittest.TestCase):
         try:
             window.show()
             window.close()
-            for _ in range(300):
+            records = tuple(window.coordinator._records.values())
+            self.assertEqual(len(records), 1)
+            thread = records[0].thread
+            self.assertIsNotNone(thread)
+            thread_finished: list[bool] = []
+            thread_destroyed: list[bool] = []
+            thread.finished.connect(lambda: thread_finished.append(True))
+            thread.destroyed.connect(lambda *_: thread_destroyed.append(True))
+            self.assertTrue(stop_called.wait(2.0))
+            for _ in range(1000):
                 self.app.processEvents()
-                if not window.isVisible() and not window.coordinator.has_active_tasks():
+                if (
+                    not window.isVisible()
+                    and not window.coordinator.has_active_tasks()
+                    and thread_finished
+                ):
                     break
-                QTest.qWait(10)
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            self.app.processEvents()
 
             self.assertFalse(window.isVisible())
             self.assertFalse(window.coordinator.has_active_tasks())
+            self.assertEqual(thread_finished, [True])
+            self.assertEqual(thread_destroyed, [True])
+            self.assertFalse(window.coordinator.findChildren(QThread))
             self.assertIsNone(controller.collector.process)
             self.assertIs(controller.startup_state, StartupState.CLOSING)
         finally:
@@ -861,7 +959,7 @@ class ActionWorkerTests(unittest.TestCase):
     def test_close_during_startup_requests_cooperative_cancel_without_waiting(self) -> None:
         window = self._window_harness()
         window.queue_current = None
-        window.download_summary_thread = None
+        window._download_summary_binding = None
         window.background_thread = None
         controller = ManagerController.__new__(ManagerController)
         controller.startup_state = StartupState.SAFETY_CHECKING
@@ -1051,18 +1149,16 @@ class ActionWorkerTests(unittest.TestCase):
 
     def test_batch_post_action_failure_stops_queue_without_advancing(self) -> None:
         window = self._window_harness()
-        window.download_summary_worker = SimpleNamespace(
-            error=None,
-            result=SimpleNamespace(complete=True, reliable=True),
-        )
-        window.download_summary_thread = object()
-        window.download_summary_run = window.queue_current
-        window.download_summary_exit_code = 0
-        window.download_summary_assessment = assess_process_exit(0)
         window._run = Mock(return_value=None)
+        submitted = self._capture_summary_submission(window)
 
         with patch.object(gui_module, "format_summary_for_ui", return_value=("汇总完成",)):
-            MainWindow._finish_download_summary(window)
+            self._summary_success(
+                window,
+                submitted,
+                SimpleNamespace(complete=True, reliable=True),
+            )
+        self._summary_removed(submitted)
 
         displayed = "\n".join(
             str(value)
