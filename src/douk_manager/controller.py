@@ -26,6 +26,10 @@ from douk_manager.core.locks import critical_section
 from douk_manager.core.settings_tasks import EarliestRule, GeneratedTask, SettingsTaskService
 from douk_manager.core.task_order import TaskOrderService
 from douk_manager.core.result_history import RecentPrivateMatch, ResultHistoryService
+from douk_manager.core.result_dashboard import (
+    DashboardFileFingerprint,
+    ResultDashboardService,
+)
 from douk_manager.integrations.collector import CollectorService, MigrationResult
 from douk_manager.integrations.indexer import IndexResult, IndexService
 from douk_manager.integrations.screenshots import ScreenshotPreview, ScreenshotResult, ScreenshotService
@@ -68,6 +72,7 @@ class ManagerController:
         self.tasks = SettingsTaskService(self.paths, self.backup)
         self.task_order = TaskOrderService(self.paths)
         self.results = ResultHistoryService(self.paths.download_task_logs)
+        self.result_dashboard = ResultDashboardService(self.paths.download_task_logs)
         self.engine = EngineService(self.paths, self.config, self.backup)
         self.engine_updates = EngineUpdateService(self.paths, self.backup)
         self.collector = CollectorService(self.config, self.paths)
@@ -466,6 +471,37 @@ class ManagerController:
             "刷新下载结果", context=context
         )
         return self.results.page_snapshot(limit=limit, context=context)
+
+    def result_dashboard_index(
+        self,
+        *,
+        force_refresh: bool = False,
+        context: OperationContext | None = None,
+    ):
+        self._require_operational_ready_with_context(
+            "刷新结果看板任务索引", context=context
+        )
+        return self.result_dashboard.task_index(
+            force_refresh=force_refresh, context=context
+        )
+
+    def result_dashboard_snapshot(
+        self,
+        task_log: Path,
+        *,
+        expected_fingerprint: DashboardFileFingerprint | None = None,
+        force_refresh: bool = False,
+        context: OperationContext | None = None,
+    ):
+        self._require_operational_ready_with_context(
+            "读取结果看板任务", context=context
+        )
+        return self.result_dashboard.selected_task(
+            task_log,
+            expected_fingerprint=expected_fingerprint,
+            force_refresh=force_refresh,
+            context=context,
+        )
 
     def generate_batches(
         self, start: int, end: int, size: int, rule: EarliestRule
