@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import inspect
 import tempfile
 import threading
 import unittest
@@ -14,6 +15,7 @@ from PySide6.QtCore import QEventLoop, QTimer
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from douk_manager.background import TaskSpec
 from douk_manager.core.download_summary import (
     AccountOutcome,
     AccountStatus,
@@ -22,7 +24,7 @@ from douk_manager.core.download_summary import (
     NativeLogSegment,
     format_summary_for_task_log,
 )
-from douk_manager.gui import MainWindow
+from douk_manager.gui import BackgroundTaskBinding, MainWindow
 from douk_manager.startup import StartupState
 
 
@@ -369,6 +371,36 @@ class ResultDashboardGuiTests(unittest.TestCase):
                 )
             finally:
                 release.set()
+                self._dispose(window, home_patch)
+
+    def test_summary_auto_refresh_waits_for_old_result_reader_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window, home_patch = self._window(Path(directory))
+            try:
+                old_reader = BackgroundTaskBinding(
+                    generation_key="result_page_snapshot",
+                    generation=1,
+                    spec=TaskSpec(
+                        task_type="result_page_snapshot",
+                        display_name="刷新下载结果",
+                    ),
+                )
+                window._background_bindings["old-reader"] = old_reader
+                with patch.object(MainWindow, "refresh_result_dashboard") as refresh:
+                    window._defer_dashboard_refresh_until_results_idle()
+
+                    refresh.assert_not_called()
+                    self.assertIsNotNone(old_reader.on_removed)
+                    window._background_bindings.pop("old-reader")
+                    old_reader.on_removed()
+                    refresh.assert_called_once_with(window, auto_refresh=True)
+                source = inspect.getsource(MainWindow._remove_download_summary)
+                self.assertIn(
+                    '_refresh_background_targets(("download_results", "runtime_status"))',
+                    source,
+                )
+                self.assertIn("_defer_dashboard_refresh_until_results_idle", source)
+            finally:
                 self._dispose(window, home_patch)
 
 
