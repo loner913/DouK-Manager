@@ -3372,24 +3372,49 @@ class PhaseOneFreezeTests(unittest.TestCase):
 
 
 class Phase2QtProbeExecutionContractTests(unittest.TestCase):
-    def test_finished_observer_is_a_gui_owned_qobject(self) -> None:
+    def test_lifecycle_observer_is_gui_owned_and_checks_wrapper_retention(self) -> None:
         from tests import phase2_qt_lifecycle_probe as probe
 
-        task = {"thread_finished_count": 0, "lifecycle_events": []}
+        task = {
+            "thread_finished_count": 0,
+            "thread_destroyed_count": 0,
+            "worker_destroyed_count": 0,
+            "thread_wrapper_retained_during_destroyed": False,
+            "worker_wrapper_retained_during_destroyed": False,
+            "lifecycle_events": [],
+        }
         parent = QObject()
-        observer = probe._TaskThreadFinishedObserver(task, parent)
+        qt_refs: dict[str, tuple[object, object, QObject]] = {}
+        observer = probe._TaskLifecycleObserver(
+            task,
+            "probe-task",
+            qt_refs,
+            parent,
+        )
+        retained = (object(), object(), observer)
+        qt_refs["probe-task"] = retained
 
         self.assertIs(observer.parent(), parent)
         self.assertIs(observer.thread(), parent.thread())
-        observer.observe()
+        observer.observe_thread_finished()
+        observer.observe_worker_destroyed()
+        observer.observe_thread_destroyed()
         self.assertEqual(task["thread_finished_count"], 1)
-        self.assertEqual(task["lifecycle_events"], ["thread_finished_signal"])
+        self.assertEqual(task["worker_destroyed_count"], 1)
+        self.assertEqual(task["thread_destroyed_count"], 1)
+        self.assertTrue(task["worker_wrapper_retained_during_destroyed"])
+        self.assertTrue(task["thread_wrapper_retained_during_destroyed"])
+        self.assertEqual(
+            task["lifecycle_events"],
+            ["thread_finished_signal", "worker_destroyed", "thread_destroyed"],
+        )
 
+        qt_refs.clear()
         parent.deleteLater()
         QCoreApplication.sendPostedEvents(parent, QEvent.Type.DeferredDelete)
         _QT_APPLICATION.processEvents()
 
-    def test_probe_retains_qt_wrappers_until_window_disposal(self) -> None:
+    def test_probe_releases_qt_wrappers_after_destroyed_callbacks(self) -> None:
         from tests import phase2_qt_lifecycle_probe as probe
 
         observer = object.__new__(probe._RoundObserver)
@@ -3400,6 +3425,7 @@ class Phase2QtProbeExecutionContractTests(unittest.TestCase):
             "settled_count": 1,
             "removed_count": 1,
             "thread_finished_count": 1,
+            "qt_refs_released_after_destroyed": False,
             "lifecycle_events": [],
         }
         retained = (object(), object(), object())
@@ -3417,10 +3443,8 @@ class Phase2QtProbeExecutionContractTests(unittest.TestCase):
             side_effect=lambda condition: self.assertTrue(condition()),
         ):
             observer.wait_until_clean()
-        self.assertIs(observer._qt_refs["probe-task"], retained)
-
-        observer.release_qt_refs_after_window_dispose()
         self.assertEqual(observer._qt_refs, {})
+        self.assertTrue(task["qt_refs_released_after_destroyed"])
 
     def test_one_round_uses_one_real_window_and_real_qthreads_for_all_entries(
         self,
@@ -3478,7 +3502,7 @@ class Phase2QtProbeExecutionContractTests(unittest.TestCase):
             self.assertEqual(task["thread_type"], "PySide6.QtCore.QThread")
             self.assertTrue(
                 task["finished_observer_type"].endswith(
-                    "._TaskThreadFinishedObserver"
+                    "._TaskLifecycleObserver"
                 )
             )
             self.assertTrue(task["finished_observer_gui_affinity"])
@@ -3488,6 +3512,9 @@ class Phase2QtProbeExecutionContractTests(unittest.TestCase):
             self.assertEqual(task["thread_finished_count"], 1)
             self.assertEqual(task["thread_destroyed_count"], 1)
             self.assertEqual(task["worker_destroyed_count"], 1)
+            self.assertTrue(task["thread_wrapper_retained_during_destroyed"])
+            self.assertTrue(task["worker_wrapper_retained_during_destroyed"])
+            self.assertTrue(task["qt_refs_released_after_destroyed"])
         self.assertEqual(evidence["active_records_after"], 0)
         self.assertEqual(evidence["bindings_after"], 0)
         self.assertEqual(evidence["pending_after"], 0)
@@ -3514,7 +3541,7 @@ class Phase2QtProbeExecutionContractTests(unittest.TestCase):
         self.assertTrue(evidence["closing_protocol"]["closing_entry_rejected"])
         self.assertEqual(evidence["round_cleanup"]["active_records_after_cleanup"], 0)
         self.assertEqual(evidence["round_cleanup"]["qthreads_after_cleanup"], 0)
-        self.assertGreater(evidence["round_cleanup"]["qt_refs_before_window_dispose"], 0)
+        self.assertEqual(evidence["round_cleanup"]["qt_refs_before_window_dispose"], 0)
         self.assertEqual(evidence["round_cleanup"]["qt_refs_after_cleanup"], 0)
         self.assertEqual(evidence["round_cleanup"]["errors"], [])
         self.assertEqual(evidence["window_cleanup"]["window_destroyed_count"], 1)
@@ -3538,7 +3565,7 @@ class Phase2QtProbeExecutionContractTests(unittest.TestCase):
         self.assertTrue(evidence["closing_protocol"]["ui_unchanged"])
         self.assertTrue(evidence["closing_protocol"]["late_refresh_suppressed"])
         self.assertTrue(evidence["closing_protocol"]["closing_entry_rejected"])
-        self.assertGreater(evidence["round_cleanup"]["qt_refs_before_window_dispose"], 0)
+        self.assertEqual(evidence["round_cleanup"]["qt_refs_before_window_dispose"], 0)
         self.assertEqual(evidence["round_cleanup"]["qt_refs_after_cleanup"], 0)
         self.assertEqual(evidence["round_cleanup"]["errors"], [])
         self.assertEqual(evidence["window_cleanup"]["window_destroyed_count"], 1)

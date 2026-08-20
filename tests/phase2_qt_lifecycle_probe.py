@@ -275,15 +275,38 @@ class _ManagedCollectorProcess:
         return 0
 
 
-class _TaskThreadFinishedObserver(QObject):
-    def __init__(self, task: dict[str, Any], parent: QObject) -> None:
+class _TaskLifecycleObserver(QObject):
+    def __init__(
+        self,
+        task: dict[str, Any],
+        task_id: str,
+        qt_refs: dict[str, tuple[TaskWorker, QThread, QObject]],
+        parent: QObject,
+    ) -> None:
         super().__init__(parent)
         self._task = task
+        self._task_id = task_id
+        self._qt_refs = qt_refs
 
     @Slot()
-    def observe(self) -> None:
+    def observe_thread_finished(self) -> None:
         self._task["thread_finished_count"] += 1
         self._task["lifecycle_events"].append("thread_finished_signal")
+
+    @Slot()
+    def observe_thread_destroyed(self) -> None:
+        self._observe_destroyed("thread")
+
+    @Slot()
+    def observe_worker_destroyed(self) -> None:
+        self._observe_destroyed("worker")
+
+    def _observe_destroyed(self, object_name: str) -> None:
+        self._task[f"{object_name}_wrapper_retained_during_destroyed"] = (
+            self._task_id in self._qt_refs
+        )
+        self._task[f"{object_name}_destroyed_count"] += 1
+        self._task["lifecycle_events"].append(f"{object_name}_destroyed")
 
 
 def _summary_payload() -> DownloadSummary:
@@ -353,7 +376,7 @@ class _RoundObserver:
         self.tasks_by_id: dict[str, dict[str, Any]] = {}
         self._qt_refs: dict[
             str,
-            tuple[TaskWorker, QThread, _TaskThreadFinishedObserver],
+            tuple[TaskWorker, QThread, QObject],
         ] = {}
         self.required_entry_calls: list[str] = []
         self.summary_post_sequence: list[str] = []
@@ -449,6 +472,9 @@ class _RoundObserver:
             "thread_finished_count": 0,
             "thread_destroyed_count": 0,
             "worker_destroyed_count": 0,
+            "thread_wrapper_retained_during_destroyed": False,
+            "worker_wrapper_retained_during_destroyed": False,
+            "qt_refs_released_after_destroyed": False,
             "lifecycle_events": [],
             "expected_outcome": TaskState.SUCCEEDED.value,
             "triggered_by_terminal_task_ids": [
@@ -526,19 +552,20 @@ class _RoundObserver:
         )
         self.tasks.append(task)
         self.tasks_by_id[task_id] = task
-        finished_observer = _TaskThreadFinishedObserver(task, self.window)
-        task["finished_observer_type"] = _type_name(finished_observer)
+        lifecycle_observer = _TaskLifecycleObserver(
+            task,
+            task_id,
+            self._qt_refs,
+            self.window,
+        )
+        task["finished_observer_type"] = _type_name(lifecycle_observer)
         task["finished_observer_gui_affinity"] = (
-            finished_observer.thread() is self.window.thread()
+            lifecycle_observer.thread() is self.window.thread()
         )
-        self._qt_refs[task_id] = (worker, thread, finished_observer)
-        thread.finished.connect(finished_observer.observe)
-        thread.destroyed.connect(
-            lambda *_args, task=task: self._observe_qobject_destroyed(task, "thread")
-        )
-        worker.destroyed.connect(
-            lambda *_args, task=task: self._observe_qobject_destroyed(task, "worker")
-        )
+        self._qt_refs[task_id] = (worker, thread, lifecycle_observer)
+        thread.finished.connect(lifecycle_observer.observe_thread_finished)
+        thread.destroyed.connect(lifecycle_observer.observe_thread_destroyed)
+        worker.destroyed.connect(lifecycle_observer.observe_worker_destroyed)
         try:
             run_until(entered.is_set)
             task["thread_running_after_start"] = thread.isRunning()
@@ -549,11 +576,18 @@ class _RoundObserver:
                 release.set()
         return task_id
 
-    @staticmethod
-    def _observe_qobject_destroyed(task: dict[str, Any], object_name: str) -> None:
-        field = f"{object_name}_destroyed_count"
-        task[field] += 1
-        task["lifecycle_events"].append(f"{object_name}_destroyed")
+    def _release_destroyed_qt_refs(self, tasks: list[dict[str, Any]]) -> None:
+        for task in tasks:
+            if task["qt_refs_released_after_destroyed"]:
+                continue
+            if (
+                task["thread_destroyed_count"] != 1
+                or task["worker_destroyed_count"] != 1
+            ):
+                continue
+            task["qt_refs_released_after_destroyed"] = (
+                self._qt_refs.pop(task["task_id"], None) is not None
+            )
 
     def release_qt_refs_after_window_dispose(self) -> None:
         self._qt_refs.clear()
@@ -765,6 +799,7 @@ class _RoundObserver:
             )
 
         run_until(qt_objects_destroyed)
+        self._release_destroyed_qt_refs(self.tasks[start_index:])
 
     def invoke_required_entry(self, entry: str) -> None:
         start_index = len(self.tasks)
@@ -979,6 +1014,7 @@ class _RoundObserver:
                 )
                 and not self.window.findChildren(QThread)
             )
+            self._release_destroyed_qt_refs(self.tasks)
         except Exception:
             cleanup_errors.append(traceback.format_exc())
         for signal, slot in (
@@ -1119,7 +1155,7 @@ class _RoundObserver:
             if task["thread_type"] != "PySide6.QtCore.QThread":
                 errors.append(f"task did not use a real QThread: {task['task_type']}")
             if not task["finished_observer_type"].endswith(
-                "._TaskThreadFinishedObserver"
+                "._TaskLifecycleObserver"
             ):
                 errors.append(
                     f"task did not use a QObject finished observer: {task['task_type']}"
@@ -1140,6 +1176,15 @@ class _RoundObserver:
                 if task[field] != 1:
                     errors.append(
                         f"{task['task_type']} has {field}={task[field]!r}"
+                    )
+            for field in (
+                "thread_wrapper_retained_during_destroyed",
+                "worker_wrapper_retained_during_destroyed",
+                "qt_refs_released_after_destroyed",
+            ):
+                if not task[field]:
+                    errors.append(
+                        f"{task['task_type']} did not prove {field}"
                     )
             if task["outcome"] != task["expected_outcome"]:
                 errors.append(
@@ -1204,11 +1249,10 @@ class _RoundObserver:
             errors.append("MainWindow retained pending requests")
         if self.window.findChildren(QThread):
             errors.append("MainWindow retained QThread children")
-        expected_qt_refs = {task["task_id"] for task in self.tasks}
-        if set(self._qt_refs) != expected_qt_refs:
+        if self._qt_refs:
             errors.append(
-                "probe did not retain every Qt wrapper through event drain: "
-                f"actual={sorted(self._qt_refs)!r} expected={sorted(expected_qt_refs)!r}"
+                "probe retained destroyed Qt wrappers after callback drain: "
+                f"{sorted(self._qt_refs)!r}"
             )
         if errors:
             raise RuntimeError("; ".join(errors))
