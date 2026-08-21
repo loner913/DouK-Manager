@@ -10,6 +10,7 @@ from PySide6.QtCore import (
     QAbstractTableModel,
     QModelIndex,
     QObject,
+    QRect,
     QThread,
     Qt,
     QTimer,
@@ -23,6 +24,8 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -69,6 +72,11 @@ from douk_manager.core.result_dashboard import (
 from douk_manager.core.settings_tasks import EarliestRule
 from douk_manager.core.task_order import move_to_index
 from douk_manager.ui_messages import format_information
+from douk_manager.ui_state import (
+    WindowGeometryState,
+    WindowStateStore,
+    safe_window_placement,
+)
 from douk_manager.startup import (
     StartupSafetyResult,
     StartupSafetyService,
@@ -78,6 +86,93 @@ from douk_manager.startup import (
 
 
 T = TypeVar("T")
+
+
+class SmartSkipChoice:
+    SKIP = "skip"
+    FORCE_ALL = "force_all"
+    CANCEL = "cancel"
+
+
+class SmartSkipPreviewDialog(QDialog):
+    """Bounded, resizable confirmation for a potentially large text preview."""
+
+    SCREEN_MARGIN = 48
+
+    def __init__(self, text: str, *, can_skip: bool, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._choice = SmartSkipChoice.CANCEL
+        self.setWindowTitle("智能跳过预览")
+        self.setModal(True)
+        self.setSizeGripEnabled(True)
+
+        layout = QVBoxLayout(self)
+        self.details = QTextEdit(self)
+        self.details.setObjectName("smartSkipPreviewDetails")
+        self.details.setReadOnly(True)
+        self.details.setPlainText(text)
+        self.details.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        layout.addWidget(self.details, 1)
+
+        self.buttons = QDialogButtonBox(self)
+        self.skip_button = self.buttons.addButton(
+            "按预览跳过", QDialogButtonBox.ButtonRole.AcceptRole
+        )
+        self.force_button = self.buttons.addButton(
+            "强制包含全部", QDialogButtonBox.ButtonRole.DestructiveRole
+        )
+        self.cancel_button = self.buttons.addButton(
+            "取消创建", QDialogButtonBox.ButtonRole.RejectRole
+        )
+        self.skip_button.setObjectName("smartSkipAcceptButton")
+        self.force_button.setObjectName("smartSkipForceButton")
+        self.cancel_button.setObjectName("smartSkipCancelButton")
+        self.skip_button.setEnabled(can_skip)
+        self.cancel_button.setDefault(True)
+        self.skip_button.clicked.connect(self._choose_skip)
+        self.force_button.clicked.connect(self._choose_force_all)
+        self.cancel_button.clicked.connect(self.reject)
+        layout.addWidget(self.buttons)
+        self._fit_to_screen()
+
+    @property
+    def choice(self) -> str:
+        return self._choice
+
+    def reject(self) -> None:
+        self._choice = SmartSkipChoice.CANCEL
+        super().reject()
+
+    def _choose_skip(self) -> None:
+        if not self.skip_button.isEnabled():
+            return
+        self._choice = SmartSkipChoice.SKIP
+        self.accept()
+
+    def _choose_force_all(self) -> None:
+        self._choice = SmartSkipChoice.FORCE_ALL
+        self.accept()
+
+    def _fit_to_screen(self) -> None:
+        screen = self.parentWidget().screen() if self.parentWidget() is not None else None
+        screen = screen or QApplication.primaryScreen()
+        if screen is None:
+            self.resize(900, 680)
+            return
+        available = screen.availableGeometry()
+        maximum_width = max(1, available.width() - self.SCREEN_MARGIN * 2)
+        maximum_height = max(1, available.height() - self.SCREEN_MARGIN * 2)
+        minimum_width = min(560, maximum_width)
+        minimum_height = min(360, maximum_height)
+        self.setMinimumSize(minimum_width, minimum_height)
+        self.setMaximumSize(maximum_width, maximum_height)
+        width = min(900, maximum_width)
+        height = min(700, maximum_height)
+        self.resize(width, height)
+        self.move(
+            available.x() + (available.width() - width) // 2,
+            available.y() + (available.height() - height) // 2,
+        )
 
 
 POST_MODES = (
@@ -378,9 +473,11 @@ class TaskTemplateList(QListWidget):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, *, window_state_store: WindowStateStore | None = None) -> None:
         super().__init__()
         self.controller = ManagerController()
+        self._window_state_store = window_state_store or WindowStateStore.default()
+        self._window_state_saved = False
         self.coordinator = BackgroundTaskCoordinator(self)
         self.coordinator.task_settled.connect(self._on_startup_task_settled)
         self.coordinator.task_settled.connect(self._on_background_task_settled)
@@ -435,8 +532,7 @@ class MainWindow(QMainWindow):
         self.startup_recheck_timer.setSingleShot(True)
         self.startup_recheck_timer.timeout.connect(self._run_startup_recheck)
         self.setWindowTitle("DouK全流程一体化管理器")
-        self.resize(1260, 820)
-        self.setMinimumSize(1080, 700)
+        self._restore_window_state()
         self._build_ui()
         self._apply_style()
         self._finalize_action_gates()
@@ -2913,19 +3009,15 @@ class MainWindow(QMainWindow):
                 return
             matches = private_preview.private_matches
             if matches:
-                box = QMessageBox(self)
-                box.setWindowTitle("智能跳过预览")
-                box.setText("\n".join(self._smart_preview_lines(private_preview)))
-                skip_button = box.addButton("按预览跳过", QMessageBox.ButtonRole.AcceptRole)
-                force_button = box.addButton("强制包含全部", QMessageBox.ButtonRole.DestructiveRole)
-                cancel_button = box.addButton("取消创建", QMessageBox.ButtonRole.RejectRole)
-                skip_button.setEnabled(private_preview.effective is not None)
+                box = SmartSkipPreviewDialog(
+                    "\n".join(self._smart_preview_lines(private_preview)),
+                    can_skip=private_preview.effective is not None,
+                    parent=self,
+                )
                 box.exec()
-                if box.clickedButton() is cancel_button:
-                    return
-                if box.clickedButton() is skip_button:
+                if box.choice == SmartSkipChoice.SKIP:
                     excluded_numbers = private_preview.skipped_numbers
-                elif box.clickedButton() is force_button:
+                elif box.choice == SmartSkipChoice.FORCE_ALL:
                     excluded_numbers = ()
                 else:
                     return
@@ -4609,6 +4701,51 @@ class MainWindow(QMainWindow):
         path.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
+    def _available_screen_geometries(self) -> tuple[tuple[QRect, ...], int]:
+        screens = tuple(QApplication.screens())
+        primary = QApplication.primaryScreen()
+        primary_index = screens.index(primary) if primary in screens else 0
+        return tuple(screen.availableGeometry() for screen in screens), primary_index
+
+    def _restore_window_state(self) -> None:
+        available, primary_index = self._available_screen_geometries()
+        try:
+            state = self._window_state_store.load()
+        except Exception as exc:
+            self.controller.logger.warning("读取窗口状态失败，使用安全默认值：%s", exc)
+            state = None
+        placement = safe_window_placement(
+            state, available, primary_index=primary_index
+        )
+        self.setMinimumSize(placement.minimum_size)
+        self.setGeometry(placement.geometry)
+        if placement.maximized:
+            self.setWindowState(self.windowState() | Qt.WindowState.WindowMaximized)
+
+    def _save_window_state_once(self) -> None:
+        if getattr(self, "_window_state_saved", False):
+            return
+        store = getattr(self, "_window_state_store", None)
+        if store is None:
+            return
+        normal = self.normalGeometry() if self.isMaximized() else self.geometry()
+        available, primary_index = self._available_screen_geometries()
+        placement = safe_window_placement(
+            WindowGeometryState(normal, self.isMaximized()),
+            available,
+            primary_index=primary_index,
+        )
+        try:
+            if not store.save(
+                WindowGeometryState(placement.geometry, placement.maximized)
+            ):
+                self.controller.logger.warning("窗口状态保存失败，将保留上一个有效状态。")
+                return
+        except Exception as exc:
+            self.controller.logger.warning("窗口状态保存失败，将保留上一个有效状态：%s", exc)
+            return
+        self._window_state_saved = True
+
     def closeEvent(self, event) -> None:  # noqa: N802
         if MainWindow._download_run_blocks_close(
             self
@@ -4672,6 +4809,9 @@ class MainWindow(QMainWindow):
             )
             event.ignore()
             return
+        save_window_state = getattr(self, "_save_window_state_once", None)
+        if callable(save_window_state):
+            save_window_state()
         event.accept()
 
     def _start_collector_stop_on_close(self) -> None:
