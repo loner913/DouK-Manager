@@ -210,7 +210,9 @@ class ResultDashboardGuiTests(unittest.TestCase):
                     window._open_dashboard_task_log()
                     window._open_dashboard_native_log()
                 opened = [Path(call.args[0].toLocalFile()) for call in open_url.call_args_list]
-                self.assertEqual(opened, [task, native])
+                self.assertEqual(len(opened), 2)
+                self.assertTrue(opened[0].samefile(task))
+                self.assertTrue(opened[1].samefile(native))
 
                 native.unlink()
                 with patch.object(QMessageBox, "information") as information, patch.object(

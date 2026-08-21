@@ -150,7 +150,7 @@ class ResultDashboardServiceTests(unittest.TestCase):
         self.assertTrue(snapshot.details_complete)
         self.assertEqual([row.a_number for row in snapshot.account_rows], [1, 2, 3, 4, 5])
         self.assertTrue(snapshot.account_rows[0].completed_with_anomaly)
-        self.assertEqual(snapshot.native_log_segments[0].path, native)
+        self.assertTrue(snapshot.native_log_segments[0].path.samefile(native))
         self.assertEqual(snapshot.native_log_segments[0].offset, 10)
         self.assertEqual(snapshot.native_log_segments[0].length, 200)
 
