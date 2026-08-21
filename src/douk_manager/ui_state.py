@@ -11,6 +11,7 @@ from PySide6.QtCore import QSettings, QRect, QSize
 UI_STATE_VERSION = 1
 UI_STATE_PATH_ENV = "DOUK_MANAGER_UI_STATE_PATH"
 DEFAULT_WINDOW_SIZE = QSize(1260, 820)
+DEFAULT_WINDOW_FRACTION = 0.9
 DEFAULT_MINIMUM_SIZE = QSize(1080, 700)
 WINDOW_SCREEN_MARGIN = 16
 
@@ -112,8 +113,12 @@ def safe_window_placement(
         min(DEFAULT_MINIMUM_SIZE.width(), working_target.width()),
         min(DEFAULT_MINIMUM_SIZE.height(), working_target.height()),
     )
-    requested_width = candidate.width() if candidate is not None else DEFAULT_WINDOW_SIZE.width()
-    requested_height = candidate.height() if candidate is not None else DEFAULT_WINDOW_SIZE.height()
+    if candidate is None:
+        requested_width = round(working_target.width() * DEFAULT_WINDOW_FRACTION)
+        requested_height = round(working_target.height() * DEFAULT_WINDOW_FRACTION)
+    else:
+        requested_width = candidate.width()
+        requested_height = candidate.height()
     width = min(max(requested_width, minimum.width()), working_target.width())
     height = min(max(requested_height, minimum.height()), working_target.height())
 

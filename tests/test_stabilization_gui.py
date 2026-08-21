@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSettings, QRect, Qt
+from PySide6.QtCore import QSettings, QRect, QSize, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QWidget
 
@@ -21,6 +21,7 @@ from douk_manager.gui import (
     SmartSkipPreviewDialog,
 )
 from douk_manager.ui_state import (
+    DEFAULT_WINDOW_FRACTION,
     DEFAULT_WINDOW_SIZE,
     UI_STATE_VERSION,
     WindowGeometryState,
@@ -228,8 +229,23 @@ class WindowStateTests(unittest.TestCase):
         primary = QRect(0, 0, 1920, 1040)
         secondary = QRect(1920, 0, 1600, 900)
         default = safe_window_placement(None, (primary, secondary))
-        self.assertEqual(default.geometry.size(), DEFAULT_WINDOW_SIZE)
+        expected_work_area = primary.adjusted(16, 16, -16, -16)
+        self.assertEqual(
+            default.geometry.size(),
+            QSize(
+                round(expected_work_area.width() * DEFAULT_WINDOW_FRACTION),
+                round(expected_work_area.height() * DEFAULT_WINDOW_FRACTION),
+            ),
+        )
         self.assertTrue(primary.contains(default.geometry))
+        self.assertEqual(default.geometry.center(), expected_work_area.center())
+
+        large_screen = QRect(0, 0, 2560, 1392)
+        large_default = safe_window_placement(None, (large_screen,))
+        self.assertEqual(large_default.geometry.size(), QSize(2275, 1224))
+        self.assertTrue(large_screen.contains(large_default.geometry))
+        self.assertGreater(large_default.geometry.width(), DEFAULT_WINDOW_SIZE.width())
+        self.assertGreater(large_default.geometry.height(), DEFAULT_WINDOW_SIZE.height())
 
         on_secondary = safe_window_placement(
             WindowGeometryState(QRect(2100, 100, 1300, 760), True),
