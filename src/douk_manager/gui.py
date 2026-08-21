@@ -6,7 +6,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
-from PySide6.QtCore import QObject, QThread, Qt, QTimer, QUrl, Signal, Slot
+from PySide6.QtCore import (
+    QAbstractTableModel,
+    QModelIndex,
+    QObject,
+    QThread,
+    Qt,
+    QTimer,
+    QUrl,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -27,6 +37,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSpinBox,
+    QTableView,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -49,6 +60,7 @@ from douk_manager.core.engine import ENGINE_MODE_MONITOR, assess_process_exit
 from douk_manager.core.power import request_normal_shutdown
 from douk_manager.core.result_history import ResultPageSnapshot
 from douk_manager.core.result_dashboard import (
+    DashboardAccountRow,
     DashboardFileFingerprint,
     DashboardTaskIndex,
     DashboardTaskIndexEntry,
@@ -157,6 +169,117 @@ def _dashboard_status_label(status: AccountStatus | str) -> str:
         "not_started": "未开始",
     }
     return labels.get(status, str(status))
+
+
+def _dashboard_account_needs_attention(account: DashboardAccountRow) -> bool:
+    return account.completed_with_anomaly or account.status in (
+        AccountStatus.ERROR,
+        AccountStatus.INTERRUPTED,
+        "pre_start_error",
+        "not_started",
+    )
+
+
+class DashboardAccountTableModel(QAbstractTableModel):
+    HEADERS = ("账号", "主状态", "异常附加", "证据来源")
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._rows: tuple[DashboardAccountRow, ...] = ()
+        self._visible_rows: tuple[DashboardAccountRow, ...] = ()
+        self._evidence_source = ""
+        self._filter_mode = "attention"
+        self._account_number: int | None = None
+
+    @property
+    def total_count(self) -> int:
+        return len(self._rows)
+
+    @property
+    def visible_count(self) -> int:
+        return len(self._visible_rows)
+
+    @property
+    def attention_count(self) -> int:
+        return sum(_dashboard_account_needs_attention(row) for row in self._rows)
+
+    def set_rows(
+        self,
+        rows: tuple[DashboardAccountRow, ...],
+        *,
+        evidence_source: str,
+    ) -> None:
+        self.beginResetModel()
+        self._rows = rows
+        self._evidence_source = evidence_source
+        self._rebuild_visible_rows()
+        self.endResetModel()
+
+    def set_filter(self, mode: str, account_text: str) -> None:
+        account_number = self._parse_account_number(account_text)
+        if mode == self._filter_mode and account_number == self._account_number:
+            return
+        self.beginResetModel()
+        self._filter_mode = mode
+        self._account_number = account_number
+        self._rebuild_visible_rows()
+        self.endResetModel()
+
+    @staticmethod
+    def _parse_account_number(text: str) -> int | None:
+        value = text.strip()
+        if value[:1].casefold() == "a":
+            value = value[1:].strip()
+        if not value:
+            return None
+        if not value.isdecimal():
+            return -1
+        return int(value)
+
+    def _rebuild_visible_rows(self) -> None:
+        self._visible_rows = tuple(row for row in self._rows if self._matches(row))
+
+    def _matches(self, row: DashboardAccountRow) -> bool:
+        if self._account_number is not None and row.a_number != self._account_number:
+            return False
+        if self._filter_mode == "all":
+            return True
+        if self._filter_mode == "attention":
+            return _dashboard_account_needs_attention(row)
+        if self._filter_mode == "anomaly":
+            return row.completed_with_anomaly
+        if self._filter_mode.startswith("status:"):
+            expected = self._filter_mode.removeprefix("status:")
+            return getattr(row.status, "value", row.status) == expected
+        return False
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._visible_rows)
+
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self.HEADERS)
+
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> object:
+        if not index.isValid() or role != Qt.ItemDataRole.DisplayRole:
+            return None
+        row = self._visible_rows[index.row()]
+        values = (
+            f"A{row.a_number}",
+            _dashboard_status_label(row.status),
+            "是" if row.completed_with_anomaly else "否",
+            self._evidence_source,
+        )
+        return values[index.column()]
+
+    def headerData(
+        self,
+        section: int,
+        orientation: Qt.Orientation,
+        role: int = Qt.ItemDataRole.DisplayRole,
+    ) -> object:
+        if role == Qt.ItemDataRole.DisplayRole and orientation == Qt.Orientation.Horizontal:
+            return self.HEADERS[section]
+        return super().headerData(section, orientation, role)
 
 
 class ActionWorker(QObject):
@@ -1355,20 +1478,68 @@ class MainWindow(QMainWindow):
         detail_layout.addWidget(integrity_box, 1)
         layout.addLayout(detail_layout)
 
-        account_box = QGroupBox("账号明细")
+        account_box = QGroupBox("账号关注与定位")
         account_layout = QVBoxLayout(account_box)
-        self.dashboard_account_table = QTableWidget(0, 4)
-        self.dashboard_account_table.setHorizontalHeaderLabels(
-            ("账号", "主状态", "异常附加", "证据来源")
-        )
+        account_filters = QHBoxLayout()
+        account_filters.addWidget(QLabel("显示"))
+        self.dashboard_account_scope = QComboBox()
+        self._mark_safe_widget(self.dashboard_account_scope)
+        self.dashboard_account_scope.addItem("需关注", "attention")
+        self.dashboard_account_scope.addItem("全部账号", "all")
+        for status in AccountStatus:
+            self.dashboard_account_scope.addItem(
+                _dashboard_status_label(status), f"status:{status.value}"
+            )
+        self.dashboard_account_scope.addItem("前置异常", "status:pre_start_error")
+        self.dashboard_account_scope.addItem("未开始", "status:not_started")
+        self.dashboard_account_scope.addItem("完成但有异常记录", "anomaly")
+        self.dashboard_account_scope.setToolTip("默认仅显示需要核对或解释的账号")
+        account_filters.addWidget(self.dashboard_account_scope)
+        self.dashboard_account_search = QLineEdit()
+        self._mark_safe_widget(self.dashboard_account_search)
+        self.dashboard_account_search.setPlaceholderText("A 编号，例如 55")
+        self.dashboard_account_search.setClearButtonEnabled(True)
+        account_filters.addWidget(self.dashboard_account_search)
+        self.dashboard_account_summary = QLabel("显示 0 / 0；需关注 0；无法归类 未知")
+        self.dashboard_account_summary.setWordWrap(True)
+        account_filters.addWidget(self.dashboard_account_summary, 1)
+        account_layout.addLayout(account_filters)
+
+        self._dashboard_account_model = DashboardAccountTableModel(self)
+        self.dashboard_account_table = QTableView()
+        self.dashboard_account_table.setModel(self._dashboard_account_model)
         self.dashboard_account_table.setEditTriggers(
             QAbstractItemView.EditTrigger.NoEditTriggers
         )
         self.dashboard_account_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
         )
+        self.dashboard_account_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.dashboard_account_table.setVerticalScrollMode(
+            QAbstractItemView.ScrollMode.ScrollPerPixel
+        )
+        self.dashboard_account_table.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.dashboard_account_table.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.dashboard_account_table.setWordWrap(False)
+        self.dashboard_account_table.verticalHeader().setVisible(False)
+        self.dashboard_account_table.verticalHeader().setDefaultSectionSize(24)
         self.dashboard_account_table.horizontalHeader().setStretchLastSection(True)
         self.dashboard_account_table.setFixedHeight(230)
+        self.dashboard_account_table.setToolTip(
+            "内容超出时，将鼠标置于框内即可使用滚轮上下浏览。"
+        )
+        self.dashboard_account_scope.currentIndexChanged.connect(
+            self._apply_dashboard_account_filter
+        )
+        self.dashboard_account_search.textChanged.connect(
+            self._apply_dashboard_account_filter
+        )
         account_layout.addWidget(self.dashboard_account_table)
         layout.addWidget(account_box)
         return page
@@ -1663,18 +1834,11 @@ class MainWindow(QMainWindow):
             integrity.append("原因：" + "；".join(snapshot.reliability_reasons))
         self.dashboard_integrity.setText("\n".join(integrity))
 
-        self.dashboard_account_table.setRowCount(len(snapshot.account_rows))
-        for row_index, account in enumerate(snapshot.account_rows):
-            values = (
-                f"A{account.a_number}",
-                _dashboard_status_label(account.status),
-                "是" if account.completed_with_anomaly else "否",
-                snapshot.task_log.name,
-            )
-            for column, value in enumerate(values):
-                self.dashboard_account_table.setItem(
-                    row_index, column, QTableWidgetItem(value)
-                )
+        self._dashboard_account_model.set_rows(
+            snapshot.account_rows,
+            evidence_source=snapshot.task_log.name,
+        )
+        self._apply_dashboard_account_filter()
 
         self.dashboard_native_selector.clear()
         seen_native: set[str] = set()
@@ -1688,12 +1852,33 @@ class MainWindow(QMainWindow):
             self.dashboard_native_selector.count() > 0
         )
 
+    def _apply_dashboard_account_filter(self, _value: object = None) -> None:
+        if not hasattr(self, "_dashboard_account_model"):
+            return
+        mode = str(self.dashboard_account_scope.currentData() or "attention")
+        self._dashboard_account_model.set_filter(
+            mode, self.dashboard_account_search.text()
+        )
+        snapshot = self._dashboard_snapshot
+        unattributed = (
+            "未知"
+            if snapshot is None or snapshot.unattributed_planned_count is None
+            else str(snapshot.unattributed_planned_count)
+        )
+        self.dashboard_account_summary.setText(
+            f"显示 {self._dashboard_account_model.visible_count} / "
+            f"{self._dashboard_account_model.total_count}；"
+            f"需关注 {self._dashboard_account_model.attention_count}；"
+            f"无法归类 {unattributed}"
+        )
+
     def _reset_dashboard_view(self) -> None:
         self.dashboard_current_task.setText("当前显示：无")
         for label in self.dashboard_metric_values.values():
             label.setText("—")
         self.dashboard_distribution.clearContents()
-        self.dashboard_account_table.setRowCount(0)
+        self._dashboard_account_model.set_rows((), evidence_source="")
+        self._apply_dashboard_account_filter()
         self.dashboard_integrity.setText("尚无稳定结果")
         self.dashboard_native_selector.clear()
         self.dashboard_open_native_button.setEnabled(False)

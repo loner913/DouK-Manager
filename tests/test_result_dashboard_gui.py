@@ -24,6 +24,7 @@ from douk_manager.core.download_summary import (
     NativeLogSegment,
     format_summary_for_task_log,
 )
+from douk_manager.core.result_dashboard import DashboardAccountRow
 from douk_manager.gui import BackgroundTaskBinding, MainWindow
 from douk_manager.startup import StartupState
 
@@ -151,6 +152,9 @@ class ResultDashboardGuiTests(unittest.TestCase):
                     ("结束时间", "账号", "状态", "异常附加", "任务模板", "来源日志"),
                 )
                 self.assertEqual(window.dashboard_account_table.height(), 230)
+                self.assertEqual(
+                    window.dashboard_account_scope.currentData(), "attention"
+                )
                 self.assertEqual(window.dashboard_distribution.rowCount(), 6)
             finally:
                 self._dispose(window, home_patch)
@@ -181,7 +185,15 @@ class ResultDashboardGuiTests(unittest.TestCase):
                 self.assertEqual(window.dashboard_metric_values["planned"].text(), "4")
                 self.assertEqual(window.dashboard_metric_values["started"].text(), "3")
                 self.assertEqual(window.dashboard_metric_values["reliable"].text(), "可靠")
-                self.assertEqual(window.dashboard_account_table.rowCount(), 4)
+                self.assertEqual(window.dashboard_account_table.model().rowCount(), 2)
+                self.assertEqual(
+                    window.dashboard_account_summary.text(),
+                    "显示 2 / 4；需关注 2；无法归类 0",
+                )
+                window.dashboard_account_scope.setCurrentIndex(
+                    window.dashboard_account_scope.findData("all")
+                )
+                self.assertEqual(window.dashboard_account_table.model().rowCount(), 4)
                 self.assertEqual(window.dashboard_distribution.item(0, 2).text(), "33.3%")
 
                 window.refresh_result_dashboard(force_refresh=True)
@@ -207,6 +219,71 @@ class ResultDashboardGuiTests(unittest.TestCase):
                     window._open_dashboard_native_log()
                 information.assert_called_once()
                 open_url.assert_not_called()
+            finally:
+                self._dispose(window, home_patch)
+
+    def test_large_account_view_filters_and_scrolls_inside_fixed_box(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window, home_patch = self._window(Path(directory))
+            try:
+                rows = [
+                    DashboardAccountRow(number, AccountStatus.DOWNLOADED, False)
+                    for number in range(1, 1501)
+                ]
+                rows[-5:] = [
+                    DashboardAccountRow(1496, AccountStatus.ERROR, False),
+                    DashboardAccountRow(1497, AccountStatus.INTERRUPTED, False),
+                    DashboardAccountRow(1498, "pre_start_error", False),
+                    DashboardAccountRow(1499, "not_started", False),
+                    DashboardAccountRow(1500, AccountStatus.DOWNLOADED, True),
+                ]
+                window._dashboard_account_model.set_rows(
+                    tuple(rows), evidence_source="DownloadTask_large.log"
+                )
+                window._apply_dashboard_account_filter()
+
+                model = window.dashboard_account_table.model()
+                self.assertEqual(model.rowCount(), 5)
+                self.assertEqual(
+                    window.dashboard_account_summary.text(),
+                    "显示 5 / 1500；需关注 5；无法归类 未知",
+                )
+                self.assertEqual(
+                    window.dashboard_account_scope.itemText(
+                        window.dashboard_account_scope.findData("status:pre_start_error")
+                    ),
+                    "前置异常",
+                )
+                self.assertEqual(
+                    window.dashboard_account_scope.itemText(
+                        window.dashboard_account_scope.findData("status:not_started")
+                    ),
+                    "未开始",
+                )
+
+                window.tabs.setCurrentIndex(window.dashboard_tab_index)
+                window.dashboard_account_scope.setCurrentIndex(
+                    window.dashboard_account_scope.findData("all")
+                )
+                self.app.processEvents()
+                self.assertEqual(model.rowCount(), 1500)
+                self.assertEqual(window.dashboard_account_table.height(), 230)
+                self.assertGreater(
+                    window.dashboard_account_table.verticalScrollBar().maximum(), 0
+                )
+
+                window.dashboard_account_search.setText("A1497")
+                self.assertEqual(model.rowCount(), 1)
+                self.assertEqual(model.index(0, 0).data(), "A1497")
+                window.dashboard_account_search.setText("not-a-number")
+                self.assertEqual(model.rowCount(), 0)
+
+                window.dashboard_account_search.clear()
+                window.dashboard_account_scope.setCurrentIndex(
+                    window.dashboard_account_scope.findData("status:pre_start_error")
+                )
+                self.assertEqual(model.rowCount(), 1)
+                self.assertEqual(model.index(0, 1).data(), "进入处理前异常")
             finally:
                 self._dispose(window, home_patch)
 
