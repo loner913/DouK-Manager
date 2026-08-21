@@ -8,6 +8,8 @@ from typing import Any, Callable, TypeVar
 
 from PySide6.QtCore import (
     QAbstractTableModel,
+    QEvent,
+    QMargins,
     QModelIndex,
     QObject,
     QRect,
@@ -4721,6 +4723,41 @@ class MainWindow(QMainWindow):
         self.setGeometry(placement.geometry)
         if placement.maximized:
             self.setWindowState(self.windowState() | Qt.WindowState.WindowMaximized)
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        self._clamp_normal_window_frame()
+
+    def changeEvent(self, event) -> None:  # noqa: N802
+        super().changeEvent(event)
+        if (
+            event.type() == QEvent.Type.WindowStateChange
+            and not self.isMaximized()
+            and not self.isMinimized()
+        ):
+            QTimer.singleShot(0, self._clamp_normal_window_frame)
+
+    def _clamp_normal_window_frame(self) -> None:
+        if self.isMaximized() or self.isMinimized() or not self.isVisible():
+            return
+        client = self.geometry()
+        frame = self.frameGeometry()
+        margins = QMargins(
+            max(0, client.left() - frame.left()),
+            max(0, client.top() - frame.top()),
+            max(0, frame.right() - client.right()),
+            max(0, frame.bottom() - client.bottom()),
+        )
+        available, primary_index = self._available_screen_geometries()
+        placement = safe_window_placement(
+            WindowGeometryState(client, False),
+            available,
+            primary_index=primary_index,
+            frame_margins=margins,
+        )
+        self.setMinimumSize(placement.minimum_size)
+        if placement.geometry != client:
+            self.setGeometry(placement.geometry)
 
     def _save_window_state_once(self) -> None:
         if getattr(self, "_window_state_saved", False):

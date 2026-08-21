@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSettings, QRect, QSize, Qt
+from PySide6.QtCore import QMargins, QSettings, QRect, QSize, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QWidget
 
@@ -259,6 +259,20 @@ class WindowStateTests(unittest.TestCase):
         )
         self.assertTrue(primary.contains(removed.geometry))
 
+        windows_frame = QMargins(0, 31, 0, 0)
+        removed_with_frame = safe_window_placement(
+            WindowGeometryState(QRect(999999, 999999, 4000, 3000), False),
+            (primary,),
+            frame_margins=windows_frame,
+        )
+        reconstructed_frame = removed_with_frame.geometry.adjusted(
+            -windows_frame.left(),
+            -windows_frame.top(),
+            windows_frame.right(),
+            windows_frame.bottom(),
+        )
+        self.assertTrue(primary.contains(reconstructed_frame))
+
         small = QRect(50, 70, 800, 600)
         fallback = safe_window_placement(
             WindowGeometryState(QRect(-99999, -99999, 99999, 99999), False),
@@ -315,9 +329,41 @@ class WindowStateTests(unittest.TestCase):
                     self.app.processEvents()
                     available = window.screen().availableGeometry()
                     self.assertTrue(
-                        available.contains(window.geometry()),
-                        f"available={available}; geometry={window.geometry()}; "
+                        available.contains(window.frameGeometry()),
+                        f"available={available}; frame={window.frameGeometry()}; "
                         f"minimum={window.minimumSize()}; hint={window.sizeHint()}",
+                    )
+                finally:
+                    for handler in list(window.controller.logger.handlers):
+                        window.controller.logger.removeHandler(handler)
+                        handler.close()
+                    window.hide()
+                    window.deleteLater()
+                    self.app.processEvents()
+
+    def test_real_offscreen_state_clamps_native_frame_after_show(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "manager"
+            store, _settings = self._store(directory)
+            self.assertTrue(
+                store.save(
+                    WindowGeometryState(
+                        QRect(999999, 999999, 4000, 3000),
+                        False,
+                    )
+                )
+            )
+            with patch.dict(os.environ, {"DOUK_MANAGER_HOME": str(root)}):
+                window = MainWindow(window_state_store=store)
+                try:
+                    window.poll_timer.stop()
+                    window.show()
+                    self.app.processEvents()
+                    available = window.screen().availableGeometry()
+                    self.assertTrue(
+                        available.contains(window.frameGeometry()),
+                        f"available={available}; frame={window.frameGeometry()}; "
+                        f"geometry={window.geometry()}",
                     )
                 finally:
                     for handler in list(window.controller.logger.handlers):

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from PySide6.QtCore import QSettings, QRect, QSize
+from PySide6.QtCore import QMargins, QSettings, QRect, QSize
 
 
 UI_STATE_VERSION = 1
@@ -96,6 +96,7 @@ def safe_window_placement(
     available_geometries: Iterable[QRect],
     *,
     primary_index: int = 0,
+    frame_margins: QMargins | None = None,
 ) -> SafeWindowPlacement:
     screens = tuple(
         QRect(rect)
@@ -108,10 +109,17 @@ def safe_window_placement(
     candidate = state.normal_geometry if state is not None else None
     target, has_intersection = _target_screen(candidate, screens, primary_index)
     working_target = _inset_screen(target)
+    margins = frame_margins or QMargins()
+    frame_left = max(0, margins.left())
+    frame_top = max(0, margins.top())
+    frame_right = max(0, margins.right())
+    frame_bottom = max(0, margins.bottom())
+    client_area_width = max(1, working_target.width() - frame_left - frame_right)
+    client_area_height = max(1, working_target.height() - frame_top - frame_bottom)
 
     minimum = QSize(
-        min(DEFAULT_MINIMUM_SIZE.width(), working_target.width()),
-        min(DEFAULT_MINIMUM_SIZE.height(), working_target.height()),
+        min(DEFAULT_MINIMUM_SIZE.width(), client_area_width),
+        min(DEFAULT_MINIMUM_SIZE.height(), client_area_height),
     )
     if candidate is None:
         requested_width = round(working_target.width() * DEFAULT_WINDOW_FRACTION)
@@ -119,20 +127,25 @@ def safe_window_placement(
     else:
         requested_width = candidate.width()
         requested_height = candidate.height()
-    width = min(max(requested_width, minimum.width()), working_target.width())
-    height = min(max(requested_height, minimum.height()), working_target.height())
+    width = min(max(requested_width, minimum.width()), client_area_width)
+    height = min(max(requested_height, minimum.height()), client_area_height)
+
+    client_left = working_target.left() + frame_left
+    client_top = working_target.top() + frame_top
+    client_right = working_target.right() - frame_right
+    client_bottom = working_target.bottom() - frame_bottom
 
     if candidate is None or not has_intersection:
-        x = working_target.x() + (working_target.width() - width) // 2
-        y = working_target.y() + (working_target.height() - height) // 2
+        x = client_left + (client_area_width - width) // 2
+        y = client_top + (client_area_height - height) // 2
     else:
         x = min(
-            max(candidate.x(), working_target.left()),
-            working_target.right() - width + 1,
+            max(candidate.x(), client_left),
+            client_right - width + 1,
         )
         y = min(
-            max(candidate.y(), working_target.top()),
-            working_target.bottom() - height + 1,
+            max(candidate.y(), client_top),
+            client_bottom - height + 1,
         )
 
     return SafeWindowPlacement(
