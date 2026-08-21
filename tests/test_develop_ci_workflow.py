@@ -59,7 +59,11 @@ class DevelopCiWorkflowTests(unittest.TestCase):
         self.assertIn("steps.identity.outputs.ref", self.workflow)
         self.assertIn("steps.identity.outputs.sha", self.workflow)
         self.assertIn("retention-days: 30", self.workflow)
-        self.assertIn('"Version: 0.1.4"', self.workflow)
+        self.assertIn('"Version: 0.1.5"', self.workflow)
+        self.assertRegex(
+            self.workflow,
+            r"name: DouK-Manager_Windows_X64-v0\.1\.5-\$\{\{ steps\.identity\.outputs\.ref \}\}-run-\$\{\{ github\.run_number \}\}-\$\{\{ steps\.identity\.outputs\.sha \}\}",
+        )
 
     def test_official_actions_do_not_use_node20_generations(self) -> None:
         self.assertIn("actions/checkout@v7", self.workflow)
