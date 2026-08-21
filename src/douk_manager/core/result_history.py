@@ -4,8 +4,12 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from douk_manager.core.download_summary import AccountStatus
+
+if TYPE_CHECKING:
+    from douk_manager.operation import OperationContext
 
 
 class ResultHistoryError(RuntimeError):
@@ -32,6 +36,13 @@ class DownloadTaskHistory:
     reliable: bool
     account_rows: tuple[AccountHistoryRow, ...]
     details_complete: bool
+
+
+@dataclass(frozen=True)
+class ResultPageSnapshot:
+    runs: tuple[DownloadTaskHistory, ...]
+    rows: tuple[AccountHistoryRow, ...]
+    incomplete_old_runs: int
 
 
 @dataclass(frozen=True)
@@ -93,9 +104,16 @@ class ResultHistoryService:
     def __init__(self, log_directory: Path) -> None:
         self.log_directory = log_directory
 
-    def list_runs(self, *, limit: int | None = 500) -> tuple[DownloadTaskHistory, ...]:
+    def list_runs(
+        self,
+        *,
+        limit: int | None = 500,
+        context: OperationContext | None = None,
+    ) -> tuple[DownloadTaskHistory, ...]:
         if limit is not None and limit < 1:
             return ()
+        if context is not None:
+            context.raise_if_cancelled()
         self.log_directory.mkdir(parents=True, exist_ok=True)
         paths_with_mtime: list[tuple[int, Path]] = []
         for path in self.log_directory.glob("DownloadTask_*.log"):
@@ -107,6 +125,8 @@ class ResultHistoryService:
         paths = ordered_paths if limit is None else ordered_paths[:limit]
         result: list[DownloadTaskHistory] = []
         for path in paths:
+            if context is not None:
+                context.raise_if_cancelled()
             try:
                 parsed = self.parse(path)
             except (OSError, UnicodeError, ResultHistoryError):
@@ -115,6 +135,19 @@ class ResultHistoryService:
                 result.append(parsed)
         result.sort(key=lambda item: item.ended_at, reverse=True)
         return tuple(result)
+
+    def page_snapshot(
+        self,
+        *,
+        limit: int = 500,
+        context: OperationContext | None = None,
+    ) -> ResultPageSnapshot:
+        runs = self.list_runs(limit=limit, context=context)
+        rows = tuple(row for run in runs for row in run.account_rows)
+        incomplete_old_runs = sum(
+            1 for run in runs if run.account_rows and not run.details_complete
+        )
+        return ResultPageSnapshot(runs, rows, incomplete_old_runs)
 
     def list_account_rows(self, *, limit: int = 500) -> tuple[AccountHistoryRow, ...]:
         return tuple(row for run in self.list_runs(limit=limit) for row in run.account_rows)
@@ -152,6 +185,7 @@ class ResultHistoryService:
         validity_days: int,
         *,
         now: datetime | None = None,
+        context: OperationContext | None = None,
     ) -> tuple[PrivateReferenceDecision, ...]:
         """Classify every requested account without guessing missing results.
 
@@ -180,7 +214,9 @@ class ResultHistoryService:
             AccountStatus.NO_ELIGIBLE_WORKS,
             AccountStatus.PRIVATE,
         }
-        for run in self.list_runs(limit=None):
+        for run in self.list_runs(limit=None, context=context):
+            if context is not None:
+                context.raise_if_cancelled()
             for row in run.account_rows:
                 if row.a_number not in requested_set:
                     continue

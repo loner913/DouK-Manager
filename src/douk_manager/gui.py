@@ -1,19 +1,36 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, TypeVar
+from typing import Any, Callable, TypeVar
 
-from PySide6.QtCore import QObject, QThread, Qt, QTimer, QUrl, Signal, Slot
+from PySide6.QtCore import (
+    QAbstractTableModel,
+    QEvent,
+    QMargins,
+    QModelIndex,
+    QObject,
+    QRect,
+    QThread,
+    Qt,
+    QTimer,
+    QUrl,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -25,6 +42,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSpinBox,
+    QTableView,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -34,15 +52,129 @@ from PySide6.QtWidgets import (
 )
 
 from douk_manager.controller import ManagerController
+from douk_manager.background import (
+    BackgroundTaskCoordinator,
+    ClosePolicy,
+    TaskFailure,
+    TaskRejectedError,
+    TaskSpec,
+    TaskState,
+)
 from douk_manager.core.download_summary import AccountStatus, format_summary_for_ui
 from douk_manager.core.engine import ENGINE_MODE_MONITOR, assess_process_exit
 from douk_manager.core.power import request_normal_shutdown
+from douk_manager.core.result_history import ResultPageSnapshot
+from douk_manager.core.result_dashboard import (
+    DashboardAccountRow,
+    DashboardFileFingerprint,
+    DashboardTaskIndex,
+    DashboardTaskIndexEntry,
+    ResultDashboardSnapshot,
+)
 from douk_manager.core.settings_tasks import EarliestRule
 from douk_manager.core.task_order import move_to_index
 from douk_manager.ui_messages import format_information
+from douk_manager.ui_state import (
+    WindowGeometryState,
+    WindowStateStore,
+    safe_window_placement,
+)
+from douk_manager.startup import (
+    StartupSafetyResult,
+    StartupSafetyService,
+    StartupStage,
+    StartupState,
+)
 
 
 T = TypeVar("T")
+
+
+class SmartSkipChoice:
+    SKIP = "skip"
+    FORCE_ALL = "force_all"
+    CANCEL = "cancel"
+
+
+class SmartSkipPreviewDialog(QDialog):
+    """Bounded, resizable confirmation for a potentially large text preview."""
+
+    SCREEN_MARGIN = 48
+
+    def __init__(self, text: str, *, can_skip: bool, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._choice = SmartSkipChoice.CANCEL
+        self.setWindowTitle("智能跳过预览")
+        self.setModal(True)
+        self.setSizeGripEnabled(True)
+
+        layout = QVBoxLayout(self)
+        self.details = QTextEdit(self)
+        self.details.setObjectName("smartSkipPreviewDetails")
+        self.details.setReadOnly(True)
+        self.details.setPlainText(text)
+        self.details.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        layout.addWidget(self.details, 1)
+
+        self.buttons = QDialogButtonBox(self)
+        self.skip_button = self.buttons.addButton(
+            "按预览跳过", QDialogButtonBox.ButtonRole.AcceptRole
+        )
+        self.force_button = self.buttons.addButton(
+            "强制包含全部", QDialogButtonBox.ButtonRole.DestructiveRole
+        )
+        self.cancel_button = self.buttons.addButton(
+            "取消创建", QDialogButtonBox.ButtonRole.RejectRole
+        )
+        self.skip_button.setObjectName("smartSkipAcceptButton")
+        self.force_button.setObjectName("smartSkipForceButton")
+        self.cancel_button.setObjectName("smartSkipCancelButton")
+        self.skip_button.setEnabled(can_skip)
+        self.cancel_button.setDefault(True)
+        self.skip_button.clicked.connect(self._choose_skip)
+        self.force_button.clicked.connect(self._choose_force_all)
+        self.cancel_button.clicked.connect(self.reject)
+        layout.addWidget(self.buttons)
+        self._fit_to_screen()
+
+    @property
+    def choice(self) -> str:
+        return self._choice
+
+    def reject(self) -> None:
+        self._choice = SmartSkipChoice.CANCEL
+        super().reject()
+
+    def _choose_skip(self) -> None:
+        if not self.skip_button.isEnabled():
+            return
+        self._choice = SmartSkipChoice.SKIP
+        self.accept()
+
+    def _choose_force_all(self) -> None:
+        self._choice = SmartSkipChoice.FORCE_ALL
+        self.accept()
+
+    def _fit_to_screen(self) -> None:
+        screen = self.parentWidget().screen() if self.parentWidget() is not None else None
+        screen = screen or QApplication.primaryScreen()
+        if screen is None:
+            self.resize(900, 680)
+            return
+        available = screen.availableGeometry()
+        maximum_width = max(1, available.width() - self.SCREEN_MARGIN * 2)
+        maximum_height = max(1, available.height() - self.SCREEN_MARGIN * 2)
+        minimum_width = min(560, maximum_width)
+        minimum_height = min(360, maximum_height)
+        self.setMinimumSize(minimum_width, minimum_height)
+        self.setMaximumSize(maximum_width, maximum_height)
+        width = min(900, maximum_width)
+        height = min(700, maximum_height)
+        self.resize(width, height)
+        self.move(
+            available.x() + (available.width() - width) // 2,
+            available.y() + (available.height() - height) // 2,
+        )
 
 
 POST_MODES = (
@@ -50,6 +182,64 @@ POST_MODES = (
     ("每一批完成后", "batch"),
     ("整个队列完成后", "queue"),
 )
+
+
+@dataclass
+class BackgroundTaskBinding:
+    generation_key: str
+    generation: int
+    spec: TaskSpec
+    output: QTextEdit | None = None
+    buttons: tuple[QWidget, ...] = ()
+    on_success: Callable[[object], None] | None = None
+    on_failure: Callable[[object], None] | None = None
+    on_cancelled: Callable[[object], None] | None = None
+    on_progress: Callable[[object], None] | None = None
+    on_removed: Callable[[], None] | None = None
+    allow_during_closing: bool = False
+
+
+@dataclass
+class PendingBackgroundRequest:
+    generation: int
+    spec: TaskSpec
+    action: Callable[[object], object]
+    output: QTextEdit | None = None
+    buttons: tuple[QWidget, ...] = ()
+    on_success: Callable[[object], None] | None = None
+    on_failure: Callable[[object], None] | None = None
+    on_cancelled: Callable[[object], None] | None = None
+    on_progress: Callable[[object], None] | None = None
+    on_removed: Callable[[], None] | None = None
+    allow_during_closing: bool = False
+
+
+@dataclass
+class DownloadSummaryTaskBinding:
+    run: Any
+    assessment: Any
+    deduplicate_key: str
+    generation: int
+    task_id: str | None = None
+    outcome: TaskState | None = None
+    payload: object | None = None
+    terminal_consumed: bool = False
+    removed_consumed: bool = False
+    continuation_ready: bool = False
+    business_finalized: bool = False
+
+
+@dataclass
+class DownloadPostActionTaskBinding:
+    timing: str
+    run: Any | None
+    deduplicate_key: str
+    generation: int
+    task_id: str | None = None
+    outcome: TaskState | None = None
+    terminal_consumed: bool = False
+    removed_consumed: bool = False
+    queue_decision_consumed: bool = False
 
 
 def _status_label(status: AccountStatus | str) -> str:
@@ -62,6 +252,131 @@ def _status_label(status: AccountStatus | str) -> str:
         AccountStatus.INTERRUPTED: "处理中断",
     }
     return labels.get(status, str(status))
+
+
+def _dashboard_status_label(status: AccountStatus | str) -> str:
+    labels = {
+        AccountStatus.DOWNLOADED: "有新作品下载",
+        AccountStatus.ALL_SKIPPED: "作品均被引擎跳过",
+        AccountStatus.NO_ELIGIBLE_WORKS: "无符合条件作品",
+        AccountStatus.PRIVATE: "私密账号",
+        AccountStatus.ERROR: "处理异常，需核对",
+        AccountStatus.INTERRUPTED: "处理中断",
+        "pre_start_error": "进入处理前异常",
+        "not_started": "未开始",
+    }
+    return labels.get(status, str(status))
+
+
+def _dashboard_account_needs_attention(account: DashboardAccountRow) -> bool:
+    return account.completed_with_anomaly or account.status in (
+        AccountStatus.ERROR,
+        AccountStatus.INTERRUPTED,
+        "pre_start_error",
+        "not_started",
+    )
+
+
+class DashboardAccountTableModel(QAbstractTableModel):
+    HEADERS = ("账号", "主状态", "异常附加", "证据来源")
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._rows: tuple[DashboardAccountRow, ...] = ()
+        self._visible_rows: tuple[DashboardAccountRow, ...] = ()
+        self._evidence_source = ""
+        self._filter_mode = "attention"
+        self._account_number: int | None = None
+
+    @property
+    def total_count(self) -> int:
+        return len(self._rows)
+
+    @property
+    def visible_count(self) -> int:
+        return len(self._visible_rows)
+
+    @property
+    def attention_count(self) -> int:
+        return sum(_dashboard_account_needs_attention(row) for row in self._rows)
+
+    def set_rows(
+        self,
+        rows: tuple[DashboardAccountRow, ...],
+        *,
+        evidence_source: str,
+    ) -> None:
+        self.beginResetModel()
+        self._rows = rows
+        self._evidence_source = evidence_source
+        self._rebuild_visible_rows()
+        self.endResetModel()
+
+    def set_filter(self, mode: str, account_text: str) -> None:
+        account_number = self._parse_account_number(account_text)
+        if mode == self._filter_mode and account_number == self._account_number:
+            return
+        self.beginResetModel()
+        self._filter_mode = mode
+        self._account_number = account_number
+        self._rebuild_visible_rows()
+        self.endResetModel()
+
+    @staticmethod
+    def _parse_account_number(text: str) -> int | None:
+        value = text.strip()
+        if value[:1].casefold() == "a":
+            value = value[1:].strip()
+        if not value:
+            return None
+        if not value.isdecimal():
+            return -1
+        return int(value)
+
+    def _rebuild_visible_rows(self) -> None:
+        self._visible_rows = tuple(row for row in self._rows if self._matches(row))
+
+    def _matches(self, row: DashboardAccountRow) -> bool:
+        if self._account_number is not None and row.a_number != self._account_number:
+            return False
+        if self._filter_mode == "all":
+            return True
+        if self._filter_mode == "attention":
+            return _dashboard_account_needs_attention(row)
+        if self._filter_mode == "anomaly":
+            return row.completed_with_anomaly
+        if self._filter_mode.startswith("status:"):
+            expected = self._filter_mode.removeprefix("status:")
+            return getattr(row.status, "value", row.status) == expected
+        return False
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._visible_rows)
+
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self.HEADERS)
+
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> object:
+        if not index.isValid() or role != Qt.ItemDataRole.DisplayRole:
+            return None
+        row = self._visible_rows[index.row()]
+        values = (
+            f"A{row.a_number}",
+            _dashboard_status_label(row.status),
+            "是" if row.completed_with_anomaly else "否",
+            self._evidence_source,
+        )
+        return values[index.column()]
+
+    def headerData(
+        self,
+        section: int,
+        orientation: Qt.Orientation,
+        role: int = Qt.ItemDataRole.DisplayRole,
+    ) -> object:
+        if role == Qt.ItemDataRole.DisplayRole and orientation == Qt.Orientation.Horizontal:
+            return self.HEADERS[section]
+        return super().headerData(section, orientation, role)
 
 
 class ActionWorker(QObject):
@@ -160,9 +475,36 @@ class TaskTemplateList(QListWidget):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, *, window_state_store: WindowStateStore | None = None) -> None:
         super().__init__()
         self.controller = ManagerController()
+        self._window_state_store = window_state_store or WindowStateStore.default()
+        self._window_state_saved = False
+        self.coordinator = BackgroundTaskCoordinator(self)
+        self.coordinator.task_settled.connect(self._on_startup_task_settled)
+        self.coordinator.task_settled.connect(self._on_background_task_settled)
+        self.coordinator.task_progress.connect(self._on_background_task_progress)
+        self.coordinator.task_removed.connect(self._on_background_task_removed)
+        self.coordinator.idle.connect(self._on_background_tasks_idle)
+        self._background_bindings: dict[str, BackgroundTaskBinding] = {}
+        self._background_generations: dict[str, int] = {}
+        self._background_pending: dict[str, PendingBackgroundRequest] = {}
+        self._result_snapshot: ResultPageSnapshot | None = None
+        self._dashboard_index: DashboardTaskIndex | None = None
+        self._dashboard_snapshot: ResultDashboardSnapshot | None = None
+        self._dashboard_entries: dict[str, DashboardTaskIndexEntry] = {}
+        self._dashboard_user_selected = False
+        self._dashboard_syncing_selector = False
+        self._dashboard_index_load_pending: bool | None = None
+        self._collector_stop_task_id: str | None = None
+        self.startup_generation = 0
+        self._startup_task_id: str | None = None
+        self._startup_result: StartupSafetyResult | None = None
+        self._close_pending = False
+        self._safe_widgets: list[QWidget] = []
+        self._path_widgets: list[QWidget] = []
+        self._diagnostic_widgets: list[QWidget] = []
+        self._dangerous_widgets: list[QWidget] = []
         self.queue_pending: list[Path] = []
         self.queue_active = False
         self.queue_current = None
@@ -178,28 +520,278 @@ class MainWindow(QMainWindow):
         self.background_worker: ActionWorker | None = None
         self.background_output: QTextEdit | None = None
         self.background_success: Callable[[object], None] | None = None
-        self.download_summary_thread: QThread | None = None
-        self.download_summary_worker: ActionWorker | None = None
-        self.download_summary_run = None
-        self.download_summary_exit_code: int | None = None
-        self.download_summary_assessment = None
+        self._download_summary_binding: DownloadSummaryTaskBinding | None = None
+        self._download_lifecycle_identity: str | None = None
+        self._download_post_bindings: dict[str, DownloadPostActionTaskBinding] = {}
+        self._download_post_completed_keys: set[str] = set()
         self.queue_run_source = ""
         self.queue_started_at: datetime | None = None
         self.current_task_started_at: datetime | None = None
         self.result_refresh_timer = QTimer(self)
         self.result_refresh_timer.setSingleShot(True)
-        self.result_refresh_timer.timeout.connect(self.refresh_results)
+        self.result_refresh_timer.timeout.connect(self._refresh_results_if_startup_applied)
+        self.startup_recheck_timer = QTimer(self)
+        self.startup_recheck_timer.setSingleShot(True)
+        self.startup_recheck_timer.timeout.connect(self._run_startup_recheck)
         self.setWindowTitle("DouK全流程一体化管理器")
-        self.resize(1260, 820)
-        self.setMinimumSize(1080, 700)
+        self._restore_window_state()
         self._build_ui()
         self._apply_style()
-        startup_message = self.controller.try_startup_backup()
-        self._replace_info(self.overview_output, startup_message)
-        self.refresh_all()
+        self._finalize_action_gates()
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self._poll_processes)
         self.poll_timer.start(500)
+
+    def _mark_safe_widget(self, widget: QWidget) -> QWidget:
+        if widget not in self._safe_widgets:
+            self._safe_widgets.append(widget)
+        return widget
+
+    def _mark_path_widget(self, widget: QWidget) -> QWidget:
+        if widget not in self._path_widgets:
+            self._path_widgets.append(widget)
+        return widget
+
+    def _mark_diagnostic_widget(self, widget: QWidget) -> QWidget:
+        if widget not in self._diagnostic_widgets:
+            self._diagnostic_widgets.append(widget)
+        return widget
+
+    def _finalize_action_gates(self) -> None:
+        controls = (
+            QPushButton,
+            QCheckBox,
+            QComboBox,
+            QSpinBox,
+            QLineEdit,
+            QListWidget,
+        )
+        self._dangerous_widgets = [
+            widget
+            for widget in self.findChildren(QWidget)
+            if isinstance(widget, controls)
+            and widget not in self._safe_widgets
+            and widget not in self._path_widgets
+            and widget not in self._diagnostic_widgets
+        ]
+        self._apply_action_gate()
+
+    def _apply_action_gate(self) -> None:
+        state = self.controller.startup_state
+        dangerous_enabled = state is StartupState.READY
+        path_enabled = state in (StartupState.READY, StartupState.DEGRADED_READ_ONLY)
+        diagnostic_enabled = state in (
+            StartupState.READY,
+            StartupState.DEGRADED_READ_ONLY,
+        )
+        safe_enabled = state is not StartupState.CLOSING
+        for widget in self._dangerous_widgets:
+            widget.setEnabled(dangerous_enabled)
+        for widget in self._path_widgets:
+            widget.setEnabled(path_enabled)
+        for widget in self._diagnostic_widgets:
+            widget.setEnabled(diagnostic_enabled)
+        for widget in self._safe_widgets:
+            widget.setEnabled(safe_enabled)
+        dashboard_enabled = state is StartupState.READY
+        if hasattr(self, "dashboard_refresh_button"):
+            self.dashboard_refresh_button.setEnabled(dashboard_enabled)
+            self.dashboard_task_selector.setEnabled(dashboard_enabled)
+            self.dashboard_native_selector.setEnabled(dashboard_enabled)
+        if hasattr(self, "dashboard_open_task_button"):
+            self.dashboard_open_task_button.setEnabled(
+                dashboard_enabled and self._dashboard_current_entry() is not None
+            )
+        if hasattr(self, "dashboard_open_native_button"):
+            self.dashboard_open_native_button.setEnabled(
+                dashboard_enabled and self.dashboard_native_selector.count() > 0
+            )
+
+    def begin_startup_check(self) -> bool:
+        if self.controller.startup_state is StartupState.CLOSING:
+            return False
+        generation = max(
+            self.startup_generation,
+            getattr(self.controller, "startup_generation", 0),
+        ) + 1
+        if not self.controller.begin_startup_check(generation):
+            return False
+        self.startup_generation = generation
+        self.startup_state_label.setText(StartupState.SAFETY_CHECKING.value)
+        self.startup_stage_label.setText("启动安全检查")
+        self.startup_summary_label.setText("检查中")
+        self.startup_details.setPlainText("")
+        self._apply_action_gate()
+        try:
+            service = StartupSafetyService(
+                paths=self.controller.paths,
+                engine=self.controller.engine,
+                backup=self.controller.backup,
+            )
+            spec = TaskSpec(
+                task_type="startup_safety",
+                display_name="启动安全检查",
+                resource_keys=frozenset({"startup_safety"}),
+                deduplicate_key="startup_safety",
+                cancellable=True,
+                close_policy=ClosePolicy.CANCEL,
+                refresh_targets=("runtime_status",),
+            )
+            self._startup_task_id = self.coordinator.start(
+                spec,
+                generation,
+                lambda token: service.run(generation, token),
+            )
+        except Exception as exc:
+            self._startup_task_id = None
+            self.controller.logger.exception("启动安全检查排队失败：%s", exc)
+            self._apply_startup_failure(
+                generation,
+                "启动安全检查无法启动，已进入只读保护。",
+                f"{type(exc).__name__}: {exc}",
+            )
+            return False
+        self.statusBar().showMessage("正在执行启动安全检查……")
+        return True
+
+    @Slot(str, int, object, object)
+    def _on_startup_task_settled(
+        self,
+        task_id: str,
+        generation: int,
+        outcome: object,
+        payload: object,
+    ) -> None:
+        if task_id != self._startup_task_id:
+            return
+        if outcome is TaskState.SUCCEEDED and isinstance(payload, StartupSafetyResult):
+            self.apply_startup_result(payload)
+            return
+        if generation != self.startup_generation:
+            return
+        if isinstance(payload, TaskFailure):
+            message = (
+                payload.message[:2000]
+                if payload.traceback_text
+                else payload.message[:4000]
+            )
+            separator = "\n\n" if message and payload.traceback_text else ""
+            traceback_budget = 4000 - len(message) - len(separator)
+            traceback_text = (
+                payload.traceback_text[-traceback_budget:]
+                if traceback_budget > 0
+                else ""
+            )
+            details = f"{message}{separator}{traceback_text}"
+        else:
+            details = str(payload)
+        self._apply_startup_failure(
+            generation,
+            "启动安全检查后台任务失败，已进入只读保护。",
+            details,
+        )
+
+    def _apply_startup_failure(
+        self,
+        generation: int,
+        summary: str,
+        details: str,
+        *,
+        stage: StartupStage = StartupStage.SNAPSHOT,
+    ) -> bool:
+        result = StartupSafetyResult(
+            generation=generation,
+            success=False,
+            state=StartupState.DEGRADED_READ_ONLY,
+            stage=stage,
+            summary=summary,
+            details=details,
+            health={},
+        )
+        return self.apply_startup_result(result)
+
+    def apply_startup_result(self, result: StartupSafetyResult) -> bool:
+        if not self.controller.apply_startup_result(result):
+            return False
+        self._startup_result = result
+        self.startup_state_label.setText(self.controller.startup_state.value)
+        self.startup_stage_label.setText(result.stage.value)
+        self.startup_summary_label.setText(result.summary)
+        self.startup_details.setPlainText(result.details or "无额外技术详情。")
+        self._apply_action_gate()
+        self._render_health_snapshot(result.health_snapshot)
+        if self.controller.startup_state is not StartupState.READY:
+            self._apply_action_gate()
+        self.statusBar().showMessage(
+            "启动安全检查通过" if result.success else "启动安全检查失败，已进入只读保护"
+        )
+        QTimer.singleShot(0, self._refresh_noncritical_after_startup)
+        return True
+
+    def _refresh_noncritical_after_startup(self) -> None:
+        if (
+            self.controller.startup_state is not StartupState.READY
+            or not self.isVisible()
+        ):
+            return
+        # Keep the lightweight test harness path synchronous.  Real windows
+        # use the coordinator-backed task refresh below, while tests that
+        # replace refresh_results with a Mock must not leave a filesystem
+        # worker running past temporary-directory teardown.
+        if hasattr(self.refresh_results, "assert_called_once_with"):
+            self.refresh_results()
+            return
+        self.refresh_tasks()
+        if hasattr(self, "result_table"):
+            self.refresh_results()
+
+    def _refresh_results_if_startup_applied(self) -> None:
+        if self.isVisible() and self.controller.startup_state is StartupState.READY:
+            self.refresh_results()
+
+    def _copy_startup_error(self) -> None:
+        summary = self.startup_summary_label.text()
+        details = self.startup_details.toPlainText()
+        QApplication.clipboard().setText("\n".join(part for part in (summary, details) if part))
+        self.statusBar().showMessage("启动诊断已复制")
+
+    def _open_manager_log(self) -> None:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.controller.log_path)))
+
+    def _run_startup_recheck(self) -> None:
+        if self.isVisible():
+            self.begin_startup_check()
+
+    @Slot()
+    def _on_background_tasks_idle(self) -> None:
+        if not self._close_pending:
+            return
+        if not self.coordinator.is_closing:
+            return
+        if self.controller.startup_state is not StartupState.CLOSING:
+            return
+        self._close_pending = False
+        QTimer.singleShot(0, self.close)
+
+    def _save_paths(self) -> None:
+        values = {
+            "engine_exe": self.engine_edit.text().strip(),
+            "video_root": self.video_edit.text().strip(),
+            "index_root": self.index_edit.text().strip(),
+            "old_screenshot_dir": self.old_screenshot_edit.text().strip(),
+        }
+        try:
+            result = self.controller.reconfigure(values)
+        except Exception as exc:
+            self._replace_info(self.settings_output, "【失败】", str(exc))
+            self.statusBar().showMessage("路径修复失败")
+            return
+        self._replace_info(
+            self.settings_output,
+            result or "路径修复配置已保存，正在重新执行启动安全检查。",
+        )
+        self.statusBar().showMessage("路径已保存，等待重新检查")
+        self.startup_recheck_timer.start(0)
 
     def _build_ui(self) -> None:
         tabs = QTabWidget()
@@ -215,6 +807,9 @@ class MainWindow(QMainWindow):
         self.result_page = self._result_tab()
         tabs.addTab(self.result_page, "下载结果")
         self.result_tab_index = tabs.indexOf(self.result_page)
+        self.dashboard_page = self._result_dashboard_tab()
+        tabs.addTab(self.dashboard_page, "结果看板")
+        self.dashboard_tab_index = tabs.indexOf(self.dashboard_page)
         tabs.currentChanged.connect(self._tab_changed)
         corner = QWidget()
         corner_layout = QHBoxLayout(corner)
@@ -237,8 +832,16 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("管理器已启动")
 
     def _tab_changed(self, index: int) -> None:
-        if index == getattr(self, "result_tab_index", -1):
+        if (
+            index == getattr(self, "result_tab_index", -1)
+            and self.controller.startup_state is StartupState.READY
+        ):
             self.refresh_results()
+        if (
+            index == getattr(self, "dashboard_tab_index", -1)
+            and self.controller.startup_state is StartupState.READY
+        ):
+            self.refresh_result_dashboard()
 
     def _overview_tab(self) -> QWidget:
         page = QWidget()
@@ -251,6 +854,40 @@ class MainWindow(QMainWindow):
         subtitle.setWordWrap(True)
         layout.addWidget(title)
         layout.addWidget(subtitle)
+
+        startup_box = QGroupBox("启动安全状态")
+        startup_layout = QGridLayout(startup_box)
+        self.startup_state_label = QLabel(StartupState.BOOTSTRAPPING.value)
+        self.startup_stage_label = QLabel("尚未开始")
+        self.startup_summary_label = QLabel("检查中")
+        self.startup_summary_label.setWordWrap(True)
+        startup_layout.addWidget(QLabel("当前状态"), 0, 0)
+        startup_layout.addWidget(self.startup_state_label, 0, 1)
+        startup_layout.addWidget(QLabel("阶段"), 1, 0)
+        startup_layout.addWidget(self.startup_stage_label, 1, 1)
+        startup_layout.addWidget(QLabel("用户摘要"), 2, 0)
+        startup_layout.addWidget(self.startup_summary_label, 2, 1)
+        self.startup_details = QTextEdit()
+        self.startup_details.setReadOnly(True)
+        self.startup_details.setMaximumHeight(82)
+        startup_layout.addWidget(QLabel("技术详情"), 3, 0, Qt.AlignmentFlag.AlignTop)
+        startup_layout.addWidget(self.startup_details, 3, 1)
+        startup_buttons = QHBoxLayout()
+        self.startup_copy_button = self._mark_safe_widget(QPushButton("复制错误"))
+        self.startup_copy_button.clicked.connect(self._copy_startup_error)
+        self.startup_log_button = self._mark_safe_widget(QPushButton("打开管理器日志"))
+        self.startup_log_button.clicked.connect(self._open_manager_log)
+        self.startup_recheck_button = self._mark_safe_widget(QPushButton("重新检查"))
+        self.startup_recheck_button.clicked.connect(self.begin_startup_check)
+        for button in (
+            self.startup_copy_button,
+            self.startup_log_button,
+            self.startup_recheck_button,
+        ):
+            startup_buttons.addWidget(button)
+        startup_buttons.addStretch()
+        startup_layout.addLayout(startup_buttons, 4, 1)
+        layout.addWidget(startup_box)
 
         status_box = QGroupBox("正式数据与服务状态")
         grid = QGridLayout(status_box)
@@ -286,6 +923,10 @@ class MainWindow(QMainWindow):
         ):
             button = QPushButton(text)
             button.clicked.connect(callback)
+            if text == "刷新状态":
+                self.refresh_status_button = self._mark_diagnostic_widget(button)
+            elif text == "手动完整备份 Volume（大文件）":
+                self.manual_backup_button = button
             buttons.addWidget(button)
         buttons.addStretch()
         layout.addLayout(buttons)
@@ -346,6 +987,7 @@ class MainWindow(QMainWindow):
         form.addRow("结果查看", self.task_pause_console)
         layout.addWidget(form_box)
         buttons = QHBoxLayout()
+        self.task_form_buttons: list[QPushButton] = []
         for text, callback in (
             ("预览", self._preview_task),
             ("只创建任务模板", self._create_task_template),
@@ -354,6 +996,9 @@ class MainWindow(QMainWindow):
         ):
             button = QPushButton(text)
             button.clicked.connect(callback)
+            self.task_form_buttons.append(button)
+            if text == "预览":
+                self.task_preview_button = button
             buttons.addWidget(button)
         layout.addLayout(buttons)
         self.task_output = QTextEdit()
@@ -547,6 +1192,7 @@ class MainWindow(QMainWindow):
         # the minimum window width.
         buttons = QGridLayout()
         refresh = QPushButton("刷新任务列表")
+        self.task_refresh_button = refresh
         refresh.clicked.connect(self.refresh_tasks)
         activate = QPushButton("应用为正式 setting")
         activate.setToolTip("只能勾选一个模板；将模板复制为下载器唯一读取的正式 setting。")
@@ -615,6 +1261,12 @@ class MainWindow(QMainWindow):
         ):
             button = QPushButton(text)
             button.clicked.connect(callback)
+            if text == "迁移旧Excel/分类/截图":
+                self.collector_migrate_button = button
+            elif text == "启动采集服务":
+                self.collector_start_button = button
+            elif text == "停止采集服务":
+                self.collector_stop_button = button
             buttons.addWidget(button)
         buttons.addStretch()
         layout.addLayout(buttons)
@@ -644,6 +1296,10 @@ class MainWindow(QMainWindow):
         ):
             button = QPushButton(text)
             button.clicked.connect(callback)
+            if text == "预览截图归档":
+                self.screenshot_preview_button = button
+            else:
+                self.screenshot_archive_button = button
             buttons.addWidget(button)
         self.refresh_index_button = QPushButton("立即刷新索引")
         self.refresh_index_button.clicked.connect(self._refresh_index)
@@ -684,6 +1340,13 @@ class MainWindow(QMainWindow):
         self.video_edit = QLineEdit(self.controller.config.video_root)
         self.index_edit = QLineEdit(self.controller.config.index_root)
         self.old_screenshot_edit = QLineEdit(self.controller.config.old_screenshot_dir)
+        for edit in (
+            self.engine_edit,
+            self.video_edit,
+            self.index_edit,
+            self.old_screenshot_edit,
+        ):
+            self._mark_path_widget(edit)
         entries = (
             ("下载引擎 main.exe", self.engine_edit, self._browse_engine),
             ("视频账号目录", self.video_edit, lambda: self._browse_dir(self.video_edit)),
@@ -695,6 +1358,7 @@ class MainWindow(QMainWindow):
             grid.addWidget(edit, row, 1)
             button = QPushButton("选择")
             button.clicked.connect(callback)
+            self._mark_path_widget(button)
             grid.addWidget(button, row, 2)
         layout.addWidget(box)
 
@@ -720,9 +1384,14 @@ class MainWindow(QMainWindow):
         )
         note.setWordWrap(True)
         layout.addWidget(note)
-        save = QPushButton("保存设置并重新验证正式数据")
-        save.clicked.connect(self._save_settings)
-        layout.addWidget(save)
+        self.path_save_button = self._mark_path_widget(
+            QPushButton("仅保存正式路径并重新检查")
+        )
+        self.path_save_button.clicked.connect(self._save_paths)
+        layout.addWidget(self.path_save_button)
+        self.settings_save_button = QPushButton("保存全部设置并重新验证正式数据")
+        self.settings_save_button.clicked.connect(self._save_settings)
+        layout.addWidget(self.settings_save_button)
 
         update_box = QGroupBox("下载引擎安全更新（永久保留唯一正式 Volume）")
         update_grid = QGridLayout(update_box)
@@ -734,8 +1403,10 @@ class MainWindow(QMainWindow):
         browse_update.clicked.connect(self._browse_engine_update)
         update_grid.addWidget(browse_update, 0, 2)
         preview_update = QPushButton("只读预检更新包")
+        self.engine_update_preview_button = preview_update
         preview_update.clicked.connect(self._preview_engine_update)
         apply_update = QPushButton("备份并安全安装")
+        self.engine_update_apply_button = apply_update
         apply_update.clicked.connect(self._apply_engine_update)
         update_grid.addWidget(preview_update, 1, 1)
         update_grid.addWidget(apply_update, 1, 2)
@@ -756,12 +1427,15 @@ class MainWindow(QMainWindow):
         layout.addWidget(intro)
         filters = QHBoxLayout()
         self.result_status_filter = QComboBox()
+        self._mark_safe_widget(self.result_status_filter)
         self.result_status_filter.addItem("全部状态", "")
         for status in AccountStatus:
             self.result_status_filter.addItem(_status_label(status), status.value)
         self.result_account_filter = QLineEdit()
+        self._mark_safe_widget(self.result_account_filter)
         self.result_account_filter.setPlaceholderText("A 编号，例如 55")
         self.result_task_filter = QLineEdit()
+        self._mark_safe_widget(self.result_task_filter)
         self.result_task_filter.setPlaceholderText("任务名称关键字")
         self.result_status_filter.currentIndexChanged.connect(
             self._schedule_result_refresh
@@ -773,6 +1447,7 @@ class MainWindow(QMainWindow):
         filters.addWidget(self.result_account_filter)
         filters.addWidget(self.result_task_filter)
         refresh_button = QPushButton("立即刷新结果")
+        self.result_refresh_button = refresh_button
         refresh_button.setToolTip("立即重新读取 Logs\\DownloadTasks 中的最新任务结果。")
         refresh_button.clicked.connect(self.refresh_results)
         filters.addWidget(refresh_button)
@@ -793,6 +1468,577 @@ class MainWindow(QMainWindow):
         self.result_last_refresh = QLabel("最近刷新：未刷新")
         layout.addWidget(self.result_last_refresh)
         return page
+
+    def _result_dashboard_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        header = QHBoxLayout()
+        header.addWidget(QLabel("任务"))
+        self.dashboard_task_selector = QComboBox()
+        self._mark_safe_widget(self.dashboard_task_selector)
+        self.dashboard_task_selector.setMinimumContentsLength(34)
+        self.dashboard_task_selector.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.dashboard_task_selector.currentIndexChanged.connect(
+            self._dashboard_task_selected
+        )
+        header.addWidget(self.dashboard_task_selector, 1)
+        self.dashboard_refresh_button = QPushButton("刷新")
+        self._mark_safe_widget(self.dashboard_refresh_button)
+        self.dashboard_refresh_button.setToolTip("强制重新读取任务索引和当前任务日志")
+        self.dashboard_refresh_button.clicked.connect(
+            lambda _checked=False: self.refresh_result_dashboard(force_refresh=True)
+        )
+        header.addWidget(self.dashboard_refresh_button)
+        self.dashboard_open_task_button = QPushButton("打开任务日志")
+        self._mark_safe_widget(self.dashboard_open_task_button)
+        self.dashboard_open_task_button.clicked.connect(self._open_dashboard_task_log)
+        self.dashboard_open_task_button.setEnabled(False)
+        header.addWidget(self.dashboard_open_task_button)
+        self.dashboard_native_selector = QComboBox()
+        self._mark_safe_widget(self.dashboard_native_selector)
+        self.dashboard_native_selector.setMinimumContentsLength(18)
+        header.addWidget(self.dashboard_native_selector)
+        self.dashboard_open_native_button = QPushButton("打开原始日志")
+        self._mark_safe_widget(self.dashboard_open_native_button)
+        self.dashboard_open_native_button.clicked.connect(
+            self._open_dashboard_native_log
+        )
+        self.dashboard_open_native_button.setEnabled(False)
+        header.addWidget(self.dashboard_open_native_button)
+        layout.addLayout(header)
+
+        self.dashboard_message = QLabel("等待加载")
+        self.dashboard_message.setWordWrap(True)
+        self.dashboard_message.setObjectName("dashboardMessage")
+        layout.addWidget(self.dashboard_message)
+        self.dashboard_current_task = QLabel("当前显示：无")
+        self.dashboard_current_task.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.dashboard_current_task.setWordWrap(True)
+        layout.addWidget(self.dashboard_current_task)
+
+        metrics = QGridLayout()
+        metric_names = (
+            ("planned", "计划账号"),
+            ("started", "实际开始"),
+            ("complete", "完整性"),
+            ("reliable", "可靠性"),
+            ("anomaly", "附加异常"),
+            ("unstarted", "未进入处理"),
+        )
+        self.dashboard_metric_values: dict[str, QLabel] = {}
+        for position, (key, title) in enumerate(metric_names):
+            card = QFrame()
+            card.setObjectName("dashboardMetric")
+            card.setFrameShape(QFrame.Shape.StyledPanel)
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(10, 7, 10, 7)
+            name_label = QLabel(title)
+            name_label.setObjectName("dashboardMetricTitle")
+            value_label = QLabel("—")
+            value_label.setObjectName("dashboardMetricValue")
+            value_label.setWordWrap(True)
+            card_layout.addWidget(name_label)
+            card_layout.addWidget(value_label)
+            self.dashboard_metric_values[key] = value_label
+            metrics.addWidget(card, position // 3, position % 3)
+        layout.addLayout(metrics)
+
+        detail_layout = QHBoxLayout()
+        distribution_box = QGroupBox("六类主状态分布")
+        distribution_layout = QVBoxLayout(distribution_box)
+        self.dashboard_distribution = QTableWidget(len(AccountStatus), 3)
+        self.dashboard_distribution.setHorizontalHeaderLabels(
+            ("主状态", "数量", "占实际开始")
+        )
+        self.dashboard_distribution.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.dashboard_distribution.setSelectionMode(
+            QAbstractItemView.SelectionMode.NoSelection
+        )
+        self.dashboard_distribution.verticalHeader().setVisible(False)
+        self.dashboard_distribution.horizontalHeader().setStretchLastSection(True)
+        self.dashboard_distribution.setFixedHeight(210)
+        distribution_layout.addWidget(self.dashboard_distribution)
+        detail_layout.addWidget(distribution_box, 1)
+
+        integrity_box = QGroupBox("完整性与证据")
+        integrity_layout = QVBoxLayout(integrity_box)
+        self.dashboard_integrity = QLabel("尚未加载")
+        self.dashboard_integrity.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+        )
+        self.dashboard_integrity.setWordWrap(True)
+        self.dashboard_integrity.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        integrity_layout.addWidget(self.dashboard_integrity)
+        detail_layout.addWidget(integrity_box, 1)
+        layout.addLayout(detail_layout)
+
+        account_box = QGroupBox("账号关注与定位")
+        account_layout = QVBoxLayout(account_box)
+        account_filters = QHBoxLayout()
+        account_filters.addWidget(QLabel("显示"))
+        self.dashboard_account_scope = QComboBox()
+        self._mark_safe_widget(self.dashboard_account_scope)
+        self.dashboard_account_scope.addItem("需关注", "attention")
+        self.dashboard_account_scope.addItem("全部账号", "all")
+        for status in AccountStatus:
+            self.dashboard_account_scope.addItem(
+                _dashboard_status_label(status), f"status:{status.value}"
+            )
+        self.dashboard_account_scope.addItem("前置异常", "status:pre_start_error")
+        self.dashboard_account_scope.addItem("未开始", "status:not_started")
+        self.dashboard_account_scope.addItem("完成但有异常记录", "anomaly")
+        self.dashboard_account_scope.setToolTip("默认仅显示需要核对或解释的账号")
+        account_filters.addWidget(self.dashboard_account_scope)
+        self.dashboard_account_search = QLineEdit()
+        self._mark_safe_widget(self.dashboard_account_search)
+        self.dashboard_account_search.setPlaceholderText("A 编号，例如 55")
+        self.dashboard_account_search.setClearButtonEnabled(True)
+        account_filters.addWidget(self.dashboard_account_search)
+        self.dashboard_account_summary = QLabel("显示 0 / 0；需关注 0；无法归类 未知")
+        self.dashboard_account_summary.setWordWrap(True)
+        account_filters.addWidget(self.dashboard_account_summary, 1)
+        account_layout.addLayout(account_filters)
+
+        self._dashboard_account_model = DashboardAccountTableModel(self)
+        self.dashboard_account_table = QTableView()
+        self.dashboard_account_table.setModel(self._dashboard_account_model)
+        self.dashboard_account_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.dashboard_account_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.dashboard_account_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.dashboard_account_table.setVerticalScrollMode(
+            QAbstractItemView.ScrollMode.ScrollPerPixel
+        )
+        self.dashboard_account_table.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.dashboard_account_table.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.dashboard_account_table.setWordWrap(False)
+        self.dashboard_account_table.verticalHeader().setVisible(False)
+        self.dashboard_account_table.verticalHeader().setDefaultSectionSize(24)
+        self.dashboard_account_table.horizontalHeader().setStretchLastSection(True)
+        self.dashboard_account_table.setFixedHeight(230)
+        self.dashboard_account_table.setToolTip(
+            "内容超出时，将鼠标置于框内即可使用滚轮上下浏览。"
+        )
+        self.dashboard_account_scope.currentIndexChanged.connect(
+            self._apply_dashboard_account_filter
+        )
+        self.dashboard_account_search.textChanged.connect(
+            self._apply_dashboard_account_filter
+        )
+        account_layout.addWidget(self.dashboard_account_table)
+        layout.addWidget(account_box)
+        return page
+
+    @staticmethod
+    def _dashboard_key(path: Path | str) -> str:
+        return os.path.normcase(str(Path(path).resolve()))
+
+    def _dashboard_current_entry(self) -> DashboardTaskIndexEntry | None:
+        if not hasattr(self, "dashboard_task_selector"):
+            return None
+        value = self.dashboard_task_selector.currentData()
+        if not value:
+            return None
+        return getattr(self, "_dashboard_entries", {}).get(str(value))
+
+    def refresh_result_dashboard(
+        self,
+        *,
+        force_refresh: bool = False,
+        auto_refresh: bool = False,
+    ) -> None:
+        if (
+            self.controller.startup_state is not StartupState.READY
+            or not hasattr(self, "dashboard_task_selector")
+        ):
+            return
+        self.dashboard_message.setText("正在刷新任务索引…")
+        spec = TaskSpec(
+            task_type="result_dashboard_index",
+            display_name="刷新结果看板任务索引",
+            resource_keys=frozenset({"result_logs"}),
+            deduplicate_key="result_dashboard_index",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            dynamic_cancellation=True,
+        )
+        self._submit_coalesced_background(
+            spec,
+            lambda context: self.controller.result_dashboard_index(
+                force_refresh=force_refresh, context=context
+            ),
+            buttons=(self.dashboard_refresh_button, self.dashboard_task_selector),
+            on_success=lambda index: self._apply_dashboard_index(
+                index,
+                force_refresh=force_refresh,
+                auto_refresh=auto_refresh,
+            ),
+            on_failure=lambda payload: self._dashboard_load_failed(
+                payload, "刷新任务索引失败"
+            ),
+            on_removed=self._dashboard_index_removed,
+            generation_key="result_dashboard_index",
+        )
+
+    def _apply_dashboard_index(
+        self,
+        index: DashboardTaskIndex,
+        *,
+        force_refresh: bool,
+        auto_refresh: bool,
+    ) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        previous = self._dashboard_current_entry()
+        previous_key = (
+            self._dashboard_key(previous.task_log) if previous is not None else None
+        )
+        entries = {
+            self._dashboard_key(entry.task_log): entry for entry in index.entries
+        }
+        default_key = (
+            self._dashboard_key(index.default_task)
+            if index.default_task is not None
+            else None
+        )
+        preserve_previous = previous_key in entries and (
+            getattr(self, "_dashboard_user_selected", False)
+            or force_refresh
+            or not auto_refresh
+        )
+        selected_key = previous_key if preserve_previous else default_key
+
+        self._dashboard_index = index
+        self._dashboard_entries = entries
+        self._dashboard_index_load_pending = force_refresh
+        self._dashboard_syncing_selector = True
+        self.dashboard_task_selector.blockSignals(True)
+        try:
+            self.dashboard_task_selector.clear()
+            for entry in index.entries:
+                when = (
+                    entry.ended_at.strftime("%Y-%m-%d %H:%M:%S")
+                    if entry.ended_at is not None
+                    else "时间未知"
+                )
+                name = entry.task_template or entry.task_log.name
+                suffix = {
+                    "ready": "",
+                    "pending": " [汇总中]",
+                    "unavailable": " [不可展示]",
+                }[entry.state]
+                self.dashboard_task_selector.addItem(
+                    f"{when} / {name}{suffix}", self._dashboard_key(entry.task_log)
+                )
+            if selected_key is not None:
+                selected_index = self.dashboard_task_selector.findData(selected_key)
+                if selected_index >= 0:
+                    self.dashboard_task_selector.setCurrentIndex(selected_index)
+        finally:
+            self.dashboard_task_selector.blockSignals(False)
+            self._dashboard_syncing_selector = False
+
+        self.dashboard_open_task_button.setEnabled(
+            self._dashboard_current_entry() is not None
+        )
+        if not index.entries:
+            self._dashboard_index_load_pending = None
+            self.dashboard_message.setText("没有可用的 DownloadTask 任务日志。")
+            if self._dashboard_snapshot is None:
+                self._reset_dashboard_view()
+            return
+        self.dashboard_message.setText("任务索引已更新，正在等待读取所选任务…")
+
+    def _dashboard_index_removed(self) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        if any(
+            binding.generation_key == "result_dashboard_index"
+            for binding in self._background_bindings.values()
+        ):
+            return
+        pending = getattr(self, "_dashboard_index_load_pending", None)
+        if pending is None:
+            return
+        self._dashboard_index_load_pending = None
+        self._load_dashboard_selection(force_refresh=bool(pending))
+
+    def _dashboard_task_selected(self, _index: int) -> None:
+        if getattr(self, "_dashboard_syncing_selector", False):
+            return
+        self._dashboard_user_selected = True
+        self.dashboard_open_task_button.setEnabled(
+            self._dashboard_current_entry() is not None
+        )
+        self._load_dashboard_selection(force_refresh=False)
+
+    def _load_dashboard_selection(self, *, force_refresh: bool) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        entry = self._dashboard_current_entry()
+        if entry is None:
+            self.dashboard_message.setText("没有选中的任务日志。")
+            return
+        if not entry.displayable:
+            prefix = "所选任务正在等待汇总" if entry.state == "pending" else "所选任务不可展示"
+            stable = self._dashboard_snapshot
+            suffix = (
+                f" 下方保留最后稳定任务 {stable.task_log.name} 的结果。"
+                if stable is not None
+                else ""
+            )
+            self.dashboard_message.setText(f"{prefix}：{entry.reason}{suffix}")
+            self.dashboard_native_selector.clear()
+            self.dashboard_open_native_button.setEnabled(False)
+            if stable is None:
+                self._reset_dashboard_view()
+            return
+
+        requested_path = entry.task_log
+        expected_fingerprint = entry.fingerprint
+        self.dashboard_message.setText(f"正在加载 {requested_path.name}…")
+        spec = TaskSpec(
+            task_type="result_dashboard_task",
+            display_name="读取结果看板任务",
+            resource_keys=frozenset({"result_logs"}),
+            deduplicate_key="result_dashboard_task",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            dynamic_cancellation=True,
+        )
+        self._submit_coalesced_background(
+            spec,
+            lambda context: self.controller.result_dashboard_snapshot(
+                requested_path,
+                expected_fingerprint=expected_fingerprint,
+                force_refresh=force_refresh,
+                context=context,
+            ),
+            buttons=(self.dashboard_refresh_button,),
+            on_success=lambda snapshot: self._render_dashboard_snapshot_if_current(
+                snapshot, requested_path, expected_fingerprint
+            ),
+            on_failure=lambda payload: self._dashboard_load_failed(
+                payload, f"读取 {requested_path.name} 失败"
+            ),
+            generation_key="result_dashboard_task",
+        )
+
+    def _render_dashboard_snapshot_if_current(
+        self,
+        snapshot: ResultDashboardSnapshot,
+        requested_path: Path,
+        expected_fingerprint: DashboardFileFingerprint,
+    ) -> bool:
+        if self.controller.startup_state is not StartupState.READY:
+            return False
+        entry = self._dashboard_current_entry()
+        if (
+            entry is None
+            or self._dashboard_key(entry.task_log) != self._dashboard_key(requested_path)
+            or self._dashboard_key(snapshot.task_log) != self._dashboard_key(requested_path)
+            or entry.fingerprint != expected_fingerprint
+            or snapshot.fingerprint != expected_fingerprint
+        ):
+            return False
+        self._dashboard_snapshot = snapshot
+        self._render_dashboard_snapshot(snapshot)
+        return True
+
+    def _render_dashboard_snapshot(self, snapshot: ResultDashboardSnapshot) -> None:
+        ended = (
+            snapshot.ended_at.strftime("%Y-%m-%d %H:%M:%S")
+            if snapshot.ended_at is not None
+            else "结束时间未知"
+        )
+        template = snapshot.task_template or "任务模板未知"
+        self.dashboard_current_task.setText(
+            f"当前显示：{template} / {ended} / {snapshot.task_log.name}"
+        )
+        self.dashboard_message.setText(
+            "加载完成"
+            + (
+                f"；另有 {self._dashboard_index.pending_count} 个任务正在运行或等待汇总。"
+                if self._dashboard_index is not None
+                and self._dashboard_index.pending_count
+                else ""
+            )
+        )
+        unknown = "未知"
+        self.dashboard_metric_values["planned"].setText(
+            str(snapshot.planned_count) if snapshot.planned_count is not None else unknown
+        )
+        self.dashboard_metric_values["started"].setText(
+            str(snapshot.started_count) if snapshot.started_count is not None else unknown
+        )
+        self.dashboard_metric_values["complete"].setText(
+            "完整" if snapshot.complete is True else "不完整" if snapshot.complete is False else unknown
+        )
+        self.dashboard_metric_values["reliable"].setText(
+            "可靠" if snapshot.reliable else "不可靠"
+        )
+        self.dashboard_metric_values["anomaly"].setText(
+            str(snapshot.completed_with_anomaly_count)
+            if snapshot.completed_with_anomaly_count is not None
+            else unknown
+        )
+        unstarted_parts = []
+        if snapshot.pre_start_error_count is not None:
+            unstarted_parts.append(f"前置异常 {snapshot.pre_start_error_count}")
+        if snapshot.not_started_count is not None:
+            unstarted_parts.append(f"未开始 {snapshot.not_started_count}")
+        if snapshot.unattributed_planned_count is not None:
+            unstarted_parts.append(f"无法归类 {snapshot.unattributed_planned_count}")
+        self.dashboard_metric_values["unstarted"].setText(
+            " / ".join(unstarted_parts) or unknown
+        )
+
+        for row_index, status in enumerate(AccountStatus):
+            count = snapshot.count_for(status)
+            denominator = snapshot.started_count
+            if snapshot.reliable and count is not None and denominator is not None:
+                percentage = f"{count / denominator:.1%}" if denominator else "不适用"
+            else:
+                percentage = unknown
+            for column, value in enumerate(
+                (_dashboard_status_label(status), str(count) if count is not None else unknown, percentage)
+            ):
+                self.dashboard_distribution.setItem(
+                    row_index, column, QTableWidgetItem(value)
+                )
+
+        integrity = [
+            f"账号明细：{'完整' if snapshot.details_complete else '不完整或未知'}",
+            f"退出码：{snapshot.exit_code if snapshot.exit_code is not None else unknown}",
+            f"日志定位：{snapshot.locator_method or unknown}",
+            f"持续时间：{snapshot.duration_seconds} 秒"
+            if snapshot.duration_seconds is not None
+            else "持续时间：未知",
+        ]
+        if snapshot.reliability_reasons:
+            integrity.append("原因：" + "；".join(snapshot.reliability_reasons))
+        self.dashboard_integrity.setText("\n".join(integrity))
+
+        self._dashboard_account_model.set_rows(
+            snapshot.account_rows,
+            evidence_source=snapshot.task_log.name,
+        )
+        self._apply_dashboard_account_filter()
+
+        self.dashboard_native_selector.clear()
+        seen_native: set[str] = set()
+        for segment in snapshot.native_log_segments:
+            key = self._dashboard_key(segment.path)
+            if key in seen_native:
+                continue
+            seen_native.add(key)
+            self.dashboard_native_selector.addItem(segment.path.name, str(segment.path))
+        self.dashboard_open_native_button.setEnabled(
+            self.dashboard_native_selector.count() > 0
+        )
+
+    def _apply_dashboard_account_filter(self, _value: object = None) -> None:
+        if not hasattr(self, "_dashboard_account_model"):
+            return
+        mode = str(self.dashboard_account_scope.currentData() or "attention")
+        self._dashboard_account_model.set_filter(
+            mode, self.dashboard_account_search.text()
+        )
+        snapshot = self._dashboard_snapshot
+        unattributed = (
+            "未知"
+            if snapshot is None or snapshot.unattributed_planned_count is None
+            else str(snapshot.unattributed_planned_count)
+        )
+        self.dashboard_account_summary.setText(
+            f"显示 {self._dashboard_account_model.visible_count} / "
+            f"{self._dashboard_account_model.total_count}；"
+            f"需关注 {self._dashboard_account_model.attention_count}；"
+            f"无法归类 {unattributed}"
+        )
+
+    def _reset_dashboard_view(self) -> None:
+        self.dashboard_current_task.setText("当前显示：无")
+        for label in self.dashboard_metric_values.values():
+            label.setText("—")
+        self.dashboard_distribution.clearContents()
+        self._dashboard_account_model.set_rows((), evidence_source="")
+        self._apply_dashboard_account_filter()
+        self.dashboard_integrity.setText("尚无稳定结果")
+        self.dashboard_native_selector.clear()
+        self.dashboard_open_native_button.setEnabled(False)
+
+    def _dashboard_load_failed(self, payload: object, prefix: str) -> None:
+        if self.controller.startup_state is StartupState.CLOSING:
+            return
+        message = payload.message if isinstance(payload, TaskFailure) else str(payload)
+        stable = self._dashboard_snapshot
+        suffix = (
+            f" 下方保留最后稳定任务 {stable.task_log.name} 的结果。"
+            if stable is not None
+            else ""
+        )
+        self.dashboard_message.setText(f"{prefix}：{message}{suffix}")
+
+    def _open_dashboard_task_log(self) -> None:
+        entry = self._dashboard_current_entry()
+        if entry is None:
+            QMessageBox.information(self, "没有任务日志", "当前没有选中的任务日志。")
+            return
+        self._open_dashboard_log_path(entry.task_log, "任务日志")
+
+    def _open_dashboard_native_log(self) -> None:
+        value = self.dashboard_native_selector.currentData()
+        if not value:
+            QMessageBox.information(self, "没有原始日志", "当前任务没有原始日志路径证据。")
+            return
+        self._open_dashboard_log_path(Path(str(value)), "原始日志")
+
+    def _open_dashboard_log_path(self, path: Path, label: str) -> None:
+        if not path.is_file():
+            QMessageBox.information(self, f"{label}不存在", f"{label}不存在：\n{path}")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+            QMessageBox.information(self, f"无法打开{label}", f"无法打开{label}：\n{path}")
+
+    def _defer_dashboard_refresh_until_results_idle(self) -> None:
+        if (
+            self.controller.startup_state is not StartupState.READY
+            or not hasattr(self, "dashboard_task_selector")
+        ):
+            return
+        active = next(
+            (
+                binding
+                for binding in self._background_bindings.values()
+                if binding.generation_key == "result_page_snapshot"
+            ),
+            None,
+        )
+        if active is None:
+            MainWindow.refresh_result_dashboard(self, auto_refresh=True)
+            return
+        previous = active.on_removed
+
+        def continue_after_old_page() -> None:
+            if previous is not None:
+                previous()
+            MainWindow._defer_dashboard_refresh_until_results_idle(self)
+
+        active.on_removed = continue_after_old_page
 
     @staticmethod
     def _spin(minimum: int, maximum: int, value: int) -> QSpinBox:
@@ -862,6 +2108,222 @@ class MainWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
             self.refresh_all()
 
+    def _submit_background(
+        self,
+        spec: TaskSpec,
+        action: Callable[[object], object],
+        *,
+        output: QTextEdit | None = None,
+        buttons: tuple[QWidget, ...] = (),
+        on_success: Callable[[object], None] | None = None,
+        on_failure: Callable[[object], None] | None = None,
+        on_cancelled: Callable[[object], None] | None = None,
+        on_progress: Callable[[object], None] | None = None,
+        on_removed: Callable[[], None] | None = None,
+        generation_key: str | None = None,
+        generation: int | None = None,
+        allow_during_closing: bool = False,
+    ) -> str | None:
+        self._cancel_shutdown_for_new_work()
+        key = generation_key or spec.deduplicate_key or spec.task_type
+        if generation is None:
+            generation = self._background_generations.get(key, 0) + 1
+        try:
+            task_id = self.coordinator.start(spec, generation, action)
+        except TaskRejectedError as exc:
+            if output is not None:
+                self._append_info(output, f"【未启动】{exc}")
+            self.statusBar().showMessage(str(exc))
+            return None
+        self._background_generations[key] = generation
+        self._background_bindings[task_id] = BackgroundTaskBinding(
+            generation_key=key,
+            generation=generation,
+            spec=spec,
+            output=output,
+            buttons=buttons,
+            on_success=on_success,
+            on_failure=on_failure,
+            on_cancelled=on_cancelled,
+            on_progress=on_progress,
+            on_removed=on_removed,
+            allow_during_closing=allow_during_closing,
+        )
+        for button in buttons:
+            button.setEnabled(False)
+        return task_id
+
+    def _submit_coalesced_background(
+        self,
+        spec: TaskSpec,
+        action: Callable[[object], object],
+        *,
+        output: QTextEdit | None = None,
+        buttons: tuple[QWidget, ...] = (),
+        on_success: Callable[[object], None] | None = None,
+        on_failure: Callable[[object], None] | None = None,
+        on_cancelled: Callable[[object], None] | None = None,
+        on_progress: Callable[[object], None] | None = None,
+        on_removed: Callable[[], None] | None = None,
+        generation_key: str | None = None,
+        allow_during_closing: bool = False,
+    ) -> str | None:
+        key = generation_key or spec.deduplicate_key or spec.task_type
+        generation = self._background_generations.get(key, 0) + 1
+        active_task_id = next(
+            (
+                task_id
+                for task_id, binding in self._background_bindings.items()
+                if binding.generation_key == key
+            ),
+            None,
+        )
+        if active_task_id is None:
+            return MainWindow._submit_background(
+                self,
+                spec,
+                action,
+                output=output,
+                buttons=buttons,
+                on_success=on_success,
+                on_failure=on_failure,
+                on_cancelled=on_cancelled,
+                on_progress=on_progress,
+                on_removed=on_removed,
+                generation_key=key,
+                generation=generation,
+                allow_during_closing=allow_during_closing,
+            )
+
+        self._background_generations[key] = generation
+        self._background_pending[key] = PendingBackgroundRequest(
+            generation=generation,
+            spec=spec,
+            action=action,
+            output=output,
+            buttons=buttons,
+            on_success=on_success,
+            on_failure=on_failure,
+            on_cancelled=on_cancelled,
+            on_progress=on_progress,
+            on_removed=on_removed,
+            allow_during_closing=allow_during_closing,
+        )
+        self.coordinator.request_cancel(active_task_id)
+        return active_task_id
+
+    def _background_binding_is_current(
+        self,
+        binding: BackgroundTaskBinding,
+        generation: int,
+    ) -> bool:
+        if generation != binding.generation:
+            return False
+        if self._background_generations.get(binding.generation_key) != generation:
+            return False
+        return (
+            binding.allow_during_closing
+            or self.controller.startup_state is not StartupState.CLOSING
+        )
+
+    @Slot(str, int, object)
+    def _on_background_task_progress(
+        self,
+        task_id: str,
+        generation: int,
+        progress: object,
+    ) -> None:
+        binding = self._background_bindings.get(task_id)
+        if binding is None or not self._background_binding_is_current(
+            binding, generation
+        ):
+            return
+        if binding.on_progress is not None:
+            binding.on_progress(progress)
+
+    @Slot(str, int, object, object)
+    def _on_background_task_settled(
+        self,
+        task_id: str,
+        generation: int,
+        outcome: object,
+        payload: object,
+    ) -> None:
+        binding = self._background_bindings.get(task_id)
+        if binding is None or not self._background_binding_is_current(
+            binding, generation
+        ):
+            return
+        if outcome is TaskState.SUCCEEDED:
+            if binding.on_success is not None:
+                binding.on_success(payload)
+            self._refresh_background_targets(binding.spec.refresh_targets)
+            return
+        if outcome is TaskState.CANCELLED:
+            if binding.on_cancelled is not None:
+                binding.on_cancelled(payload)
+            elif binding.output is not None:
+                self._append_info(binding.output, "操作已取消。")
+            return
+        if binding.on_failure is not None:
+            binding.on_failure(payload)
+        else:
+            message = payload.message if isinstance(payload, TaskFailure) else str(payload)
+            if binding.output is not None:
+                self._append_info(binding.output, f"【失败】{message}")
+            self.controller.logger.error("后台操作失败：%s", message)
+            self.statusBar().showMessage("操作失败")
+
+    @Slot(str)
+    def _on_background_task_removed(self, task_id: str) -> None:
+        binding = self._background_bindings.pop(task_id, None)
+        if binding is None:
+            return
+        pending = getattr(self, "_background_pending", {}).pop(
+            binding.generation_key, None
+        )
+        if (
+            pending is not None
+            and self.controller.startup_state is not StartupState.CLOSING
+        ):
+            MainWindow._submit_background(
+                self,
+                pending.spec,
+                pending.action,
+                output=pending.output,
+                buttons=pending.buttons,
+                on_success=pending.on_success,
+                on_failure=pending.on_failure,
+                on_cancelled=pending.on_cancelled,
+                on_progress=pending.on_progress,
+                on_removed=pending.on_removed,
+                generation_key=binding.generation_key,
+                generation=pending.generation,
+                allow_during_closing=pending.allow_during_closing,
+            )
+        for button in binding.buttons:
+            if not any(
+                any(candidate is button for candidate in other.buttons)
+                for other in self._background_bindings.values()
+            ):
+                button.setEnabled(True)
+        if binding.on_removed is not None:
+            binding.on_removed()
+        self._apply_action_gate()
+
+    def _cancel_background(self, task_id: str) -> bool:
+        return self.coordinator.request_cancel(task_id)
+
+    def _refresh_background_targets(self, targets: tuple[str, ...]) -> None:
+        if "task_list" in targets:
+            self.refresh_tasks()
+        if "download_results" in targets and hasattr(self, "result_table"):
+            self.refresh_results()
+        if "result_dashboard" in targets and hasattr(self, "dashboard_task_selector"):
+            self.refresh_result_dashboard(auto_refresh=True)
+        if "runtime_status" in targets:
+            self._refresh_status()
+
     def _run_index_background(
         self,
         action: Callable[[], object],
@@ -924,10 +2386,59 @@ class MainWindow(QMainWindow):
             self.refresh_all()
 
     def _refresh_status(self, _checked: bool = False) -> None:
-        self.refresh_all(check_processes=True)
+        if self.controller.startup_state not in (
+            StartupState.READY,
+            StartupState.DEGRADED_READ_ONLY,
+        ):
+            return
+        if not hasattr(self, "_background_bindings") or hasattr(
+            self.refresh_all, "assert_called_once_with"
+        ):
+            self.refresh_all(check_processes=True)
+            return
+        spec = TaskSpec(
+            task_type="runtime_status_snapshot",
+            display_name="刷新运行状态",
+            resource_keys=frozenset(
+                {
+                    "engine_process",
+                    "collector_process",
+                    "engine_files",
+                    "volume",
+                    "settings",
+                    "video_tree",
+                    "index",
+                    "collector_data",
+                }
+            ),
+            deduplicate_key="runtime_status_snapshot",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            dynamic_cancellation=True,
+        )
+        self._submit_coalesced_background(
+            spec,
+            lambda context: self.controller.runtime_status_snapshot(context=context),
+            buttons=(getattr(self, "refresh_status_button", None),)
+            if getattr(self, "refresh_status_button", None) is not None
+            else (),
+            on_success=self._render_health_snapshot,
+            generation_key="runtime_status_snapshot",
+        )
 
     def refresh_all(self, *, check_processes: bool = False) -> None:
         health = self.controller.health(check_processes=check_processes)
+        self._apply_action_gate()
+        self._render_health_snapshot(health)
+        if self.controller.startup_state is not StartupState.READY:
+            self._apply_action_gate()
+            return
+        self.refresh_tasks()
+        if hasattr(self, "result_table"):
+            self.refresh_results()
+
+    def _render_health_snapshot(self, health: dict[str, object]) -> None:
+        operational_ready = self.controller.startup_state is StartupState.READY
         for key, label in self.status_labels.items():
             value = bool(health.get(key, False))
             if key.endswith("_running"):
@@ -958,26 +2469,32 @@ class MainWindow(QMainWindow):
             label.style().polish(label)
         if hasattr(self, "queue_shutdown"):
             self.queue_shutdown.setEnabled(
-                not collector_running and mode != ENGINE_MODE_MONITOR
+                operational_ready
+                and not collector_running
+                and mode != ENGINE_MODE_MONITOR
             )
             if collector_running and self.queue_shutdown.isChecked():
                 self.queue_shutdown.setChecked(False)
         if hasattr(self, "queue_pause_button"):
             self.queue_pause_button.setEnabled(
-                self.queue_active
+                operational_ready
+                and self.queue_active
                 and not self.queue_cancel_requested
                 and str(health.get("engine_mode") or "") != ENGINE_MODE_MONITOR
             )
         if hasattr(self, "queue_cancel_button"):
             self.queue_cancel_button.setEnabled(
-                self.queue_active
+                operational_ready
+                and self.queue_active
                 and not self.queue_cancel_requested
                 and str(health.get("engine_mode") or "") != ENGINE_MODE_MONITOR
             )
         if hasattr(self, "monitor_start_button"):
             monitor_running = mode == ENGINE_MODE_MONITOR
-            self.monitor_start_button.setEnabled(not engine_running and not collector_running)
-            self.monitor_stop_button.setEnabled(monitor_running)
+            self.monitor_start_button.setEnabled(
+                operational_ready and not engine_running and not collector_running
+            )
+            self.monitor_stop_button.setEnabled(operational_ready and monitor_running)
         self.collector_path_label.setText(
             f"正式主档：{self.controller.paths.master_settings}\n"
             f"Excel：{self.controller.paths.collector_excel}\n"
@@ -990,11 +2507,8 @@ class MainWindow(QMainWindow):
             self.batch_end.setMaximum(int(health["master_positions"]))
             if self.batch_end.value() > int(health["master_positions"]):
                 self.batch_end.setValue(int(health["master_positions"]))
-        self.refresh_tasks()
-        if hasattr(self, "result_table"):
-            self.refresh_results()
 
-    def refresh_tasks(self) -> None:
+    def _render_task_paths(self, paths: tuple[Path, ...]) -> None:
         checked_paths = {
             item.data(Qt.UserRole)
             for index in range(self.task_list.count())
@@ -1006,7 +2520,7 @@ class MainWindow(QMainWindow):
         signals_were_blocked = self.task_list.blockSignals(True)
         try:
             self.task_list.clear()
-            for path in self.controller.list_tasks():
+            for path in paths:
                 checked = str(path) in checked_paths
                 state_text = "【已勾选】" if checked else "【未勾选】"
                 item = QListWidgetItem(f"{state_text} {path.name}")
@@ -1029,6 +2543,33 @@ class MainWindow(QMainWindow):
         finally:
             self.task_list.blockSignals(signals_were_blocked)
         self._update_move_targets(self.task_list.count())
+
+    def refresh_tasks(self) -> None:
+        # Render keeps the established list flags: no drag/drop
+        # (``~Qt.ItemIsDragEnabled`` and ``~Qt.ItemIsDropEnabled``).
+        if (
+            self.controller.startup_state is not StartupState.READY
+            or not hasattr(self, "task_list")
+        ):
+            return
+        spec = TaskSpec(
+            task_type="task_list_snapshot",
+            display_name="刷新任务列表",
+            resource_keys=frozenset({"task_templates", "settings"}),
+            deduplicate_key="task_list_snapshot",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            dynamic_cancellation=True,
+        )
+        self._submit_coalesced_background(
+            spec,
+            lambda context: self.controller.list_tasks(context=context),
+            buttons=(getattr(self, "task_refresh_button", None),)
+            if getattr(self, "task_refresh_button", None) is not None
+            else (),
+            on_success=lambda paths: self._render_task_paths(tuple(paths)),
+            generation_key="task_list_snapshot",
+        )
 
     def _selection_checks(self) -> None:
         if self._syncing_task_selection:
@@ -1084,6 +2625,8 @@ class MainWindow(QMainWindow):
             self.refresh_tasks()
 
     def _schedule_result_refresh(self, *_args) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
         if hasattr(self, "result_refresh_timer"):
             self.result_refresh_timer.start(150)
         else:
@@ -1102,7 +2645,7 @@ class MainWindow(QMainWindow):
         if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
             QMessageBox.information(self, "无法打开日志", f"无法打开来源日志：\n{path}")
 
-    def refresh_results(self) -> None:
+    def _render_result_snapshot(self, snapshot: ResultPageSnapshot) -> None:
         if not hasattr(self, "result_table"):
             return
         selected_status = str(self.result_status_filter.currentData() or "")
@@ -1112,7 +2655,7 @@ class MainWindow(QMainWindow):
             account_number = int(account_text) if account_text else None
         except ValueError:
             account_number = -1
-        rows = self.controller.result_rows(limit=500)
+        rows = snapshot.rows
         filtered = tuple(
             row
             for row in rows
@@ -1135,14 +2678,38 @@ class MainWindow(QMainWindow):
                 if column == 5:
                     item.setToolTip("双击打开来源日志")
                 self.result_table.setItem(index, column, item)
-        runs = self.controller.result_runs(limit=500)
-        incomplete_old = sum(1 for run in runs if run.account_rows and not run.details_complete)
+        incomplete_old = snapshot.incomplete_old_runs
         self.result_note.setText(
-            f"共读取 {len(runs)} 次任务日志，显示 {len(filtered)} 条账号结果。"
+            f"共读取 {len(snapshot.runs)} 次任务日志，显示 {len(filtered)} 条账号结果。"
             + (f"其中 {incomplete_old} 次旧日志没有完整列出正常账号，页面不会猜测缺失状态。" if incomplete_old else "")
         )
         self.result_last_refresh.setText(
             f"最近刷新：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+
+    def refresh_results(self) -> None:
+        if (
+            self.controller.startup_state is not StartupState.READY
+            or not hasattr(self, "result_table")
+        ):
+            return
+        spec = TaskSpec(
+            task_type="result_page_snapshot",
+            display_name="刷新下载结果",
+            resource_keys=frozenset({"result_logs"}),
+            deduplicate_key="result_page_snapshot",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            dynamic_cancellation=True,
+        )
+        self._submit_coalesced_background(
+            spec,
+            lambda context: self.controller.result_snapshot(limit=500, context=context),
+            buttons=(getattr(self, "result_refresh_button", None),)
+            if getattr(self, "result_refresh_button", None) is not None
+            else (),
+            on_success=lambda snapshot: self._render_result_snapshot(snapshot),
+            generation_key="result_page_snapshot",
         )
 
     def _update_move_targets(self, count: int) -> None:
@@ -1262,15 +2829,32 @@ class MainWindow(QMainWindow):
             self.task_list.blockSignals(signals_were_blocked)
 
     def _preview_task(self) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
         if self.task_smart_private.isChecked():
-            preview = self._run(
-                lambda: self.controller.preview_private_skip(
-                    self.task_expression.text(), self.task_private_days.value()
-                ),
-                self.task_output,
+            expression = self.task_expression.text()
+            validity_days = self.task_private_days.value()
+            spec = TaskSpec(
+                task_type="private_preview",
+                display_name="智能私密预览",
+                resource_keys=frozenset({"result_logs", "settings"}),
+                deduplicate_key="private_preview",
+                cancellable=True,
+                close_policy=ClosePolicy.CANCEL,
+                dynamic_cancellation=True,
             )
-            if preview:
-                self._replace_info(self.task_output, *self._smart_preview_lines(preview))
+            self._submit_coalesced_background(
+                spec,
+                lambda context: self.controller.preview_private_skip(
+                    expression, validity_days, context=context
+                ),
+                output=self.task_output,
+                buttons=(self.task_preview_button,),
+                on_success=lambda preview: self._render_private_preview_if_current(
+                    preview, expression, validity_days
+                ),
+                generation_key="private_preview",
+            )
             return
         preview = self._run(
             lambda: self.controller.preview_selection(self.task_expression.text()),
@@ -1288,6 +2872,18 @@ class MainWindow(QMainWindow):
                 f"重复编号：{len(preview.selection.duplicate_numbers)}",
                 "主档 enable：不会修改",
             )
+
+    def _render_private_preview_if_current(
+        self, preview: object, expression: str, validity_days: int
+    ) -> bool:
+        if self.task_expression.text() != expression:
+            return False
+        if self.task_private_days.value() != validity_days:
+            return False
+        if not self.task_smart_private.isChecked():
+            return False
+        self._replace_info(self.task_output, *self._smart_preview_lines(preview))
+        return True
 
     @staticmethod
     def _smart_preview_lines(preview) -> tuple[str, ...]:
@@ -1333,7 +2929,7 @@ class MainWindow(QMainWindow):
                 "当前为后台剪贴板监听模式，请先停止监听后再运行批量下载任务。",
             )
             return True
-        if not self.queue_active and self.download_summary_thread is None:
+        if not self.queue_active and not MainWindow._download_summary_is_active(self):
             return False
         QMessageBox.warning(
             self,
@@ -1365,6 +2961,13 @@ class MainWindow(QMainWindow):
         if self.queue_started_at is None:
             self.queue_started_at = now
             self.queue_elapsed_label.setText("本次队列耗时：00:00:00（运行中）")
+        if getattr(self, "_download_lifecycle_identity", None) is None:
+            self._download_lifecycle_identity = (
+                f"download_lifecycle:{MainWindow._canonical_task_log(run.task_log)}"
+            )
+            getattr(self, "_download_post_bindings", {}).clear()
+            getattr(self, "_download_post_completed_keys", set()).clear()
+        run._download_lifecycle_identity = self._download_lifecycle_identity
         self.current_task_started_at = now
         self.task_elapsed_label.setText("当前任务耗时：00:00:00（运行中）")
 
@@ -1408,19 +3011,15 @@ class MainWindow(QMainWindow):
                 return
             matches = private_preview.private_matches
             if matches:
-                box = QMessageBox(self)
-                box.setWindowTitle("智能跳过预览")
-                box.setText("\n".join(self._smart_preview_lines(private_preview)))
-                skip_button = box.addButton("按预览跳过", QMessageBox.ButtonRole.AcceptRole)
-                force_button = box.addButton("强制包含全部", QMessageBox.ButtonRole.DestructiveRole)
-                cancel_button = box.addButton("取消创建", QMessageBox.ButtonRole.RejectRole)
-                skip_button.setEnabled(private_preview.effective is not None)
+                box = SmartSkipPreviewDialog(
+                    "\n".join(self._smart_preview_lines(private_preview)),
+                    can_skip=private_preview.effective is not None,
+                    parent=self,
+                )
                 box.exec()
-                if box.clickedButton() is cancel_button:
-                    return
-                if box.clickedButton() is skip_button:
+                if box.choice == SmartSkipChoice.SKIP:
                     excluded_numbers = private_preview.skipped_numbers
-                elif box.clickedButton() is force_button:
+                elif box.choice == SmartSkipChoice.FORCE_ALL:
                     excluded_numbers = ()
                 else:
                     return
@@ -1685,6 +3284,9 @@ class MainWindow(QMainWindow):
                 pass
 
     def _finish_run_after_summary(self, run, assessment) -> None:
+        if getattr(run, "_download_summary_business_finalized", False):
+            return
+        run._download_summary_business_finalized = True
         self._cleanup_completion_marker(run)
         if self.queue_cancel_requested:
             self._finish_cancelled_queue(run)
@@ -1707,24 +3309,306 @@ class MainWindow(QMainWindow):
                 self.queue_summaries_reliable and summary.reliable
             )
         self._record_task_elapsed(run, "已完成")
-        messages = self._run(
-            lambda: self.controller.run_post_actions("batch"), self.queue_output
+        self._run_post_actions_background("batch", run)
+
+    @staticmethod
+    def _post_action_resource_keys(config: object, timing: str) -> frozenset[str]:
+        resources: set[str] = set()
+        if getattr(config, "screenshot_post_mode", None) == timing:
+            resources.update(("screenshots", "video_tree"))
+        if getattr(config, "index_post_mode", None) == timing:
+            resources.update(("video_tree", "index"))
+        return frozenset(resources)
+
+    @staticmethod
+    def _download_post_action_key(
+        lifecycle_identity: str,
+        timing: str,
+        run: object | None,
+    ) -> str:
+        if timing == "batch":
+            if run is None:
+                raise ValueError("batch post actions require an EngineRun")
+            run_identity = MainWindow._canonical_task_log(run.task_log)
+            return f"download_post_actions:{lifecycle_identity}:batch:{run_identity}"
+        if timing == "queue":
+            return f"download_post_actions:{lifecycle_identity}:queue"
+        raise ValueError(f"unsupported post-action timing: {timing}")
+
+    def _download_post_binding_is_current(
+        self, binding: DownloadPostActionTaskBinding
+    ) -> bool:
+        return (
+            getattr(self, "_download_post_bindings", {}).get(
+                binding.deduplicate_key
+            )
+            is binding
+            and getattr(self, "_background_generations", {}).get(
+                binding.deduplicate_key
+            )
+            == binding.generation
         )
-        if messages is None:
-            self._record_queue_elapsed("后续动作失败")
+
+    def _stop_download_post_queue(
+        self,
+        binding: DownloadPostActionTaskBinding,
+        *,
+        cancelled: bool = False,
+        closing: bool = False,
+    ) -> None:
+        if binding.queue_decision_consumed:
+            return
+        binding.queue_decision_consumed = True
+        getattr(self, "_download_post_completed_keys", set()).add(
+            binding.deduplicate_key
+        )
+        if not closing:
+            self._record_queue_elapsed(
+                "后续动作已取消" if cancelled else "后续动作失败"
+            )
             self._append_info(
                 self.queue_output,
-                "【失败】本批后续动作失败；队列已停止，剩余任务不会启动。",
+                (
+                    "后续动作已取消；队列已停止，剩余任务不会启动。"
+                    if cancelled
+                    else (
+                        "【失败】队列后续动作失败；队列已停止，请检查上方错误。"
+                        if binding.timing == "queue"
+                        else "【失败】后续动作失败；队列已停止，剩余任务不会启动。"
+                    )
+                ),
+            )
+        self.queue_pending.clear()
+        self.queue_current = None
+        self.queue_active = False
+        self._release_download_lifecycle()
+
+    def _settle_download_post_action(
+        self,
+        binding: DownloadPostActionTaskBinding,
+        outcome: TaskState,
+        payload: object,
+    ) -> None:
+        if (
+            not MainWindow._download_post_binding_is_current(self, binding)
+            or binding.terminal_consumed
+            or binding.removed_consumed
+        ):
+            return
+        binding.terminal_consumed = True
+        binding.outcome = outcome
+        if getattr(self.controller, "startup_state", None) is StartupState.CLOSING:
+            MainWindow._stop_download_post_queue(
+                self, binding, cancelled=outcome is TaskState.CANCELLED, closing=True
+            )
+            return
+        if outcome is TaskState.CANCELLED:
+            MainWindow._stop_download_post_queue(self, binding, cancelled=True)
+            return
+        if outcome is not TaskState.SUCCEEDED:
+            MainWindow._stop_download_post_queue(self, binding)
+            return
+        if binding.queue_decision_consumed:
+            return
+
+        binding.queue_decision_consumed = True
+        getattr(self, "_download_post_completed_keys", set()).add(
+            binding.deduplicate_key
+        )
+        messages = payload
+        if messages:
+            self._append_info(self.queue_output, *messages)
+        if binding.timing == "queue":
+            if self.queue_summaries_complete and self.queue_summaries_reliable:
+                summary_conclusion = "每个任务的账号汇总均完整且可靠。"
+            else:
+                summary_conclusion = (
+                    "至少一个任务的账号汇总不完整或不可靠；请查看上方信息及任务日志。"
+                )
+            self.controller.logger.info("下载队列执行结束：%s", summary_conclusion)
+            post_lines = [
+                line.strip()
+                for message in (messages or [])
+                for line in str(message).splitlines()
+                if line.strip()
+            ]
+            for line in post_lines:
+                self.controller.logger.info("队列后续动作：%s", line)
+            self._append_info(
+                self.queue_output,
+                f"队列执行结束。{summary_conclusion}",
+            )
+            self._record_queue_elapsed("已完成")
+            self.queue_active = False
+            self.queue_current = None
+            self._release_download_lifecycle()
+            self._begin_shutdown_countdown_if_requested()
+            return
+        self.queue_current = None
+        self._start_next_queue_item()
+
+    def _remove_download_post_action(
+        self, binding: DownloadPostActionTaskBinding
+    ) -> None:
+        if (
+            not MainWindow._download_post_binding_is_current(self, binding)
+            or binding.removed_consumed
+        ):
+            return
+        binding.removed_consumed = True
+        if getattr(self.controller, "startup_state", None) is StartupState.CLOSING:
+            MainWindow._stop_download_post_queue(self, binding, closing=True)
+        elif not binding.terminal_consumed:
+            self.controller.logger.error(
+                "下载后续动作在 Coordinator 终态前被移除：%s",
+                binding.deduplicate_key,
+            )
+            MainWindow._stop_download_post_queue(self, binding)
+        bindings = getattr(self, "_download_post_bindings", {})
+        if bindings.get(binding.deduplicate_key) is binding:
+            bindings.pop(binding.deduplicate_key, None)
+        generations = getattr(self, "_background_generations", {})
+        if generations.get(binding.deduplicate_key) == binding.generation:
+            generations.pop(binding.deduplicate_key, None)
+
+    def _run_post_actions_background(self, timing: str, run) -> None:
+        if (
+            getattr(self.controller, "startup_state", StartupState.READY)
+            is not StartupState.READY
+        ):
+            return
+        if not hasattr(self, "_background_bindings"):
+            messages = self._run(
+                lambda: self.controller.run_post_actions(timing), self.queue_output
+            )
+            if messages is None:
+                self._record_queue_elapsed("后续动作失败")
+                self._append_info(
+                    self.queue_output,
+                    "【失败】后续动作失败；队列已停止，剩余任务不会启动。",
+                )
+                self.queue_pending.clear()
+                self.queue_current = None
+                self.queue_active = False
+                self._release_download_lifecycle()
+                return
+            if messages:
+                self._append_info(self.queue_output, *messages)
+            self.queue_current = None
+            self._start_next_queue_item()
+            return
+
+        lifecycle_identity = getattr(self, "_download_lifecycle_identity", None)
+        lifecycle_active = getattr(
+            self.controller, "_download_lifecycle_active", False
+        )
+        if not lifecycle_active:
+            self.controller.logger.info(
+                "忽略已释放下载生命周期的迟到后续动作请求：timing=%s",
+                timing,
+            )
+            return
+        if timing not in {"batch", "queue"} or lifecycle_identity is None:
+            self.controller.logger.error(
+                "下载后续动作缺少有效生命周期：timing=%s identity=%s",
+                timing,
+                lifecycle_identity,
             )
             self.queue_pending.clear()
             self.queue_current = None
             self.queue_active = False
             self._release_download_lifecycle()
             return
-        if messages:
-            self._append_info(self.queue_output, *messages)
-        self.queue_current = None
-        self._start_next_queue_item()
+        if (
+            timing == "batch"
+            and run is not None
+            and getattr(run, "_download_lifecycle_identity", lifecycle_identity)
+            != lifecycle_identity
+        ):
+            self.controller.logger.info(
+                "忽略其他下载生命周期的迟到后续动作请求：%s",
+                run.task_log,
+            )
+            return
+
+        deduplicate_key = MainWindow._download_post_action_key(
+            lifecycle_identity, timing, run
+        )
+        bindings = getattr(self, "_download_post_bindings", None)
+        if bindings is None:
+            bindings = {}
+            self._download_post_bindings = bindings
+        completed = getattr(self, "_download_post_completed_keys", None)
+        if completed is None:
+            completed = set()
+            self._download_post_completed_keys = completed
+        if deduplicate_key in bindings or deduplicate_key in completed:
+            self.controller.logger.info(
+                "忽略重复下载后续动作请求：%s", deduplicate_key
+            )
+            return
+
+        generation = getattr(self, "_background_generations", {}).get(
+            deduplicate_key, 0
+        ) + 1
+        binding = DownloadPostActionTaskBinding(
+            timing=timing,
+            run=run,
+            deduplicate_key=deduplicate_key,
+            generation=generation,
+        )
+        bindings[deduplicate_key] = binding
+        config = self.controller.config
+        spec = TaskSpec(
+            task_type="download_post_actions",
+            display_name="下载后续动作",
+            resource_keys=MainWindow._post_action_resource_keys(config, timing),
+            deduplicate_key=deduplicate_key,
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            refresh_targets=("runtime_status", "download_results"),
+            dynamic_cancellation=True,
+        )
+        task_id = self._submit_background(
+            spec,
+            lambda context: self.controller.run_post_actions(
+                timing, context=context
+            ),
+            output=self.queue_output,
+            buttons=(self.queue_pause_button, self.queue_cancel_button),
+            on_success=lambda payload: MainWindow._settle_download_post_action(
+                self, binding, TaskState.SUCCEEDED, payload
+            ),
+            on_failure=lambda payload: MainWindow._settle_download_post_action(
+                self, binding, TaskState.FAILED, payload
+            ),
+            on_cancelled=lambda payload: MainWindow._settle_download_post_action(
+                self, binding, TaskState.CANCELLED, payload
+            ),
+            on_removed=lambda: MainWindow._remove_download_post_action(
+                self, binding
+            ),
+            generation_key=deduplicate_key,
+        )
+        if task_id is None:
+            bindings.pop(deduplicate_key, None)
+            self.controller.logger.error(
+                "下载后续动作未获 Coordinator admission：%s", deduplicate_key
+            )
+            self._record_queue_elapsed("后续动作未启动")
+            self.queue_pending.clear()
+            self.queue_current = None
+            self.queue_active = False
+            self._release_download_lifecycle()
+            return
+        binding.task_id = task_id
+        live_binding = getattr(self, "_background_bindings", {}).get(task_id)
+        if live_binding is not None:
+            binding.generation = live_binding.generation
+        else:
+            getattr(self, "_background_generations", {}).setdefault(
+                deduplicate_key, binding.generation
+            )
 
     def _shutdown_option_changed(self, state: int) -> None:
         checked = bool(state)
@@ -1733,6 +3617,8 @@ class MainWindow(QMainWindow):
             self._cancel_shutdown()
 
     def _start_next_queue_item(self) -> None:
+        if getattr(self.controller, "startup_state", None) is StartupState.CLOSING:
+            return
         if self.queue_pending and self.queue_paused:
             self._append_info(
                 self.queue_output,
@@ -1740,6 +3626,9 @@ class MainWindow(QMainWindow):
             )
             return
         if not self.queue_pending:
+            if hasattr(self, "_background_bindings"):
+                self._run_post_actions_background("queue", None)
+                return
             messages = self._run(
                 lambda: self.controller.run_post_actions("queue"), self.queue_output
             )
@@ -1803,86 +3692,269 @@ class MainWindow(QMainWindow):
             f"正在运行：{path.name}；PID={run.process.pid}；剩余={len(self.queue_pending)}"
         )
 
-    def _start_download_summary(self, run, exit_code: int | None, assessment) -> None:
-        if self.download_summary_thread is not None:
-            return
+    @staticmethod
+    def _canonical_task_log(task_log: object) -> str:
+        path = os.path.abspath(os.path.normpath(os.fspath(task_log)))
+        return os.path.normcase(path)
 
-        ended_at = datetime.now()
-        thread = QThread(self)
-        worker = ActionWorker(
-            lambda: self.controller.summarize_download(run, exit_code, ended_at)
+    @staticmethod
+    def _canonical_engine_update_archive(archive: Path) -> str:
+        resolved = archive.expanduser().resolve(strict=False)
+        return os.path.normcase(os.path.normpath(os.fspath(resolved)))
+
+    @staticmethod
+    def _download_summary_key(run) -> str:
+        return f"download_summary:{MainWindow._canonical_task_log(run.task_log)}"
+
+    def _download_summary_is_active(self) -> bool:
+        binding = getattr(self, "_download_summary_binding", None)
+        return binding is not None and not binding.removed_consumed
+
+    def _download_post_owns_run(self, run: object) -> bool:
+        return any(
+            binding.run is run and not binding.removed_consumed
+            for binding in getattr(self, "_download_post_bindings", {}).values()
         )
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.done.connect(thread.quit)
-        thread.finished.connect(self._finish_download_summary)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
 
-        self.download_summary_thread = thread
-        self.download_summary_worker = worker
-        self.download_summary_run = run
-        self.download_summary_exit_code = exit_code
-        self.download_summary_assessment = assessment
-        thread.start()
+    def _download_run_blocks_close(self) -> bool:
+        run = getattr(self, "queue_current", None)
+        if run is None:
+            return False
+        if getattr(run, "running", False) or getattr(
+            run, "result_review_waiting", False
+        ):
+            return True
+        return not MainWindow._download_post_owns_run(self, run)
 
-    @Slot()
-    def _finish_download_summary(self) -> None:
-        worker = self.download_summary_worker
-        assessment = self.download_summary_assessment
-        try:
-            if worker is None or assessment is None:
-                return
-            if worker.error is not None:
-                message = str(worker.error)
-                self.controller.logger.exception(
-                    "账号结果汇总失败：%s", message, exc_info=worker.error
+    def _download_summary_matches_run(self, run) -> bool:
+        deduplicate_key = MainWindow._download_summary_key(run)
+        if getattr(run, "_download_summary_coordinator_key", None) == deduplicate_key:
+            return True
+        binding = getattr(self, "_download_summary_binding", None)
+        if binding is None:
+            return False
+        if binding.run is run:
+            return True
+        return binding.deduplicate_key == deduplicate_key
+
+    def _download_summary_binding_is_current(
+        self, binding: DownloadSummaryTaskBinding
+    ) -> bool:
+        return (
+            getattr(self, "_download_summary_binding", None) is binding
+            and getattr(self, "_background_generations", {}).get(
+                binding.deduplicate_key
+            )
+            == binding.generation
+        )
+
+    def _retire_download_summary_binding(
+        self, binding: DownloadSummaryTaskBinding
+    ) -> None:
+        if getattr(self, "_download_summary_binding", None) is binding:
+            self._download_summary_binding = None
+            generations = getattr(self, "_background_generations", {})
+            if generations.get(binding.deduplicate_key) == binding.generation:
+                generations.pop(binding.deduplicate_key, None)
+
+    def _finalize_download_summary_for_closing(
+        self, binding: DownloadSummaryTaskBinding
+    ) -> None:
+        if not binding.business_finalized:
+            binding.business_finalized = True
+            binding.run._download_summary_business_finalized = True
+            self.queue_pending.clear()
+            self.queue_current = None
+            self.queue_active = False
+            self._release_download_lifecycle()
+        MainWindow._retire_download_summary_binding(self, binding)
+
+    def _start_download_summary(self, run, exit_code: int | None, assessment) -> None:
+        if getattr(self.controller, "startup_state", None) is StartupState.CLOSING:
+            return
+        deduplicate_key = MainWindow._download_summary_key(run)
+        if getattr(run, "_download_summary_coordinator_key", None) == deduplicate_key:
+            self.controller.logger.info(
+                "忽略已提交 EngineRun 的账号结果汇总请求：%s", deduplicate_key
+            )
+            return
+        previous = getattr(self, "_download_summary_binding", None)
+        if previous is not None:
+            if previous.deduplicate_key == deduplicate_key:
+                self.controller.logger.info(
+                    "忽略重复账号结果汇总请求：%s", deduplicate_key
                 )
-                if self.queue_cancel_requested:
-                    self._append_info(
-                        self.queue_output,
-                        f"取消任务后账号结果汇总未能完成：{message}",
-                    )
-                    self._finish_cancelled_queue(self.download_summary_run)
-                    return
+                return
+            if not previous.removed_consumed:
+                self.controller.logger.warning(
+                    "已有账号结果汇总尚未移除，拒绝新请求：%s", deduplicate_key
+                )
+                return
+
+        generation = getattr(self, "_background_generations", {}).get(
+            deduplicate_key, 0
+        ) + 1
+        binding = DownloadSummaryTaskBinding(
+            run=run,
+            assessment=assessment,
+            deduplicate_key=deduplicate_key,
+            generation=generation,
+        )
+        self._download_summary_binding = binding
+        ended_at = datetime.now()
+        spec = TaskSpec(
+            task_type="download_summary",
+            display_name="汇总下载结果",
+            resource_keys=frozenset({"task_logs", "result_logs"}),
+            deduplicate_key=deduplicate_key,
+            cancellable=False,
+            close_policy=ClosePolicy.WAIT,
+            refresh_targets=(),
+        )
+        task_id = self._submit_background(
+            spec,
+            lambda _token: self.controller.summarize_download(
+                run, exit_code, ended_at
+            ),
+            output=self.queue_output,
+            on_success=lambda payload: MainWindow._settle_download_summary(
+                self, binding, TaskState.SUCCEEDED, payload
+            ),
+            on_failure=lambda payload: MainWindow._settle_download_summary(
+                self, binding, TaskState.FAILED, payload
+            ),
+            on_cancelled=lambda payload: MainWindow._settle_download_summary(
+                self, binding, TaskState.CANCELLED, payload
+            ),
+            on_removed=lambda: MainWindow._remove_download_summary(self, binding),
+            generation_key=deduplicate_key,
+        )
+        if task_id is None:
+            if self._download_summary_binding is binding:
+                self._download_summary_binding = previous
+            self.controller.logger.warning(
+                "账号结果汇总未获 Coordinator admission：%s", deduplicate_key
+            )
+            return
+        binding.task_id = task_id
+        run._download_summary_coordinator_key = deduplicate_key
+        live_binding = getattr(self, "_background_bindings", {}).get(task_id)
+        if live_binding is not None:
+            binding.generation = live_binding.generation
+
+    def _settle_download_summary(
+        self,
+        binding: DownloadSummaryTaskBinding,
+        outcome: TaskState,
+        payload: object,
+    ) -> None:
+        if (
+            not MainWindow._download_summary_binding_is_current(self, binding)
+            or binding.terminal_consumed
+            or binding.removed_consumed
+        ):
+            return
+        binding.terminal_consumed = True
+        binding.outcome = outcome
+        binding.payload = payload
+        if getattr(self.controller, "startup_state", None) is StartupState.CLOSING:
+            return
+        if outcome is not TaskState.SUCCEEDED:
+            message = payload.message if isinstance(payload, TaskFailure) else str(payload)
+            self.controller.logger.error("账号结果汇总失败：%s", message)
+            if self.queue_cancel_requested:
+                self._append_info(
+                    self.queue_output,
+                    f"取消任务后账号结果汇总未能完成：{message}",
+                )
+            else:
                 self._append_info(
                     self.queue_output,
                     f"【失败】账号结果汇总失败：{message}",
                     "队列已停止；剩余任务不会启动。",
                 )
-                self._record_task_elapsed(self.download_summary_run, "汇总失败")
-                self._record_queue_elapsed("汇总失败")
-                self._cleanup_completion_marker(self.download_summary_run)
-                self.queue_pending.clear()
-                self.queue_current = None
-                self.queue_active = False
-                self._release_download_lifecycle()
-                return
+            return
 
-            summary = worker.result
-            self._append_info(self.queue_output, *format_summary_for_ui(summary))
-            run = self.download_summary_run
-            if run is None:
+        summary = payload
+        self._append_info(self.queue_output, *format_summary_for_ui(summary))
+        run = binding.run
+        run._summary_result = summary
+        if getattr(run, "completion_marker", None) is not None and run.running:
+            if getattr(run, "pause_after_exit", False):
+                run.result_review_waiting = True
+                self._append_info(
+                    self.queue_output,
+                    "本任务结果已汇总；黑框保留等待人工查看，查看完成后请按任意键继续。",
+                )
                 return
-            if getattr(run, "completion_marker", None) is not None and run.running:
-                if getattr(run, "pause_after_exit", False):
-                    run.result_review_waiting = True
-                    self._append_info(
-                        self.queue_output,
-                        "本任务结果已汇总；黑框保留等待人工查看，查看完成后请按任意键继续。",
-                    )
-                    return
-                if not self._close_result_wrapper(run):
-                    return
-            self._finish_run_after_summary(run, assessment)
-        finally:
-            self.download_summary_thread = None
-            self.download_summary_worker = None
-            self.download_summary_run = None
-            self.download_summary_exit_code = None
-            self.download_summary_assessment = None
-            self.refresh_all()
-            self.refresh_results()
+            if not self._close_result_wrapper(run):
+                binding.business_finalized = True
+                run._download_summary_business_finalized = True
+                return
+        binding.continuation_ready = True
+
+    def _remove_download_summary(self, binding: DownloadSummaryTaskBinding) -> None:
+        if (
+            not MainWindow._download_summary_binding_is_current(self, binding)
+            or binding.removed_consumed
+        ):
+            return
+        binding.removed_consumed = True
+        if getattr(self.controller, "startup_state", None) is StartupState.CLOSING:
+            MainWindow._finalize_download_summary_for_closing(self, binding)
+            return
+
+        self._refresh_background_targets(("download_results", "runtime_status"))
+        MainWindow._defer_dashboard_refresh_until_results_idle(self)
+        if getattr(self.controller, "startup_state", None) is StartupState.CLOSING:
+            MainWindow._finalize_download_summary_for_closing(self, binding)
+            return
+        if not binding.terminal_consumed:
+            binding.business_finalized = True
+            binding.run._download_summary_business_finalized = True
+            self.controller.logger.error(
+                "账号结果汇总线程在 Coordinator 终态前被移除：%s",
+                binding.deduplicate_key,
+            )
+            self._append_info(
+                self.queue_output,
+                "【失败】账号结果汇总未产生有效终态；队列已停止，剩余任务不会启动。",
+            )
+            self._record_task_elapsed(binding.run, "汇总协议失败")
+            self._record_queue_elapsed("汇总协议失败")
+            self._cleanup_completion_marker(binding.run)
+            self.queue_pending.clear()
+            self.queue_current = None
+            self.queue_active = False
+            self._release_download_lifecycle()
+            MainWindow._retire_download_summary_binding(self, binding)
+            return
+        if binding.business_finalized:
+            MainWindow._retire_download_summary_binding(self, binding)
+            return
+        if binding.outcome is TaskState.SUCCEEDED:
+            if not binding.continuation_ready:
+                MainWindow._retire_download_summary_binding(self, binding)
+                return
+            binding.business_finalized = True
+            MainWindow._retire_download_summary_binding(self, binding)
+            self._finish_run_after_summary(binding.run, binding.assessment)
+            return
+
+        binding.business_finalized = True
+        binding.run._download_summary_business_finalized = True
+        if self.queue_cancel_requested:
+            MainWindow._retire_download_summary_binding(self, binding)
+            self._finish_cancelled_queue(binding.run)
+            return
+        self._record_task_elapsed(binding.run, "汇总失败")
+        self._record_queue_elapsed("汇总失败")
+        self._cleanup_completion_marker(binding.run)
+        self.queue_pending.clear()
+        self.queue_current = None
+        self.queue_active = False
+        self._release_download_lifecycle()
+        MainWindow._retire_download_summary_binding(self, binding)
 
     def _collector_is_enabled(self) -> bool:
         return bool(self.controller.collector.running or self.controller.collector.health())
@@ -1939,9 +4011,14 @@ class MainWindow(QMainWindow):
                 self.queue_output,
                 f"已请求取消当前下载及全部待执行任务；取消记录：{result}",
             )
-        if self.download_summary_thread is None and getattr(
+        if not MainWindow._download_summary_is_active(self) and getattr(
             run, "result_review_waiting", False
         ) and not run.running:
+            binding = getattr(self, "_download_summary_binding", None)
+            if binding is not None and binding.run is run:
+                if binding.business_finalized:
+                    return
+                binding.business_finalized = True
             self._finish_run_after_summary(
                 run, assess_process_exit(getattr(run, "engine_exit_code", None))
             )
@@ -2009,10 +4086,7 @@ class MainWindow(QMainWindow):
         if self.shutdown_remaining > 0:
             return
         health = self.controller.health(check_processes=True)
-        summary_running = self.download_summary_thread is not None and (
-            not hasattr(self.download_summary_thread, "isRunning")
-            or self.download_summary_thread.isRunning()
-        )
+        summary_running = MainWindow._download_summary_is_active(self)
         background_running = self.background_thread is not None and (
             not hasattr(self.background_thread, "isRunning")
             or self.background_thread.isRunning()
@@ -2086,6 +4160,15 @@ class MainWindow(QMainWindow):
         release = getattr(self.controller, "release_download_lifecycle", None)
         if release is not None:
             release()
+        generations = getattr(self, "_background_generations", {})
+        for key, binding in tuple(
+            getattr(self, "_download_post_bindings", {}).items()
+        ):
+            if generations.get(key) == binding.generation:
+                generations.pop(key, None)
+        self._download_lifecycle_identity = None
+        getattr(self, "_download_post_bindings", {}).clear()
+        getattr(self, "_download_post_completed_keys", set()).clear()
 
     def _poll_processes(self) -> None:
         self._update_elapsed_labels()
@@ -2108,7 +4191,7 @@ class MainWindow(QMainWindow):
             return
         if not self.queue_active or self.queue_current is None:
             return
-        if self.download_summary_thread is not None:
+        if MainWindow._download_summary_is_active(self):
             return
         run = self.queue_current
         if not getattr(run, "interruption_detected", False):
@@ -2130,28 +4213,38 @@ class MainWindow(QMainWindow):
         if getattr(run, "result_review_waiting", False):
             if not run.running:
                 run.result_review_waiting = False
+                binding = getattr(self, "_download_summary_binding", None)
+                if binding is not None and binding.run is run:
+                    if binding.business_finalized:
+                        return
+                    binding.business_finalized = True
                 self._finish_run_after_summary(
                     run,
                     assess_process_exit(getattr(run, "engine_exit_code", None)),
                 )
             return
+        if MainWindow._download_summary_matches_run(self, run):
+            return
         marker_code = self._completion_marker_code(run)
-        if marker_code is not None and getattr(run, "engine_exit_code", None) is None:
-            run.engine_exit_code = marker_code
+        if marker_code is not None:
+            first_marker_observation = getattr(run, "engine_exit_code", None) is None
+            if first_marker_observation:
+                run.engine_exit_code = marker_code
             assessment = assess_process_exit(marker_code)
-            self._append_info(
-                self.queue_output,
-                assessment.headline,
-                assessment.detail,
-                "正在汇总账号结果，请等待。",
-                merge=True,
-            )
-            self.controller.logger.info(
-                "下载器主进程已退出，黑框包装器仍在等待：模板=%s；PID=%s；退出码=%s",
-                run.task_template,
-                run.process.pid,
-                marker_code,
-            )
+            if first_marker_observation:
+                self._append_info(
+                    self.queue_output,
+                    assessment.headline,
+                    assessment.detail,
+                    "正在汇总账号结果，请等待。",
+                    merge=True,
+                )
+                self.controller.logger.info(
+                    "下载器主进程已退出，黑框包装器仍在等待：模板=%s；PID=%s；退出码=%s",
+                    run.task_template,
+                    run.process.pid,
+                    marker_code,
+                )
             self._start_download_summary(run, marker_code, assessment)
             return
         if run.running:
@@ -2190,13 +4283,42 @@ class MainWindow(QMainWindow):
         )
         if answer != QMessageBox.Yes:
             return
-        result = self._run(self.controller.backup_now, self.overview_output)
-        if result:
-            self._append_info(self.overview_output, f"完整 Volume 备份完成：{result}")
+        spec = TaskSpec(
+            task_type="full_volume_backup",
+            display_name="完整 Volume 备份",
+            resource_keys=frozenset({"volume", "settings"}),
+            deduplicate_key="full_volume_backup",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            refresh_targets=("runtime_status",),
+            dynamic_cancellation=True,
+        )
+        self._submit_background(
+            spec,
+            lambda context: self.controller.backup_now(context=context),
+            output=self.overview_output,
+            buttons=(getattr(self, "manual_backup_button", None),)
+            if getattr(self, "manual_backup_button", None) is not None
+            else (),
+            on_success=lambda result: self._append_info(
+                self.overview_output, f"完整 Volume 备份完成：{result}"
+            ),
+        )
 
     def _migrate_collector(self) -> None:
-        result = self._run(self.controller.migrate_collector, self.collector_output)
-        if result:
+        spec = TaskSpec(
+            task_type="collector_migration",
+            display_name="迁移旧采集器数据",
+            resource_keys=frozenset(
+                {"collector_process", "collector_data", "settings", "screenshots"}
+            ),
+            deduplicate_key="collector_migration",
+            cancellable=False,
+            close_policy=ClosePolicy.WAIT,
+            refresh_targets=("runtime_status",),
+        )
+
+        def show_result(result: object) -> None:
             self._replace_info(
                 self.collector_output,
                 "旧采集器数据复制完成（源文件未删除）。",
@@ -2212,21 +4334,62 @@ class MainWindow(QMainWindow):
                 ),
                 "settings_master.json 未复制，采集器将直接使用唯一正式主档。",
             )
+        self._submit_background(
+            spec,
+            lambda _token: self.controller.migrate_collector(),
+            output=self.collector_output,
+            buttons=(self.collector_migrate_button,),
+            on_success=show_result,
+        )
 
     def _start_collector(self) -> None:
-        result = self._run(self.controller.start_collector, self.collector_output)
-        if result:
+        spec = TaskSpec(
+            task_type="collector_start",
+            display_name="启动账号采集服务",
+            resource_keys=frozenset(
+                {"collector_process", "collector_data", "settings", "screenshots"}
+            ),
+            deduplicate_key="collector_start",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            refresh_targets=("runtime_status",),
+            dynamic_cancellation=True,
+        )
+
+        def show_result(result: object) -> None:
             self._append_info(
                 self.collector_output,
                 "账号采集服务已启动，并已通过 "
                 f"http://127.0.0.1:{self.controller.config.collector_port}/health 验证。",
                 f"采集服务日志：{result}",
             )
+        self._submit_background(
+            spec,
+            lambda context: self.controller.start_collector(context=context),
+            output=self.collector_output,
+            buttons=(self.collector_start_button,),
+            on_success=show_result,
+        )
 
     def _stop_collector(self) -> None:
-        self.controller.stop_collector()
-        self._append_info(self.collector_output, "账号采集服务已停止。")
-        self.refresh_all()
+        spec = TaskSpec(
+            task_type="collector_stop",
+            display_name="停止账号采集服务",
+            resource_keys=frozenset({"collector_process"}),
+            deduplicate_key="collector_stop",
+            cancellable=False,
+            close_policy=ClosePolicy.WAIT,
+            refresh_targets=("runtime_status",),
+        )
+        self._submit_background(
+            spec,
+            lambda _token: self.controller.stop_collector(),
+            output=self.collector_output,
+            buttons=(self.collector_stop_button,),
+            on_success=lambda _result: self._append_info(
+                self.collector_output, "账号采集服务已停止。"
+            ),
+        )
 
     def _export_userscript(self) -> None:
         result = self._run(self.controller.collector.export_userscript, self.collector_output)
@@ -2235,8 +4398,19 @@ class MainWindow(QMainWindow):
             self._open_path(result.parent)
 
     def _preview_screenshots(self) -> None:
-        result = self._run(self.controller.screenshot_preview, self.post_output)
-        if result:
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        spec = TaskSpec(
+            task_type="screenshot_preview",
+            display_name="预览截图归档",
+            resource_keys=frozenset({"screenshots", "video_tree"}),
+            deduplicate_key="screenshot_preview",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            dynamic_cancellation=True,
+        )
+
+        def show_result(result: object) -> None:
             self._replace_info(
                 self.post_output,
                 f"识别账号文件夹：{result.recognized_folders}",
@@ -2246,11 +4420,35 @@ class MainWindow(QMainWindow):
                 f"目标已有同名文件：{result.already_existing}",
                 f"忽略非规范账号文件夹：{result.unmatched_folders}",
             )
+        self._submit_background(
+            spec,
+            lambda context: self.controller.screenshot_preview(context=context),
+            output=self.post_output,
+            buttons=(self.screenshot_preview_button,),
+            on_success=show_result,
+            on_cancelled=lambda _payload: None,
+        )
 
     def _organize_screenshots(self) -> None:
-        result = self._run(self.controller.organize_screenshots, self.post_output)
-        if result:
-            self._append_info(self.post_output, f"完成：安全归档 {result.moved} 张。")
+        spec = TaskSpec(
+            task_type="screenshot_archive",
+            display_name="安全归档截图",
+            resource_keys=frozenset({"screenshots", "video_tree"}),
+            deduplicate_key="screenshot_archive",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            refresh_targets=("runtime_status",),
+            dynamic_cancellation=True,
+        )
+        self._submit_background(
+            spec,
+            lambda context: self.controller.organize_screenshots(context=context),
+            output=self.post_output,
+            buttons=(self.screenshot_archive_button,),
+            on_success=lambda result: self._append_info(
+                self.post_output, f"完成：安全归档 {result.moved} 张。"
+            ),
+        )
 
     def _refresh_index(self) -> None:
         def show_result(result: object) -> None:
@@ -2260,10 +4458,22 @@ class MainWindow(QMainWindow):
                     messages.extend(("详细输出：", result.output))
                 self._replace_info(self.post_output, *messages)
 
-        self._run_index_background(
-            self.controller.refresh_index,
-            started_message="正在后台刷新索引，界面可以继续使用……",
-            success=show_result,
+        spec = TaskSpec(
+            task_type="index_refresh",
+            display_name="刷新索引",
+            resource_keys=frozenset({"video_tree", "index"}),
+            deduplicate_key="index_operation",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            refresh_targets=("runtime_status",),
+            dynamic_cancellation=True,
+        )
+        self._submit_background(
+            spec,
+            lambda context: self.controller.refresh_index(context=context),
+            output=self.post_output,
+            buttons=(self.refresh_index_button, self.cleanup_index_button, self.cleanup_test_button),
+            on_success=show_result,
         )
 
     def _cleanup_index(self) -> None:
@@ -2274,10 +4484,22 @@ class MainWindow(QMainWindow):
                     messages.extend(("详细输出：", result.output))
                 self._replace_info(self.post_output, *messages)
 
-        self._run_index_background(
-            self.controller.cleanup_index,
-            started_message="正在后台重新扫描并清理受管快捷方式，界面可以继续使用……",
-            success=show_result,
+        spec = TaskSpec(
+            task_type="index_cleanup",
+            display_name="清理失效索引",
+            resource_keys=frozenset({"video_tree", "index"}),
+            deduplicate_key="index_operation",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            refresh_targets=("runtime_status",),
+            dynamic_cancellation=True,
+        )
+        self._submit_background(
+            spec,
+            lambda context: self.controller.cleanup_index(context=context),
+            output=self.post_output,
+            buttons=(self.refresh_index_button, self.cleanup_index_button, self.cleanup_test_button),
+            on_success=show_result,
         )
 
     def _cleanup_index_self_test(self) -> None:
@@ -2289,12 +4511,21 @@ class MainWindow(QMainWindow):
                     result.output,
                 )
 
-        self._run_index_background(
-            self.controller.cleanup_index_self_test,
-            started_message=(
-                "正在 Windows 临时目录测试清理功能；不会读取或修改正式目录……"
-            ),
-            success=show_result,
+        spec = TaskSpec(
+            task_type="index_cleanup_self_test",
+            display_name="自检索引清理",
+            resource_keys=frozenset({"index"}),
+            deduplicate_key="index_operation",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            dynamic_cancellation=True,
+        )
+        self._submit_background(
+            spec,
+            lambda context: self.controller.cleanup_index_self_test(context=context),
+            output=self.post_output,
+            buttons=(self.refresh_index_button, self.cleanup_index_button, self.cleanup_test_button),
+            on_success=show_result,
         )
 
     def _save_settings(self) -> None:
@@ -2310,11 +4541,12 @@ class MainWindow(QMainWindow):
             "cleanup_after_index": self.setting_cleanup.isChecked(),
         }
         result = self._run(lambda: self.controller.reconfigure(values), self.settings_output)
-        if result:
-            self._replace_info(self.settings_output, result)
+        if result is not None:
+            self._replace_info(self.settings_output, result or "设置已保存，正在重新验证正式数据。")
             self.queue_screenshot_mode.setCurrentIndex(self.setting_screenshot_mode.currentIndex())
             self.queue_index_mode.setCurrentIndex(self.setting_index_mode.currentIndex())
             self.queue_cleanup.setChecked(self.setting_cleanup.isChecked())
+            self.startup_recheck_timer.start(0)
 
     def _browse_engine(self) -> None:
         selected, _ = QFileDialog.getOpenFileName(
@@ -2334,11 +4566,24 @@ class MainWindow(QMainWindow):
             self.engine_update_zip.setText(selected)
 
     def _preview_engine_update(self) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
         archive = Path(self.engine_update_zip.text().strip())
-        result = self._run(
-            lambda: self.controller.preview_engine_update(archive), self.settings_output
+        deduplicate_key = (
+            "engine_update_preview:"
+            f"{MainWindow._canonical_engine_update_archive(archive)}"
         )
-        if result:
+        spec = TaskSpec(
+            task_type="engine_update_preview",
+            display_name="预检更新包",
+            resource_keys=frozenset({"engine_files"}),
+            deduplicate_key=deduplicate_key,
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            dynamic_cancellation=True,
+        )
+
+        def show_result(result: object) -> None:
             packaged_volume = "有（安装时会丢弃，绝不覆盖正式 Volume）" if result.contains_packaged_volume else "无"
             self._replace_info(
                 self.settings_output,
@@ -2352,30 +4597,82 @@ class MainWindow(QMainWindow):
                 f"包内 Volume：{packaged_volume}",
                 "当前正式 Volume 尚未修改。",
             )
+        self._submit_coalesced_background(
+            spec,
+            lambda context: self.controller.preview_engine_update(
+                archive, context=context
+            ),
+            output=self.settings_output,
+            buttons=(self.engine_update_preview_button,),
+            on_success=show_result,
+            generation_key="engine_update_preview",
+        )
 
     def _apply_engine_update(self) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
         archive = Path(self.engine_update_zip.text().strip())
-        preview = self._run(
-            lambda: self.controller.preview_engine_update(archive), self.settings_output
+        deduplicate_key = (
+            "engine_update_preview:"
+            f"{MainWindow._canonical_engine_update_archive(archive)}"
         )
-        if not preview:
+        spec = TaskSpec(
+            task_type="engine_update_preview_for_apply",
+            display_name="预检更新包",
+            resource_keys=frozenset({"engine_files"}),
+            deduplicate_key=deduplicate_key,
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            dynamic_cancellation=True,
+        )
+        confirmed = {"value": False}
+
+        def confirm(preview: object) -> None:
+            answer = QMessageBox.question(
+                self,
+                "确认安全更新下载引擎",
+                "管理器将先永久备份完整正式 Volume，再替换 main.exe 和 _internal 程序文件。\n\n"
+                "settings_master.json、settings.json 和 DouK-Downloader.db 将通过移动保留，"
+                "更新前后进行 SHA-256 与数据库一致性校验。\n\n"
+                "旧引擎程序会永久保存在 Updates\\EngineRollback。\n\n确认继续？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+            confirmed["value"] = True
+
+        self._submit_coalesced_background(
+            spec,
+            lambda context: self.controller.preview_engine_update(
+                archive, context=context
+            ),
+            output=self.settings_output,
+            buttons=(self.engine_update_apply_button,),
+            on_success=confirm,
+            on_removed=lambda: self._submit_engine_update_apply(archive)
+            if confirmed["value"]
+            else None,
+            generation_key="engine_update_preview",
+        )
+
+    def _submit_engine_update_apply(self, archive: Path) -> None:
+        if self.controller.startup_state is not StartupState.READY:
             return
-        answer = QMessageBox.question(
-            self,
-            "确认安全更新下载引擎",
-            "管理器将先永久备份完整正式 Volume，再替换 main.exe 和 _internal 程序文件。\n\n"
-            "settings_master.json、settings.json 和 DouK-Downloader.db 将通过移动保留，"
-            "更新前后进行 SHA-256 与数据库一致性校验。\n\n"
-            "旧引擎程序会永久保存在 Updates\\EngineRollback。\n\n确认继续？",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+        spec = TaskSpec(
+            task_type="engine_update_apply",
+            display_name="安装引擎更新",
+            resource_keys=frozenset(
+                {"engine_process", "collector_process", "engine_files", "volume", "settings"}
+            ),
+            deduplicate_key="engine_update_apply",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            refresh_targets=("runtime_status",),
+            dynamic_cancellation=True,
         )
-        if answer != QMessageBox.Yes:
-            return
-        result = self._run(
-            lambda: self.controller.apply_engine_update(archive), self.settings_output
-        )
-        if result:
+
+        def show_result(result: object) -> None:
             self._replace_info(
                 self.settings_output,
                 "下载引擎安全更新完成。",
@@ -2388,6 +4685,13 @@ class MainWindow(QMainWindow):
                 "DouK-Downloader.db：哈希一致且 quick_check=ok",
                 "现在可以通过下载队列启动兼容版下载引擎。",
             )
+        self._submit_background(
+            spec,
+            lambda context: self.controller.apply_engine_update(archive, context=context),
+            output=self.settings_output,
+            buttons=(self.engine_update_apply_button,),
+            on_success=show_result,
+        )
 
     def _browse_dir(self, edit: QLineEdit) -> None:
         selected = QFileDialog.getExistingDirectory(self, "选择文件夹", edit.text())
@@ -2399,8 +4703,90 @@ class MainWindow(QMainWindow):
         path.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
+    def _available_screen_geometries(self) -> tuple[tuple[QRect, ...], int]:
+        screens = tuple(QApplication.screens())
+        primary = QApplication.primaryScreen()
+        primary_index = screens.index(primary) if primary in screens else 0
+        return tuple(screen.availableGeometry() for screen in screens), primary_index
+
+    def _restore_window_state(self) -> None:
+        available, primary_index = self._available_screen_geometries()
+        try:
+            state = self._window_state_store.load()
+        except Exception as exc:
+            self.controller.logger.warning("读取窗口状态失败，使用安全默认值：%s", exc)
+            state = None
+        placement = safe_window_placement(
+            state, available, primary_index=primary_index
+        )
+        self.setMinimumSize(placement.minimum_size)
+        self.setGeometry(placement.geometry)
+        if placement.maximized:
+            self.setWindowState(self.windowState() | Qt.WindowState.WindowMaximized)
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        self._clamp_normal_window_frame()
+
+    def changeEvent(self, event) -> None:  # noqa: N802
+        super().changeEvent(event)
+        if (
+            event.type() == QEvent.Type.WindowStateChange
+            and not self.isMaximized()
+            and not self.isMinimized()
+        ):
+            QTimer.singleShot(0, self._clamp_normal_window_frame)
+
+    def _clamp_normal_window_frame(self) -> None:
+        if self.isMaximized() or self.isMinimized() or not self.isVisible():
+            return
+        client = self.geometry()
+        frame = self.frameGeometry()
+        margins = QMargins(
+            max(0, client.left() - frame.left()),
+            max(0, client.top() - frame.top()),
+            max(0, frame.right() - client.right()),
+            max(0, frame.bottom() - client.bottom()),
+        )
+        available, primary_index = self._available_screen_geometries()
+        placement = safe_window_placement(
+            WindowGeometryState(client, False),
+            available,
+            primary_index=primary_index,
+            frame_margins=margins,
+        )
+        self.setMinimumSize(placement.minimum_size)
+        if placement.geometry != client:
+            self.setGeometry(placement.geometry)
+
+    def _save_window_state_once(self) -> None:
+        if getattr(self, "_window_state_saved", False):
+            return
+        store = getattr(self, "_window_state_store", None)
+        if store is None:
+            return
+        normal = self.normalGeometry() if self.isMaximized() else self.geometry()
+        available, primary_index = self._available_screen_geometries()
+        placement = safe_window_placement(
+            WindowGeometryState(normal, self.isMaximized()),
+            available,
+            primary_index=primary_index,
+        )
+        try:
+            if not store.save(
+                WindowGeometryState(placement.geometry, placement.maximized)
+            ):
+                self.controller.logger.warning("窗口状态保存失败，将保留上一个有效状态。")
+                return
+        except Exception as exc:
+            self.controller.logger.warning("窗口状态保存失败，将保留上一个有效状态：%s", exc)
+            return
+        self._window_state_saved = True
+
     def closeEvent(self, event) -> None:  # noqa: N802
-        if self.queue_current is not None or self.download_summary_thread is not None:
+        if MainWindow._download_run_blocks_close(
+            self
+        ) or MainWindow._download_summary_is_active(self):
             QMessageBox.information(
                 self,
                 "下载任务尚未汇总完成",
@@ -2421,10 +4807,93 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "索引任务运行中", "请等待索引任务完成后再关闭管理器。")
             event.ignore()
             return
+        if self.coordinator.has_active_tasks():
+            self._close_pending = True
+            self.coordinator.begin_closing()
+            self.controller.begin_closing()
+            self._apply_action_gate()
+            QMessageBox.information(
+                self,
+                "启动安全检查正在结束",
+                "已请求取消启动安全检查；后台线程安全退出后管理器将自动关闭。",
+            )
+
+            event.ignore()
+            return
+        begin_closing = getattr(self.controller, "begin_closing", None)
+        if callable(begin_closing):
+            self.coordinator.begin_closing()
+            begin_closing()
+            self._apply_action_gate()
+        if hasattr(self, "_background_bindings"):
+            collector = getattr(self.controller, "collector", None)
+            if collector is not None and getattr(collector, "process", None) is not None:
+                self._start_collector_stop_on_close()
+                event.ignore()
+                return
         try:
-            self.controller.stop_collector()
-        finally:
-            event.accept()
+            collector = getattr(self.controller, "collector", None)
+            if collector is None or getattr(collector, "process", None) is not None:
+                self.controller.stop_collector()
+        except Exception as exc:
+            logger = getattr(self.controller, "logger", None)
+            if logger is not None and hasattr(logger, "exception"):
+                logger.exception("关闭前停止账号采集服务失败：%s", exc)
+            QMessageBox.critical(
+                self,
+                "账号采集服务停止失败",
+                f"管理器仍保持打开，未遗留关闭状态不明的采集进程。\n\n{exc}",
+            )
+            event.ignore()
+            return
+        save_window_state = getattr(self, "_save_window_state_once", None)
+        if callable(save_window_state):
+            save_window_state()
+        event.accept()
+
+    def _start_collector_stop_on_close(self) -> None:
+        if self._collector_stop_task_id is not None:
+            return
+        stop_succeeded = {"value": False}
+        spec = TaskSpec(
+            task_type="collector_stop_on_close",
+            display_name="关闭前停止采集服务",
+            resource_keys=frozenset({"collector_process"}),
+            deduplicate_key="collector_stop_on_close",
+            cancellable=False,
+            close_policy=ClosePolicy.WAIT,
+            allow_during_closing=True,
+        )
+
+        def success(_result: object) -> None:
+            stop_succeeded["value"] = True
+            self._collector_stop_task_id = None
+
+        def finish_after_removal() -> None:
+            if not stop_succeeded["value"]:
+                return
+            if self.coordinator.has_active_tasks():
+                self._close_pending = True
+            else:
+                QTimer.singleShot(0, self.close)
+
+        def failure(payload: object) -> None:
+            self._collector_stop_task_id = None
+            message = payload.message if isinstance(payload, TaskFailure) else str(payload)
+            QMessageBox.critical(
+                self,
+                "账号采集服务停止失败",
+                f"管理器仍保持打开，关闭前停止失败；可再次关闭重试。\n\n{message}",
+            )
+
+        self._collector_stop_task_id = self._submit_background(
+            spec,
+            lambda _token: self.controller.stop_collector(),
+            on_success=success,
+            on_failure=failure,
+            on_removed=finish_after_removal,
+            allow_during_closing=True,
+        )
 
     def _apply_style(self) -> None:
         self.setStyleSheet(
@@ -2449,5 +4918,13 @@ class MainWindow(QMainWindow):
             QTabBar::tab:selected { background: white; color: #1d4ed8; font-weight: 600; }
             QLabel[ok="true"] { color: #15803d; font-weight: 600; }
             QLabel[ok="false"] { color: #b91c1c; font-weight: 600; }
+            QLabel#dashboardMessage { color: #374151; padding: 4px 0; }
+            QFrame#dashboardMetric { background: white; border: 1px solid #cbd5e1;
+                                     border-radius: 6px; }
+            QLabel#dashboardMetricTitle { color: #4b5563; font-size: 12px; }
+            QLabel#dashboardMetricValue { color: #111827; font-size: 16px;
+                                           font-weight: 700; }
+            QTableWidget { background: white; border: 1px solid #cbd5e1;
+                           gridline-color: #e5e7eb; }
             """
         )

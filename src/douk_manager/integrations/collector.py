@@ -10,11 +10,16 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from openpyxl import load_workbook
 
 from douk_manager.config import AppConfig, ManagedPaths, project_root, resource_path
 from douk_manager.core.json_store import read_json
+from douk_manager.operation import TaskCancelled
+
+if TYPE_CHECKING:
+    from douk_manager.operation import OperationContext
 
 
 class CollectorServiceError(RuntimeError):
@@ -57,7 +62,9 @@ class CollectorService:
         except Exception:
             return False
 
-    def start(self) -> None:
+    def start(self, *, context: OperationContext | None = None) -> None:
+        if context is not None:
+            context.raise_if_cancelled()
         if self.running:
             raise CollectorServiceError("账号采集服务已经在运行。")
         if self.process is not None:
@@ -117,12 +124,23 @@ class CollectorService:
         except OSError as exc:
             self._close_log_handle()
             raise CollectorServiceError(f"无法启动账号采集服务：{exc}") from exc
-        self._wait_until_ready(log_path)
+        try:
+            self._wait_until_ready(log_path, context=context)
+        except TaskCancelled:
+            self.stop()
+            raise
 
-    def _wait_until_ready(self, log_path: Path) -> None:
+    def _wait_until_ready(
+        self,
+        log_path: Path,
+        *,
+        context: OperationContext | None = None,
+    ) -> None:
         """Only report success after the HTTP service is genuinely reachable."""
         deadline = time.monotonic() + self.STARTUP_TIMEOUT_SECONDS
         while True:
+            if context is not None:
+                context.raise_if_cancelled()
             process = self.process
             if process is None:
                 raise CollectorServiceError("账号采集服务进程状态丢失，启动已取消。")
@@ -138,6 +156,8 @@ class CollectorService:
                     f"{details or '日志中没有输出。'}"
                 )
             if self.health(timeout=0.35):
+                if context is not None:
+                    context.enter_critical_phase()
                 return
             if time.monotonic() >= deadline:
                 self.stop()

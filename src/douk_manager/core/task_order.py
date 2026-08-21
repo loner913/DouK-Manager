@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
 
 from douk_manager.config import ManagedPaths
 from douk_manager.core.json_store import read_json, write_json_atomic
+from douk_manager.operation import TaskCancelled
+
+if TYPE_CHECKING:
+    from douk_manager.operation import OperationContext
 
 
 class TaskOrderError(RuntimeError):
@@ -16,7 +20,16 @@ _A_NUMBER = re.compile(r"A\s*0*(\d+)", re.IGNORECASE)
 _FALLBACK_SLOT = 2_147_483_647
 
 
-def task_start_number(path: Path) -> int:
+def _checkpoint(context: OperationContext | None) -> None:
+    if context is not None:
+        context.raise_if_cancelled()
+
+
+def task_start_number(
+    path: Path,
+    *,
+    context: OperationContext | None = None,
+) -> int:
     """Return the first enabled account position used by a task template.
 
     Generated task JSON files explicitly store an ``enable`` flag for every
@@ -25,15 +38,24 @@ def task_start_number(path: Path) -> int:
     hand-written templates that cannot be parsed.
     """
 
+    _checkpoint(context)
+    enabled_number: int | None = None
     try:
         document = read_json(path)
         accounts = document.get("accounts_urls")
         if isinstance(accounts, list):
             for number, account in enumerate(accounts, start=1):
                 if isinstance(account, dict) and bool(account.get("enable", True)):
-                    return number
+                    enabled_number = number
+                    break
+    except TaskCancelled:
+        raise
     except Exception:
         pass
+    _checkpoint(context)
+
+    if enabled_number is not None:
+        return enabled_number
 
     match = _A_NUMBER.search(path.stem)
     if match:
@@ -67,10 +89,17 @@ class TaskOrderService:
         self.state_path = paths.data / "task_order.json"
         self.last_warning = ""
 
-    def list_tasks(self) -> tuple[Path, ...]:
+    def list_tasks(
+        self,
+        *,
+        context: OperationContext | None = None,
+    ) -> tuple[Path, ...]:
+        _checkpoint(context)
         self.paths.tasks.mkdir(parents=True, exist_ok=True)
+        _checkpoint(context)
         tasks = tuple(self.paths.tasks.glob("*.json"))
-        entries = self._load_entries()
+        _checkpoint(context)
+        entries = self._load_entries(context=context)
         task_by_name = {path.name: path for path in tasks}
         surviving = [entry for entry in entries if entry["name"] in task_by_name]
         if len(surviving) != len(entries):
@@ -78,7 +107,11 @@ class TaskOrderService:
             # while ensuring a later same-name recreation uses its natural A
             # position instead of inheriting a deleted record.
             surviving_slots = sorted(
-                task_start_number(task_by_name[entry["name"]]) for entry in surviving
+                task_start_number(
+                    task_by_name[entry["name"]],
+                    context=context,
+                )
+                for entry in surviving
             )
             entries = [
                 {"name": entry["name"], "slot": surviving_slots[index]}
@@ -89,6 +122,7 @@ class TaskOrderService:
 
         records: list[tuple[int, int, Any, str, Path]] = []
         for path in tasks:
+            _checkpoint(context)
             name = path.name
             if name in saved_slots:
                 records.append(
@@ -99,15 +133,25 @@ class TaskOrderService:
                 # already contains manually positioned tasks, it follows that
                 # existing group instead of disturbing their relative order.
                 records.append(
-                    (task_start_number(path), 1, name.casefold(), name.casefold(), path)
+                    (
+                        task_start_number(path, context=context),
+                        1,
+                        name.casefold(),
+                        name.casefold(),
+                        path,
+                    )
                 )
+            _checkpoint(context)
 
+        _checkpoint(context)
         records.sort(key=lambda record: record[:4])
+        _checkpoint(context)
         ordered = tuple(record[4] for record in records)
         normalized = [
             {"name": record[4].name, "slot": int(record[0])} for record in records
         ]
-        self._save_entries(normalized)
+        _checkpoint(context)
+        self._save_entries(normalized, context=context)
         return ordered
 
     def save_manual_order(self, ordered_paths: Iterable[Path]) -> tuple[Path, ...]:
@@ -150,12 +194,27 @@ class TaskOrderService:
         )
         return ordered
 
-    def _load_entries(self) -> list[dict[str, Any]]:
+    def _load_entries(
+        self,
+        *,
+        context: OperationContext | None = None,
+    ) -> list[dict[str, Any]]:
         self.last_warning = ""
+        _checkpoint(context)
         if not self.state_path.is_file():
+            _checkpoint(context)
             return []
         try:
             document = read_json(self.state_path)
+        except TaskCancelled:
+            raise
+        except Exception as exc:
+            _checkpoint(context)
+            self.last_warning = f"任务顺序记录无效，已恢复按 A 编号排序：{exc}"
+            return []
+        _checkpoint(context)
+
+        try:
             if document.get("version") != self.VERSION:
                 raise TaskOrderError("顺序记录版本无效")
             raw_entries = document.get("entries")
@@ -181,17 +240,39 @@ class TaskOrderService:
                     raise TaskOrderError("顺序记录项内容无效")
                 seen.add(name)
                 result.append({"name": name, "slot": slot})
-            return result
+        except TaskCancelled:
+            raise
         except Exception as exc:
+            _checkpoint(context)
             self.last_warning = f"任务顺序记录无效，已恢复按 A 编号排序：{exc}"
             return []
+        _checkpoint(context)
+        return result
 
-    def _save_entries(self, entries: list[dict[str, Any]]) -> None:
+    def _save_entries(
+        self,
+        entries: list[dict[str, Any]],
+        *,
+        context: OperationContext | None = None,
+    ) -> None:
         document = {"version": self.VERSION, "entries": entries}
+        _checkpoint(context)
         if self.state_path.is_file():
             try:
-                if read_json(self.state_path) == document:
-                    return
+                current = read_json(self.state_path)
+            except TaskCancelled:
+                raise
             except Exception:
-                pass
+                _checkpoint(context)
+            else:
+                _checkpoint(context)
+                unchanged = current == document
+                _checkpoint(context)
+                if unchanged:
+                    return
+        else:
+            _checkpoint(context)
+        if context is not None:
+            context.raise_if_cancelled()
+            context.enter_critical_phase()
         write_json_atomic(self.state_path, document)
