@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -51,6 +52,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from douk_manager.config import validate_request_avg_delay
 from douk_manager.controller import ManagerController
 from douk_manager.background import (
     BackgroundTaskCoordinator,
@@ -1366,6 +1368,15 @@ class MainWindow(QMainWindow):
         form = QFormLayout(task_box)
         self.setting_batch_accounts = self._spin(1, 100000, self.controller.config.batch_accounts)
         self.setting_rest_seconds = self._spin(0, 86400, self.controller.config.rest_seconds)
+        self.setting_request_avg_delay = self._double_spin(
+            getattr(self.controller.config, "request_avg_delay", 6.0)
+        )
+        request_avg_delay_tip = (
+            "默认6秒，实际等待按对数正态分布随机变化，最短0.5秒。保存后无需重启管理程序，"
+            "从下一次启动下载任务生效，当前任务保持原值。此设置仅调整正常数据请求成功后的等待；"
+            "失败重试等待和每批账号暂停规则保持不变。"
+        )
+        self.setting_request_avg_delay.setToolTip(request_avg_delay_tip)
         self.setting_screenshot_mode = self._post_combo(self.controller.config.screenshot_post_mode)
         self.setting_index_mode = self._post_combo(self.controller.config.index_post_mode)
         self.setting_cleanup = QCheckBox("刷新索引后再次扫描并重试清理")
@@ -1375,6 +1386,9 @@ class MainWindow(QMainWindow):
         )
         form.addRow("每批账号数", self.setting_batch_accounts)
         form.addRow("暂停秒数", self.setting_rest_seconds)
+        delay_label = QLabel("数据请求成功后等待均值（秒）")
+        delay_label.setToolTip(request_avg_delay_tip)
+        form.addRow(delay_label, self.setting_request_avg_delay)
         form.addRow("默认截图归档", self.setting_screenshot_mode)
         form.addRow("默认索引刷新", self.setting_index_mode)
         form.addRow("默认清理复查", self.setting_cleanup)
@@ -2045,6 +2059,15 @@ class MainWindow(QMainWindow):
         spin = QSpinBox()
         spin.setRange(minimum, maximum)
         spin.setValue(value)
+        return spin
+
+    @staticmethod
+    def _double_spin(value: float) -> QDoubleSpinBox:
+        spin = QDoubleSpinBox()
+        spin.setRange(0.001, 86400.0)
+        spin.setDecimals(3)
+        spin.setSingleStep(0.5)
+        spin.setValue(float(value))
         return spin
 
     @staticmethod
@@ -4529,6 +4552,14 @@ class MainWindow(QMainWindow):
         )
 
     def _save_settings(self) -> None:
+        delay_text = self.setting_request_avg_delay.lineEdit().text().strip()
+        try:
+            request_avg_delay = validate_request_avg_delay(delay_text)
+        except ValueError as exc:
+            self._append_info(self.settings_output, "【失败】" + str(exc))
+            self.statusBar().showMessage("等待均值设置无效")
+            QMessageBox.warning(self, "设置无效", str(exc))
+            return
         values = {
             "engine_exe": self.engine_edit.text().strip(),
             "video_root": self.video_edit.text().strip(),
@@ -4536,6 +4567,7 @@ class MainWindow(QMainWindow):
             "old_screenshot_dir": self.old_screenshot_edit.text().strip(),
             "batch_accounts": self.setting_batch_accounts.value(),
             "rest_seconds": self.setting_rest_seconds.value(),
+            "request_avg_delay": request_avg_delay,
             "screenshot_post_mode": self.setting_screenshot_mode.currentData(),
             "index_post_mode": self.setting_index_mode.currentData(),
             "cleanup_after_index": self.setting_cleanup.isChecked(),
@@ -4546,7 +4578,8 @@ class MainWindow(QMainWindow):
             self.queue_screenshot_mode.setCurrentIndex(self.setting_screenshot_mode.currentIndex())
             self.queue_index_mode.setCurrentIndex(self.setting_index_mode.currentIndex())
             self.queue_cleanup.setChecked(self.setting_cleanup.isChecked())
-            self.startup_recheck_timer.start(0)
+            if self.controller.startup_state is not StartupState.READY:
+                self.startup_recheck_timer.start(0)
 
     def _browse_engine(self) -> None:
         selected, _ = QFileDialog.getOpenFileName(
@@ -4907,7 +4940,7 @@ class MainWindow(QMainWindow):
             QPushButton { background: #2563eb; color: white; border: 0; border-radius: 5px;
                           padding: 7px 12px; min-height: 22px; }
             QPushButton:hover { background: #1d4ed8; }
-            QLineEdit, QSpinBox, QComboBox, QListWidget, QTextEdit {
+            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QListWidget, QTextEdit {
                 background: white; border: 1px solid #cbd5e1; border-radius: 5px; padding: 5px;
             }
             QListWidget::indicator { width: 17px; height: 17px; border: 1px solid #64748b;

@@ -331,6 +331,32 @@ class ManagerController:
             if invalid_fields:
                 names = "、".join(sorted(invalid_fields))
                 raise ControllerError(f"只读修复状态只能修改正式路径：{names}")
+        runtime_active = getattr(self, "_download_lifecycle_active", False)
+        engine_running = (
+            self.engine.external_running() if state is StartupState.READY else False
+        )
+        updated_config: AppConfig | None = None
+        if isinstance(self.config, AppConfig) and (runtime_active or engine_running):
+            updated_config = update_config(self.config, values)
+            previous_values = asdict(self.config)
+            updated_values = asdict(updated_config)
+            changed_fields = {
+                key
+                for key in previous_values
+                if previous_values[key] != updated_values[key]
+            }
+            if changed_fields <= {"request_avg_delay"}:
+                updated_config.save(self.paths.config_file)
+                self.config = updated_config
+                self.engine.config = updated_config
+                self.logger.info(
+                    "成功请求等待均值已热保存：%s秒；当前任务环境保持不变",
+                    updated_config.request_avg_delay,
+                )
+                return (
+                    "数据请求成功后等待均值已保存，将从下一次启动下载任务生效；"
+                    "当前任务保持原值。"
+                )
         self.require_download_lifecycle_idle()
         current_engine = self.engine.current
         if (
@@ -339,7 +365,7 @@ class ManagerController:
             and current_engine.running
         ):
             raise ControllerError("下载引擎仍由管理器持有，请先在就绪状态停止后再修复路径。")
-        if state is not StartupState.DEGRADED_READ_ONLY and self.engine.external_running():
+        if state is not StartupState.DEGRADED_READ_ONLY and engine_running:
             raise ControllerError("下载引擎正在运行，禁止切换正式路径或重建服务。")
         if self.collector.running:
             if state is StartupState.DEGRADED_READ_ONLY:
@@ -347,7 +373,7 @@ class ManagerController:
             self.collector.stop()
         self._last_collector_running = False
         self._last_engine_running = False
-        self.config = update_config(self.config, values)
+        self.config = updated_config or update_config(self.config, values)
         new_paths = ManagedPaths.from_config(self.config, self.root)
         new_paths.ensure_manager_directories()
         self.config.save(new_paths.config_file)
@@ -554,12 +580,13 @@ class ManagerController:
         self._last_engine_running = True
         self.logger.info(
             "下载任务已启动：模板=%s；已选账号=%s；PID=%s；"
-            "每%s个账号暂停%s秒；结束后保留窗口=%s；任务日志=%s",
+            "每%s个账号暂停%s秒；成功请求均值%s秒；结束后保留窗口=%s；任务日志=%s",
             result.task_template,
             result.selected_accounts,
             result.process.pid,
             self.config.batch_accounts,
             self.config.rest_seconds,
+            getattr(self.config, "request_avg_delay", 6.0),
             pause_after_exit,
             result.task_log,
         )
