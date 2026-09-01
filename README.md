@@ -31,6 +31,13 @@
 
 完整的逐版本新增、修复、安全边界和升级说明见 [CHANGELOG.md](CHANGELOG.md)。
 
+## 已知问题
+
+- [账号汇总对 mark 清洗结果逐字比较，导致 35 项无法归类](docs/known-issues/account-summary-mark-normalization.md)：
+  不影响下载引擎第二阶段批量 Info 的验收结论；候选源码补丁尚未进入正式 Manager。
+- [A574 的两条作品地址解析失败](docs/known-issues/a574-work-url-parse-failures.md)：
+  在第二阶段升级前已经出现，按独立作品级问题跟踪。
+
 ## v0.1.5 后台安全、结果看板与稳定化
 
 v0.1.5 在 v0.1.4 既有账号任务、下载队列、智能跳过和下载结果页之上，按三个冻结阶段完成
