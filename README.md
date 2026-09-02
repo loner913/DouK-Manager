@@ -31,6 +31,22 @@
 
 完整的逐版本新增、修复、安全边界和升级说明见 [CHANGELOG.md](CHANGELOG.md)。
 
+## 下载引擎提速阶段状态
+
+DouK-Manager 当前只配套下载引擎已经验收并冻结的两个定制提速阶段：
+
+- 第一阶段：标准账号长链接优先本地正则解析；未命中、不确定、异常或短链接回退原 GET。
+  [固定分支](https://github.com/loner913/TikTokDownloader/tree/perf/stage-01-user-link-shortcut)
+  · [固定提交](https://github.com/loner913/TikTokDownloader/commit/0b88ed875558064be026952fb98cd2b3174a4047)
+- 第二阶段：固定每批 20 个账号的 Info 批量预取，异常时回退原单账号 Info，并保持原有
+  `50/30` 暂停机制。
+  [固定分支](https://github.com/loner913/TikTokDownloader/tree/perf/stage-02-info-batch)
+  · [固定提交](https://github.com/loner913/TikTokDownloader/commit/34ae30fb6c4c2f6468ee777e649e3d20277280a8)
+
+下载引擎提速研发在第二阶段批量 Info 完成后正式结束。第三、第四阶段及随机等待均值配置
+不属于当前产品或候选包；阶段细节和验收边界见
+[引擎提速阶段收尾记录](https://github.com/loner913/TikTokDownloader/blob/docs/performance-stage-closeout/docs/performance-stages.md)。
+
 ## v0.1.5 后台安全、结果看板与稳定化
 
 v0.1.5 在 v0.1.4 既有账号任务、下载队列、智能跳过和下载结果页之上，按三个冻结阶段完成
