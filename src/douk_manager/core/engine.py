@@ -14,12 +14,7 @@ from enum import Enum
 from pathlib import Path
 from threading import Lock
 
-from douk_manager.config import (
-    DEFAULT_REQUEST_AVG_DELAY,
-    AppConfig,
-    ManagedPaths,
-    validate_request_avg_delay,
-)
+from douk_manager.config import AppConfig, ManagedPaths
 from douk_manager.core.backup import BackupService
 from douk_manager.core.download_summary import (
     DownloadSummary,
@@ -71,7 +66,6 @@ class EngineRun:
     native_log_dir: Path
     mode: str = ENGINE_MODE_BATCH
     pause_after_exit: bool = False
-    request_avg_delay: float = DEFAULT_REQUEST_AVG_DELAY
     task_template: str = "current settings.json"
     completion_marker: Path | None = None
     review_control: Path | None = None
@@ -324,9 +318,6 @@ class EngineService:
                 raise EngineError("下载引擎已经在运行。")
             engine_mutex = _WindowsEngineMutex.acquire(self.paths.engine_exe)
             try:
-                request_avg_delay = validate_request_avg_delay(
-                    getattr(self.config, "request_avg_delay", DEFAULT_REQUEST_AVG_DELAY)
-                )
                 if not self.paths.engine_exe.is_file():
                     raise EngineError(f"Engine is missing: {self.paths.engine_exe}")
                 active = read_json(self.paths.active_settings)
@@ -348,7 +339,6 @@ class EngineService:
                         "selected_accounts": selected_accounts,
                         "batch_accounts": self.config.batch_accounts,
                         "rest_seconds": self.config.rest_seconds,
-                        "request_avg_delay": request_avg_delay,
                         "run_command": BATCH_RUN_COMMAND,
                         "pause_after_exit": pause_after_exit,
                     },
@@ -357,7 +347,6 @@ class EngineService:
                 env = os.environ.copy()
                 env["DOUK_ACCOUNT_BATCH_SIZE"] = str(self.config.batch_accounts)
                 env["DOUK_ACCOUNT_REST_SECONDS"] = str(self.config.rest_seconds)
-                env["DOUK_REQUEST_AVG_DELAY"] = str(request_avg_delay)
                 env["DOUK_MANAGER_BACKUP"] = str(snapshot)
                 creationflags = 0
                 command = [str(self.paths.engine_exe)]
@@ -426,7 +415,6 @@ class EngineService:
                 f"Selected accounts: {selected_accounts}",
                 f"Pause every accounts: {self.config.batch_accounts}",
                 f"Pause seconds: {self.config.rest_seconds}",
-                f"Success request average delay: {request_avg_delay:g} seconds",
                 f"Pause after exit: {pause_after_exit}",
                 f"Backup: {snapshot}",
                 at=started_at,
@@ -445,7 +433,6 @@ class EngineService:
             native_log_dir=native_log_dir,
             mode=ENGINE_MODE_BATCH,
             pause_after_exit=pause_after_exit,
-            request_avg_delay=request_avg_delay,
             task_template=display_template,
             completion_marker=completion_marker,
             review_control=review_control,

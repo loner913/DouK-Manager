@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import os
 import sys
 from dataclasses import asdict, dataclass
@@ -14,19 +13,6 @@ DEFAULT_ENGINE_EXE = (
     "F:\\DouK-Downloader_Custom_50_150\\"
     "DouK-Downloader_Windows_X64_20260626\\main.exe"
 )
-DEFAULT_REQUEST_AVG_DELAY = 6.0
-
-
-def validate_request_avg_delay(value: object) -> float:
-    """Return a finite, positive success-request wait mean."""
-
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        raise ValueError("数据请求成功后等待均值必须是大于0的有限数字（秒）。") from None
-    if not math.isfinite(parsed) or parsed <= 0:
-        raise ValueError("数据请求成功后等待均值必须是大于0的有限数字（秒）。")
-    return parsed
 
 
 def project_root() -> Path:
@@ -60,7 +46,6 @@ class AppConfig:
     )
     batch_accounts: int = 50
     rest_seconds: int = 150
-    request_avg_delay: float = DEFAULT_REQUEST_AVG_DELAY
     collector_port: int = 8765
     collector_token: str = "DOUK_COLLECTOR_V248_20260719"
     screenshot_post_mode: str = "queue"
@@ -74,14 +59,9 @@ class AppConfig:
         raw = read_json(path)
         allowed = cls.__dataclass_fields__.keys()
         values = {key: value for key, value in raw.items() if key in allowed}
-        if "request_avg_delay" in values:
-            values["request_avg_delay"] = validate_request_avg_delay(
-                values["request_avg_delay"]
-            )
         return cls(**values)
 
     def save(self, path: Path) -> None:
-        self.request_avg_delay = validate_request_avg_delay(self.request_avg_delay)
         write_json_atomic(path, asdict(self))
 
 
@@ -182,7 +162,4 @@ def update_config(config: AppConfig, values: dict[str, Any]) -> AppConfig:
     allowed = config.__dataclass_fields__.keys()
     merged = asdict(config)
     merged.update({key: value for key, value in values.items() if key in allowed})
-    merged["request_avg_delay"] = validate_request_avg_delay(
-        merged["request_avg_delay"]
-    )
     return AppConfig(**merged)

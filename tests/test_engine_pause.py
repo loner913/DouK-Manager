@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import tempfile
@@ -11,7 +10,7 @@ from unittest.mock import Mock, patch
 
 from douk_manager.config import AppConfig
 from douk_manager.core.backup import BackupService
-from douk_manager.core.engine import BATCH_RUN_COMMAND, ENGINE_MODE_BATCH, EngineService
+from douk_manager.core.engine import ENGINE_MODE_BATCH, EngineService
 from tests.helpers import make_test_paths
 
 
@@ -79,26 +78,6 @@ class EnginePauseTests(unittest.TestCase):
                     self.assertEqual(
                         marker.read_text(encoding="ascii").strip(), str(exit_code)
                     )
-
-    def test_start_passes_frozen_success_delay_to_engine_environment(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            paths = make_test_paths(Path(directory), 2)
-            active = json.loads(paths.active_settings.read_text(encoding="utf-8"))
-            active["run_command"] = BATCH_RUN_COMMAND
-            active["accounts_urls"][0]["enable"] = True
-            paths.active_settings.write_text(json.dumps(active), encoding="utf-8")
-            backup = BackupService(paths)
-            backup.create_critical_snapshot = Mock(return_value=paths.backups / "snapshot")
-            config = AppConfig(engine_exe=str(paths.engine_exe), request_avg_delay=5)
-            service = EngineService(paths, config, backup)
-            service.external_running = Mock(return_value=False)
-            process = Mock(pid=1234)
-            with patch(
-                "douk_manager.core.engine.subprocess.Popen", return_value=process
-            ) as popen:
-                run = service.start()
-            self.assertEqual(popen.call_args.kwargs["env"]["DOUK_REQUEST_AVG_DELAY"], "5.0")
-            self.assertEqual(run.request_avg_delay, 5.0)
 
     def test_result_review_control_updates_run_and_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
