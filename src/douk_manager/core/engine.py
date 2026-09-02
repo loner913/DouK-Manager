@@ -851,7 +851,7 @@ class EngineService:
         ]
         if completion_marker is not None:
             marker_path = str(completion_marker).replace("%", "%%")
-            lines.append(f'echo %DOUK_ENGINE_EXIT%>"{marker_path}"')
+            lines.append(f'>"{marker_path}" echo %DOUK_ENGINE_EXIT%')
         if review_control is not None:
             control_path = str(review_control).replace("%", "%%")
             lines.extend(
