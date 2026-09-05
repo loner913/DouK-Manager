@@ -295,6 +295,7 @@ def _safe_failure_reason(summary: DownloadSummary) -> str:
 class _AccountBlock:
     task_index: int
     mapped: PlannedAccount | None
+    expected_cleaned_mark: str | None = None
     logged_a_number: int | None = None
     logged_mark_mismatch: bool = False
     filtered_count: int | None = None
@@ -395,6 +396,39 @@ _CATEGORY_NAMES = {"视频": "video", "图集": "gallery", "实况": "live"}
 _READ_CHUNK_SIZE = 64 * 1024
 _MAX_BUFFERED_LINE_SIZE = 1024 * 1024
 _UTF8_BOM = b"\xef\xbb\xbf"
+
+
+def _cleaned_mark_alias(mark: str) -> str:
+    """Mirror only the engine transformations observed in account logs.
+
+    The engine removes control characters and presentation selectors, collapses
+    whitespace, and strips outer ASCII full stops before displaying a mark.
+    Other changes (such as an unexpected nickname) remain untrusted.
+    This alias is for comparison only; the frozen mark is never rewritten.
+    """
+
+    text = re.sub(r"[\x00-\x1f\x7f]", "", mark)
+    text = text.replace("\ufe0e", "").replace("\ufe0f", "")
+    return " ".join(text.split()).strip(".")
+
+
+def _unique_cleaned_mark_aliases(
+    planned_accounts: tuple[PlannedAccount, ...],
+) -> dict[int, str]:
+    candidates = [
+        (account, _cleaned_mark_alias(account.mark)) for account in planned_accounts
+    ]
+    owners: dict[str, set[int]] = {}
+    for account, alias in candidates:
+        for value in {account.mark, alias}:
+            owners.setdefault(value, set()).add(account.task_index)
+    return {
+        account.task_index: alias
+        for account, alias in candidates
+        if alias
+        and alias != account.mark
+        and owners[alias] == {account.task_index}
+    }
 
 
 def freeze_planned_accounts(document: dict) -> tuple[PlannedAccount, ...]:
@@ -595,6 +629,7 @@ def parse_download_summary(
     exit_code: int | None,
 ) -> DownloadSummary:
     plan_by_index = {account.task_index: account for account in planned_accounts}
+    cleaned_mark_aliases = _unique_cleaned_mark_aliases(planned_accounts)
     reasons: list[str] = []
     started_outcomes: list[AccountOutcome] = []
     started_indices: set[int] = set()
@@ -700,7 +735,11 @@ def parse_download_summary(
                     _add_reason(reasons, f"日志任务序号 {task_index} 顺序异常。")
                 last_event_index = max(last_event_index, task_index)
                 observed_started_indices.add(task_index)
-                current = _AccountBlock(task_index, plan_by_index.get(task_index))
+                current = _AccountBlock(
+                    task_index,
+                    plan_by_index.get(task_index),
+                    expected_cleaned_mark=cleaned_mark_aliases.get(task_index),
+                )
                 continue
 
             if "提取 sec_user_id 失败，错误配置：" in line:
@@ -840,7 +879,10 @@ def _consume_account_line(
     mark_match = _LOGGED_MARK_RE.search(line)
     if mark_match:
         logged_mark = mark_match.group(1).strip()
-        if block.mapped is not None and logged_mark == block.mapped.mark:
+        if block.mapped is not None and (
+            logged_mark == block.mapped.mark
+            or logged_mark == block.expected_cleaned_mark
+        ):
             block.logged_a_number = block.mapped.a_number
         else:
             block.logged_mark_mismatch = True

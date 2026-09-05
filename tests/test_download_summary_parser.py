@@ -687,6 +687,95 @@ class DownloadSummaryParserTests(unittest.TestCase):
         self.assertFalse(summary.reliable)
         self.assertTrue(any("不一致" in reason for reason in summary.reasons))
 
+    def test_engine_cleaned_marks_keep_the_frozen_account_identity(self) -> None:
+        cases = (
+            ("A1164example.", "A1164example"),
+            ("A1164example..", "A1164example"),
+            ("A1164example...", "A1164example"),
+            ("A1164alpha  beta", "A1164alpha beta"),
+            ("A1164alpha\t\u00a0beta", "A1164alpha beta"),
+            ("A1164C\ufe0fexample", "A1164Cexample"),
+            ("A116\ufe0e4example", "A1164example"),
+            ("A1164C\ufe0f  example..", "A1164C example"),
+        )
+        for raw_mark, logged_mark in cases:
+            with self.subTest(raw_mark=raw_mark):
+                planned = (PlannedAccount(1, 116, raw_mark),)
+                summary = self._parse(
+                    [
+                        "开始处理第 1 个账号",
+                        f"标识：{logged_mark}",
+                        "筛选处理后作品数量: 0",
+                    ],
+                    planned,
+                )
+                self.assertTrue(summary.reliable)
+                self.assertTrue(summary.complete)
+                self.assertEqual(summary.started_outcomes[0].a_number, 116)
+                self.assertEqual(planned[0].mark, raw_mark)
+
+    def test_mark_alias_never_normalizes_unexpected_logged_text(self) -> None:
+        cases = (
+            ("A10example", "A10example."),
+            ("A10example..", "A10example..."),
+            ("A10alpha beta", "A10alpha  beta"),
+            ("A10example.", "A10Example"),
+            ("A10a.b.", "A10ab"),
+            ("A10example.", "A11example"),
+        )
+        for raw_mark, logged_mark in cases:
+            with self.subTest(raw_mark=raw_mark, logged_mark=logged_mark):
+                summary = self._parse(
+                    [
+                        "开始处理第 1 个账号",
+                        f"标识：{logged_mark}",
+                        "筛选处理后作品数量: 0",
+                    ],
+                    (PlannedAccount(1, 10, raw_mark),),
+                )
+                self.assertFalse(summary.reliable)
+                self.assertEqual(summary.started_outcomes, ())
+
+    def test_colliding_cleaned_marks_are_not_trusted(self) -> None:
+        # Numeric-leading mark bodies can make different A positions share text.
+        planned = (
+            PlannedAccount(1, 1, "A116example."),
+            PlannedAccount(2, 11, "A116example.."),
+        )
+        summary = self._parse(
+            [
+                "开始处理第 1 个账号",
+                "标识：A116example",
+                "筛选处理后作品数量: 0",
+                "开始处理第 2 个账号",
+                "标识：A116example",
+                "筛选处理后作品数量: 0",
+            ],
+            planned,
+        )
+        self.assertFalse(summary.reliable)
+        self.assertEqual(summary.started_outcomes, ())
+
+    def test_alias_collision_with_another_raw_mark_is_not_trusted(self) -> None:
+        planned = (
+            PlannedAccount(1, 1, "A116example."),
+            PlannedAccount(2, 11, "A116example"),
+        )
+        summary = self._parse(
+            [
+                "开始处理第 1 个账号",
+                "标识：A116example",
+                "筛选处理后作品数量: 0",
+                "开始处理第 2 个账号",
+                "标识：A116example",
+                "筛选处理后作品数量: 0",
+            ],
+            planned,
+        )
+        self.assertFalse(summary.reliable)
+        self.assertEqual(summary.started_count, 1)
+        self.assertEqual(summary.started_outcomes[0].a_number, 11)
+
     def test_prefix_like_logged_mark_never_matches_frozen_mark(self) -> None:
         summary = self._parse(
             [
