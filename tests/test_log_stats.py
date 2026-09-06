@@ -15,7 +15,7 @@ from unittest.mock import Mock, patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QCoreApplication, QEvent, QSettings, QThread
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QScrollArea, QTextEdit
 
 from douk_manager.background import (
     BackgroundTaskCoordinator,
@@ -56,7 +56,11 @@ from douk_manager.core.result_dashboard import (
     DashboardNativeLogSegment,
     ResultDashboardService,
 )
-from douk_manager.gui import DownloadSummaryTaskBinding, MainWindow
+from douk_manager.gui import (
+    DownloadSummaryTaskBinding,
+    MainWindow,
+    _render_log_stats_html,
+)
 from douk_manager.operation import TaskCancelled
 from douk_manager.startup import StartupState
 from douk_manager.ui_state import WindowStateStore
@@ -406,13 +410,68 @@ class LogStatsWhitelistAndReportTests(unittest.TestCase):
 
     def test_report_has_schema_sections_fixed_unavailable_boundary_and_clean_tail(self) -> None:
         report = render_report(analyse_segments(()))
-        self.assertTrue(report.startswith("schema 1\n"))
+        self.assertEqual(report.splitlines()[0].split(), ["schema", "1"])
         self.assertIn("[http status]", report)
         self.assertIn("[abnormal-path status]", report)
-        self.assertIn("本版本不从日志推断账号是否已注销或被封", report)
+        self.assertIn(
+            "This version does not infer whether accounts are deactivated or banned",
+            report,
+        )
         self.assertIn("[LEAK SELF-CHECK]", report)
         self.assertTrue(report.endswith("RESULT: CLEAN\n"))
         self.assertEqual(UNAVAILABLE_MARKERS, ())
+
+        report_lines = report.splitlines()
+        metadata_labels = (
+            "schema",
+            "lines",
+            "bytes_analysed",
+            "window",
+            "active_minutes",
+            "log_location_reason",
+            "truncated",
+            "truncate_reason",
+        )
+        metadata_width = max(len(label) for label in metadata_labels)
+        for line, label in zip(
+            report_lines[: len(metadata_labels)], metadata_labels, strict=True
+        ):
+            self.assertEqual(line[:metadata_width].rstrip(), label)
+            self.assertEqual(line[metadata_width : metadata_width + 2], "  ")
+
+        endpoints_start = report_lines.index(
+            "[endpoints seen] (path only, query discarded)"
+        ) + 1
+        endpoint_width = max(len(endpoint) for endpoint in ENDPOINTS)
+        for line, endpoint in zip(
+            report_lines[endpoints_start : endpoints_start + len(ENDPOINTS)],
+            ENDPOINTS,
+            strict=True,
+        ):
+            self.assertEqual(line[2 : 2 + endpoint_width].rstrip(), endpoint)
+            self.assertEqual(
+                line[2 + endpoint_width : 4 + endpoint_width], "  "
+            )
+
+    def test_chinese_report_localises_semantic_labels_and_remains_clean(self) -> None:
+        report = render_report(analyse_segments(()), language="zh-CN")
+        for label in (
+            "统计格式版本：",
+            "已分析字节数：",
+            "请求失败：",
+            "下载中断：",
+            "签名字段覆盖率：",
+        ):
+            self.assertIn(label, report)
+        self.assertNotIn("request_failed", report)
+        self.assertNotIn("download_interrupted", report)
+        self.assertIn("[泄漏自检]", report)
+        self.assertTrue(report.endswith("RESULT: CLEAN\n"))
+        self.assertTrue(self_check_text(report).clean)
+
+    def test_report_rejects_unknown_language(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Unsupported diagnostic report language"):
+            render_report(analyse_segments(()), language="synthetic")
 
     def test_located_reason_is_whitelisted_and_unknown_text_is_not_reflected(self) -> None:
         unsafe = r"Z:\FAKE-PATH\secret.log"
@@ -423,7 +482,10 @@ class LogStatsWhitelistAndReportTests(unittest.TestCase):
         unsafe_truncate = replace(analyse_segments(()), truncate_reason=unsafe)
         truncate_report = render_report(unsafe_truncate)
         self.assertNotIn(unsafe, truncate_report)
-        self.assertIn("truncate_reason  unknown", truncate_report)
+        self.assertIn(
+            ["truncate_reason", "unknown"],
+            [line.split() for line in truncate_report.splitlines()],
+        )
 
     def test_product_self_check_detects_bad_output_without_echoing_values(self) -> None:
         text = "safe prefix\nsessionid=FAKE-SESSION-DO-NOT-USE\n"
@@ -663,6 +725,60 @@ class EngineLogStatsTests(unittest.TestCase):
                 {path.name for path in first.parent.iterdir()}, {first.name, second.name}
             )
 
+    def test_dual_export_writes_chinese_and_english_from_one_cached_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = self._service(root)
+            segment = _segment(root / "native.log", "Response Code: 403\n")
+            service.analyse_run_logs("scope", segments=(segment,))
+            segment.path.unlink()
+
+            with patch(
+                "douk_manager.core.engine.self_check_text",
+                wraps=self_check_text,
+            ) as check:
+                chinese, english = service.export_diagnostic_reports("scope")
+
+            self.assertEqual(check.call_count, 2)
+            self.assertTrue(chinese.name.endswith("-diagnostic-zh-CN.txt"))
+            self.assertTrue(english.name.endswith("-diagnostic-en.txt"))
+            self.assertEqual(chinese.parent, service.paths.logs / "Diagnostics")
+            self.assertEqual(english.parent, chinese.parent)
+            chinese_text = chinese.read_text(encoding="utf-8")
+            english_text = english.read_text(encoding="utf-8")
+            self.assertIn("请求失败：1", chinese_text)
+            self.assertIn("request_failed", english_text)
+            self.assertTrue(self_check_text(chinese_text).clean)
+            self.assertTrue(self_check_text(english_text).clean)
+
+    def test_dual_export_blocks_both_files_when_either_report_fails_self_check(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = self._service(root)
+            segment = _segment(root / "native.log", "synthetic\n")
+            service.analyse_run_logs("scope", segments=(segment,))
+            clean = render_report(analyse_segments(()), language="zh-CN")
+            with patch(
+                "douk_manager.core.engine.render_report",
+                side_effect=(clean, "sessionid=FAKE-SESSION-DO-NOT-USE\n"),
+            ):
+                with self.assertRaises(LogStatsLeakError):
+                    service.export_diagnostic_reports("scope")
+            diagnostics = service.paths.logs / "Diagnostics"
+            self.assertEqual(tuple(diagnostics.glob("*")) if diagnostics.exists() else (), ())
+
+    def test_dual_export_cancellation_removes_both_temporary_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = self._service(root)
+            segment = _segment(root / "native.log", "synthetic\n")
+            service.analyse_run_logs("scope", segments=(segment,))
+            with self.assertRaises(TaskCancelled):
+                service.export_diagnostic_reports("scope", context=_CancelAfter(3))
+            diagnostics = service.paths.logs / "Diagnostics"
+            self.assertTrue(diagnostics.is_dir())
+            self.assertEqual(tuple(diagnostics.iterdir()), ())
+
 
 class LogStatsGuiTests(unittest.TestCase):
     @classmethod
@@ -704,6 +820,115 @@ class LogStatsGuiTests(unittest.TestCase):
                 self.assertFalse(window.log_stats_auto_checkbox.isChecked())
                 self.assertEqual(window.log_stats_group.title(), "本次运行日志统计（只含统计量）")
                 self.assertIn("尚未执行产物自检", window.log_stats_self_check.text())
+                self.assertEqual(
+                    window.log_stats_export_button.text(), "导出中英文安全诊断报告"
+                )
+            finally:
+                self._dispose(window, home_patch)
+
+    def test_log_stats_layout_uses_responsive_columns_and_scrolls_at_restored_size(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window, home_patch = self._window(Path(directory))
+            try:
+                self.assertIsInstance(window.dashboard_page, QScrollArea)
+                stats = analyse_segments(())
+                unsafe = r"Z:\FAKE-PATH\secret.log"
+                wide_html = _render_log_stats_html(
+                    stats, located_reason=unsafe, columns=5
+                )
+                self.assertEqual(
+                    wide_html.count('data-log-stats-section="true"'), 5
+                )
+                self.assertIn("font-size:18px", wide_html)
+                self.assertIn("font-size:15px", wide_html)
+                self.assertIn("font-size:16px", wide_html)
+                self.assertIn("已分析字节数", wide_html)
+                self.assertIn("请求失败", wide_html)
+                self.assertIn("下载中断", wide_html)
+                self.assertNotIn("bytes_analysed", wide_html)
+                self.assertNotIn("request_failed", wide_html)
+                self.assertNotIn("download_interrupted", wide_html)
+                self.assertNotIn("异常 none", wide_html)
+                self.assertNotIn(unsafe, wide_html)
+                self.assertEqual(
+                    window.log_stats_output._column_count_for_width(1800), 5
+                )
+                self.assertEqual(
+                    window.log_stats_output._column_count_for_width(1000), 3
+                )
+                self.assertEqual(
+                    window.log_stats_output._column_count_for_width(500), 1
+                )
+                window.resize(window.minimumWidth(), window.minimumHeight())
+                with patch.object(window, "refresh_result_dashboard"):
+                    window.tabs.setCurrentWidget(window.dashboard_page)
+                window.log_stats_expand_button.setChecked(True)
+                window._apply_log_stats_result(stats, "synthetic")
+                window.show()
+                self.app.processEvents()
+
+                self.assertEqual(
+                    window.log_stats_output.lineWrapMode(),
+                    QTextEdit.LineWrapMode.WidgetWidth,
+                )
+                rendered_text = window.log_stats_output.toPlainText()
+                for heading in (
+                    "运行概览",
+                    "日志与响应",
+                    "请求端点与失败",
+                    "签名与参数",
+                    "业务事件",
+                ):
+                    self.assertIn(heading, rendered_text)
+                self.assertGreater(
+                    window.log_stats_output.verticalScrollBar().maximum(), 0
+                )
+                self.assertGreater(
+                    window.dashboard_page.verticalScrollBar().maximum(), 0
+                )
+                self.assertLess(
+                    window.log_stats_output.geometry().bottom(),
+                    window.log_stats_self_check.geometry().top(),
+                )
+            finally:
+                self._dispose(window, home_patch)
+
+    def test_log_stats_result_context_warns_after_dashboard_task_switch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            window, home_patch = self._window(root)
+            try:
+                first = root / "DownloadTask_first.log"
+                second = root / "DownloadTask_second.log"
+                first_key = window._dashboard_key(first)
+                second_key = window._dashboard_key(second)
+                window._dashboard_entries = {
+                    first_key: SimpleNamespace(task_log=first),
+                    second_key: SimpleNamespace(task_log=second),
+                }
+                window.dashboard_task_selector.blockSignals(True)
+                window.dashboard_task_selector.addItem("first", first_key)
+                window.dashboard_task_selector.addItem("second", second_key)
+                window.dashboard_task_selector.setCurrentIndex(0)
+                window.dashboard_task_selector.blockSignals(False)
+
+                window._apply_log_stats_result(analyse_segments(()), str(first))
+                self.assertFalse(window.log_stats_result_context.property("stale"))
+                self.assertIn("所选任务", window.log_stats_result_context.text())
+
+                with patch.object(window, "_load_dashboard_selection"):
+                    window.dashboard_task_selector.setCurrentIndex(1)
+                self.assertTrue(window.log_stats_result_context.property("stale"))
+                self.assertIn(
+                    "上一次分析结果", window.log_stats_result_context.text()
+                )
+                self.assertNotIn(str(root), window.log_stats_result_context.text())
+
+                window._apply_log_stats_result(analyse_segments(()), second.name)
+                self.assertFalse(window.log_stats_result_context.property("stale"))
+                self.assertIn("所选任务", window.log_stats_result_context.text())
             finally:
                 self._dispose(window, home_patch)
 
@@ -1104,6 +1329,11 @@ class LogStatsGuiTests(unittest.TestCase):
                 self.assertFalse(window.coordinator.has_active_tasks())
                 self.assertEqual(window.findChildren(QThread), [])
                 self.assertIn("RESULT: CLEAN", window.log_stats_self_check.text())
+                export_text = window.log_stats_export_path.text()
+                self.assertIn("已导出中文版：", export_text)
+                self.assertIn("已导出英文版：", export_text)
+                diagnostics = window.controller.paths.logs / "Diagnostics"
+                self.assertEqual(len(tuple(diagnostics.glob("*.txt"))), 2)
             finally:
                 self._dispose(window, home_patch)
 

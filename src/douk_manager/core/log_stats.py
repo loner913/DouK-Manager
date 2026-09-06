@@ -75,6 +75,45 @@ KEYWORDS = {
     "url_parse_failed": "视频下载地址解析失败",
     "private_account": "私密账号",
 }
+LOG_STATS_LABELS_ZH: Mapping[str, str] = MappingProxyType(
+    {
+        "schema": "统计格式版本",
+        "lines": "已分析行数",
+        "bytes_analysed": "已分析字节数",
+        "window": "日志时间窗口",
+        "active_minutes": "活跃分钟数",
+        "log_location_reason": "日志定位说明",
+        "truncated": "是否截断",
+        "truncate_reason": "截断原因",
+        "INFO": "信息",
+        "WARNING": "警告",
+        "ERROR": "错误",
+        "DEBUG": "调试",
+        "CRITICAL": "严重错误",
+        "request_failed": "请求失败",
+        "private_account": "私密账号",
+        "resp_code_abnormal": "响应码异常",
+        "download_interrupted": "下载中断",
+        "url_parse_failed": "视频下载地址解析失败",
+        "unavailable": "不可用",
+        "unknown": "未知",
+        "request_lines": "请求行数",
+        "signature_coverage": "签名字段覆盖率",
+        "account_start": "开始处理账号",
+        "extract_start": "开始提取作品",
+        "filtered": "筛选处理后作品",
+        "cache_update": "更新缓存数据",
+        "download_start": "开始下载作品",
+        "skip_video": "跳过视频作品",
+        "skip_image": "跳过图集作品",
+        "skip_live": "跳过实况作品",
+        "retry": "重试",
+        "failed_extract": "链接提取失败",
+        "batch_fallback": "回退单账号路径",
+        "batch_uncertain": "批量账号信息不确定",
+        "cookie_invalid": "Cookie 无效",
+    }
+)
 ABNORMAL_CODE = re_compile(r"Client error '(\d{3})|Server error '(\d{3})")
 
 # No stable, explicitly verified native-log wording exists for these states.
@@ -90,6 +129,59 @@ _LOCATED_REASONS = frozenset(
     }
 )
 _TRUNCATE_REASONS = frozenset({"", "line_limit", "byte_limit"})
+_LOCATED_REASONS_EN: Mapping[str, str] = MappingProxyType(
+    {
+        "": "none",
+        "未找到本次新增或增长的原生日志。": "no new or expanded native log was found",
+        "本次原生日志缺少运行锚点。": "the native log lacks a run anchor",
+        "存在多个候选原生日志，无法唯一确定本次日志。": (
+            "multiple candidate native logs prevented unique selection"
+        ),
+        "仅分析了可用的部分原生日志片段。": (
+            "only the available native-log segments were analysed"
+        ),
+        "unknown": "unknown",
+    }
+)
+_TRUNCATE_REASONS_ZH: Mapping[str, str] = MappingProxyType(
+    {
+        "": "无",
+        "line_limit": "达到分析行数上限",
+        "byte_limit": "达到分析字节数上限",
+        "unknown": "未知",
+    }
+)
+_TRUNCATE_REASONS_EN: Mapping[str, str] = MappingProxyType(
+    {
+        "": "none",
+        "line_limit": "line limit",
+        "byte_limit": "byte limit",
+        "unknown": "unknown",
+    }
+)
+
+
+def normalise_located_reason(reason: str) -> str:
+    return reason if reason in _LOCATED_REASONS else "unknown"
+
+
+def normalise_truncate_reason(reason: str) -> str:
+    return reason if reason in _TRUNCATE_REASONS else "unknown"
+
+
+def log_stats_label_zh(name: str) -> str:
+    return LOG_STATS_LABELS_ZH.get(name, name)
+
+
+def located_reason_zh(reason: str) -> str:
+    normalised = normalise_located_reason(reason)
+    if not normalised:
+        return "无"
+    return "未知" if normalised == "unknown" else normalised
+
+
+def truncate_reason_zh(reason: str) -> str:
+    return _TRUNCATE_REASONS_ZH[normalise_truncate_reason(reason)]
 
 
 class LogStatsReadError(RuntimeError):
@@ -406,46 +498,63 @@ def select_dashboard_segments(
     return (), SegmentSelectionStatus.MISSING_FILE
 
 
-def render_report(stats: LogStats, *, located_reason: str = "") -> str:
-    reason = located_reason if located_reason in _LOCATED_REASONS else "unknown"
-    truncate_reason = (
-        stats.truncate_reason
-        if stats.truncate_reason in _TRUNCATE_REASONS
-        else "unknown"
+def render_report(
+    stats: LogStats, *, located_reason: str = "", language: str = "en"
+) -> str:
+    if language == "en":
+        return _render_report_en(stats, located_reason=located_reason)
+    if language == "zh-CN":
+        return _render_report_zh_cn(stats, located_reason=located_reason)
+    raise ValueError("Unsupported diagnostic report language.")
+
+
+def _render_report_en(stats: LogStats, *, located_reason: str) -> str:
+    reason = _LOCATED_REASONS_EN[normalise_located_reason(located_reason)]
+    truncate_reason = _TRUNCATE_REASONS_EN[
+        normalise_truncate_reason(stats.truncate_reason)
+    ]
+    metadata_rows = (
+        ("schema", stats.schema),
+        ("lines", stats.lines),
+        ("bytes_analysed", stats.bytes_analysed),
+        ("window", f"{stats.window_start or 'none'} -> {stats.window_end or 'none'}"),
+        ("active_minutes", stats.active_minutes),
+        ("log_location_reason", reason),
+        ("truncated", "yes" if stats.truncated else "no"),
+        ("truncate_reason", truncate_reason),
     )
+    metadata_width = max(len(label) for label, _value in metadata_rows)
     lines = [
-        f"schema {stats.schema}",
-        f"lines  {stats.lines}",
-        f"bytes_analysed  {stats.bytes_analysed}",
-        f"window  {stats.window_start or 'none'} -> {stats.window_end or 'none'}",
-        f"active_minutes  {stats.active_minutes}",
-        f"log_location_reason  {reason or 'none'}",
-        f"truncated  {'yes' if stats.truncated else 'no'}",
-        f"truncate_reason  {truncate_reason or 'none'}",
+        *(f"{label:<{metadata_width}}  {value}" for label, value in metadata_rows),
         "",
         "[log levels]",
     ]
     for level in ("INFO", "WARNING", "ERROR", "DEBUG", "CRITICAL"):
         lines.append(f"  {level:<10} {stats.levels.get(level, 0)}")
     lines.extend(("", "[http status]"))
+    http_width = len("403 rate")
     for code, count in sorted(stats.http.counts.items()):
-        lines.append(f"  {code}  {count}")
+        lines.append(f"  {code:<{http_width}}  {count}")
     lines.extend(
         (
-            f"  TOTAL  {stats.http.total}",
-            f"  403 rate  {stats.http_403_rate:.4%}",
+            f"  {'TOTAL':<{http_width}}  {stats.http.total}",
+            f"  {'403 rate':<{http_width}}  {stats.http_403_rate:.4%}",
             "",
             "[abnormal-path status]",
         )
     )
+    abnormal_width = 4
     if stats.abnormal.counts:
         for code, count in sorted(stats.abnormal.counts.items()):
-            lines.append(f"  {code}  {count}")
+            lines.append(f"  {code:<{abnormal_width}}  {count}")
     else:
-        lines.append("  none  0")
+        lines.append(f"  {'none':<{abnormal_width}}  0")
     lines.extend(("", "[endpoints seen] (path only, query discarded)"))
+    endpoint_width = max(len(endpoint) for endpoint in ENDPOINTS)
     for endpoint in ENDPOINTS:
-        lines.append(f"  {endpoint}  {stats.endpoints.get(endpoint, 0)}")
+        lines.append(
+            f"  {endpoint:<{endpoint_width}}  {stats.endpoints.get(endpoint, 0)}"
+        )
     lines.extend(("", "[signature / param field PRESENCE] (counts only)"))
     for field in FIELD_PRESENCE:
         lines.append(f"  {field:<26} {stats.signatures.presence.get(field, 0)}")
@@ -459,7 +568,7 @@ def render_report(stats: LogStats, *, located_reason: str = "") -> str:
             f"  private_account            {stats.failures.private_account}",
             "  unavailable                0",
             "  unknown                    0",
-            "  本版本不从日志推断账号是否已注销或被封。",
+            "  This version does not infer whether accounts are deactivated or banned.",
             "",
             "[business keywords]",
         )
@@ -467,6 +576,80 @@ def render_report(stats: LogStats, *, located_reason: str = "") -> str:
     for name in KEYWORDS:
         lines.append(f"  {name:<26} {stats.keywords.get(name, 0)}")
     lines.extend(("", "[LEAK SELF-CHECK] all values below MUST be 0"))
+    for field in MUST_BE_ABSENT:
+        lines.append(f"  {field:<24} 0")
+    lines.extend(("", "RESULT: CLEAN", ""))
+    return "\n".join(lines)
+
+
+def _render_report_zh_cn(stats: LogStats, *, located_reason: str) -> str:
+    metadata_rows = (
+        (log_stats_label_zh("schema"), stats.schema),
+        (log_stats_label_zh("lines"), stats.lines),
+        (log_stats_label_zh("bytes_analysed"), stats.bytes_analysed),
+        (
+            log_stats_label_zh("window"),
+            f"{stats.window_start or '无'} -> {stats.window_end or '无'}",
+        ),
+        (log_stats_label_zh("active_minutes"), stats.active_minutes),
+        (log_stats_label_zh("log_location_reason"), located_reason_zh(located_reason)),
+        (log_stats_label_zh("truncated"), "是" if stats.truncated else "否"),
+        (
+            log_stats_label_zh("truncate_reason"),
+            truncate_reason_zh(stats.truncate_reason),
+        ),
+    )
+    lines = [
+        *(f"{label}：{value}" for label, value in metadata_rows),
+        "",
+        "[日志级别]",
+    ]
+    for level in ("INFO", "WARNING", "ERROR", "DEBUG", "CRITICAL"):
+        lines.append(f"  {log_stats_label_zh(level)}：{stats.levels.get(level, 0)}")
+    lines.append("")
+    lines.append("[HTTP 响应状态]")
+    for code, count in sorted(stats.http.counts.items()):
+        lines.append(f"  {code}：{count}")
+    lines.extend(
+        (
+            f"  总计：{stats.http.total}",
+            f"  403 比例：{stats.http_403_rate:.4%}",
+            "",
+            "[异常路径状态]",
+        )
+    )
+    if stats.abnormal.counts:
+        for code, count in sorted(stats.abnormal.counts.items()):
+            lines.append(f"  {code}：{count}")
+    else:
+        lines.append("  无：0")
+    lines.extend(("", "[已出现的请求端点]（仅路径，查询参数已丢弃）"))
+    for endpoint in ENDPOINTS:
+        lines.append(f"  {endpoint}：{stats.endpoints.get(endpoint, 0)}")
+    lines.extend(("", "[签名和参数字段存在情况]（仅计数）"))
+    for field in FIELD_PRESENCE:
+        lines.append(f"  {field}  {stats.signatures.presence.get(field, 0)}")
+    lines.extend(
+        (
+            f"  {log_stats_label_zh('request_lines')}：{stats.signatures.request_lines}",
+            f"  {log_stats_label_zh('signature_coverage')}：{stats.signature_coverage:.4%}",
+            "",
+            "[失败分类]",
+            f"  {log_stats_label_zh('request_failed')}：{stats.request_failed}",
+            (
+                f"  {log_stats_label_zh('private_account')}："
+                f"{stats.failures.private_account}"
+            ),
+            f"  {log_stats_label_zh('unavailable')}：0",
+            f"  {log_stats_label_zh('unknown')}：0",
+            "  本版本不从日志推断账号是否已注销或被封。",
+            "",
+            "[业务事件]",
+        )
+    )
+    for name in KEYWORDS:
+        lines.append(f"  {log_stats_label_zh(name)}：{stats.keywords.get(name, 0)}")
+    lines.extend(("", "[泄漏自检] 以下值必须全部为 0"))
     for field in MUST_BE_ABSENT:
         lines.append(f"  {field:<24} 0")
     lines.extend(("", "RESULT: CLEAN", ""))

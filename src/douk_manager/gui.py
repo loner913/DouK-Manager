@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from datetime import datetime
+from html import escape
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
@@ -38,9 +39,11 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QLayout,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QTableView,
     QTableWidget,
@@ -63,10 +66,16 @@ from douk_manager.background import (
 from douk_manager.core.download_summary import AccountStatus, format_summary_for_ui
 from douk_manager.core.engine import ENGINE_MODE_MONITOR, assess_process_exit
 from douk_manager.core.log_stats import (
+    ENDPOINTS,
+    FIELD_PRESENCE,
+    KEYWORDS,
     LogStats,
     SegmentSelectionStatus,
-    render_report,
+    located_reason_zh,
+    log_stats_label_zh,
+    normalise_located_reason,
     select_dashboard_segments,
+    truncate_reason_zh,
 )
 from douk_manager.core.power import request_normal_shutdown
 from douk_manager.core.result_history import ResultPageSnapshot
@@ -281,6 +290,215 @@ def _dashboard_account_needs_attention(account: DashboardAccountRow) -> bool:
         "pre_start_error",
         "not_started",
     )
+
+
+def _log_stats_section_html(
+    title: str,
+    rows: tuple[tuple[str, object], ...],
+    note: str,
+    *,
+    width_percent: int,
+) -> str:
+    row_html = "".join(
+        (
+            "<tr>"
+            '<td style="font-size:15px; font-weight:600; color:#374151; '
+            f'padding:4px 12px 4px 0;">{escape(label)}</td>'
+            '<td align="right" style="font-size:16px; font-weight:600; '
+            f'color:#111827; padding:4px 0;">{escape(str(value))}</td>'
+            "</tr>"
+        )
+        for label, value in rows
+    )
+    note_html = (
+        '<div style="font-size:12px; color:#64748b; margin-top:8px;">'
+        f"{escape(note)}</div>"
+        if note
+        else ""
+    )
+    return (
+        f'<td data-log-stats-section="true" width="{width_percent}%" '
+        'valign="top" style="padding:8px 14px; border-right:1px solid #d1d5db;">'
+        '<div style="font-size:18px; font-weight:700; color:#1f2937; '
+        f'margin-bottom:8px;">{escape(title)}</div>'
+        f'<table width="100%" cellspacing="0" cellpadding="0">{row_html}</table>'
+        f"{note_html}</td>"
+    )
+
+
+def _render_log_stats_html(
+    stats: LogStats, *, located_reason: str, columns: int
+) -> str:
+    reason = located_reason_zh(located_reason)
+    truncate_reason = truncate_reason_zh(stats.truncate_reason)
+    http_rows = tuple(
+        (f"HTTP {code}", count) for code, count in sorted(stats.http.counts.items())
+    )
+    abnormal_rows = tuple(
+        (f"异常 {code}", count)
+        for code, count in sorted(stats.abnormal.counts.items())
+    ) or (("无异常状态码", 0),)
+    sections = (
+        (
+            "运行概览",
+            (
+                (log_stats_label_zh("schema"), stats.schema),
+                (log_stats_label_zh("lines"), stats.lines),
+                (log_stats_label_zh("bytes_analysed"), stats.bytes_analysed),
+                (
+                    log_stats_label_zh("window"),
+                    f"{stats.window_start or '无'} -> {stats.window_end or '无'}",
+                ),
+                (log_stats_label_zh("active_minutes"), stats.active_minutes),
+                (log_stats_label_zh("log_location_reason"), reason),
+                (log_stats_label_zh("truncated"), "是" if stats.truncated else "否"),
+                (log_stats_label_zh("truncate_reason"), truncate_reason),
+            ),
+            "",
+        ),
+        (
+            "日志与响应",
+            tuple(
+                (log_stats_label_zh(level), stats.levels.get(level, 0))
+                for level in ("INFO", "WARNING", "ERROR", "DEBUG", "CRITICAL")
+            )
+            + http_rows
+            + (
+                ("HTTP 响应总数", stats.http.total),
+                ("HTTP 403 比例", f"{stats.http_403_rate:.4%}"),
+            )
+            + abnormal_rows,
+            "异常路径状态码（不在上面那张响应码表里）",
+        ),
+        (
+            "请求端点与失败",
+            tuple(
+                (endpoint, stats.endpoints.get(endpoint, 0)) for endpoint in ENDPOINTS
+            )
+            + (
+                (log_stats_label_zh("request_failed"), stats.request_failed),
+                (
+                    log_stats_label_zh("private_account"),
+                    stats.failures.private_account,
+                ),
+                (
+                    log_stats_label_zh("resp_code_abnormal"),
+                    stats.failures.resp_code_abnormal,
+                ),
+                (
+                    log_stats_label_zh("download_interrupted"),
+                    stats.failures.download_interrupted,
+                ),
+                (
+                    log_stats_label_zh("url_parse_failed"),
+                    stats.failures.url_parse_failed,
+                ),
+                (log_stats_label_zh("unavailable"), 0),
+                (log_stats_label_zh("unknown"), 0),
+            ),
+            "本版本不从日志推断账号是否已注销或被封。",
+        ),
+        (
+            "签名与参数",
+            tuple(
+                (field, stats.signatures.presence.get(field, 0))
+                for field in FIELD_PRESENCE
+            )
+            + (
+                (
+                    log_stats_label_zh("request_lines"),
+                    stats.signatures.request_lines,
+                ),
+                (
+                    log_stats_label_zh("signature_coverage"),
+                    f"{stats.signature_coverage:.4%}",
+                ),
+            ),
+            "仅显示字段出现次数，不显示参数值。",
+        ),
+        (
+            "业务事件",
+            tuple(
+                (log_stats_label_zh(name), stats.keywords.get(name, 0))
+                for name in KEYWORDS
+            ),
+            "只显示固定业务关键词的聚合次数。",
+        ),
+    )
+    column_count = max(1, min(int(columns), len(sections)))
+    width_percent = 100 // column_count
+    table_rows: list[str] = []
+    for offset in range(0, len(sections), column_count):
+        row_sections = sections[offset : offset + column_count]
+        cells = [
+            _log_stats_section_html(
+                title, rows, note, width_percent=width_percent
+            )
+            for title, rows, note in row_sections
+        ]
+        cells.extend(
+            f'<td width="{width_percent}%"></td>'
+            for _unused in range(column_count - len(row_sections))
+        )
+        table_rows.append(f'<tr>{"".join(cells)}</tr>')
+    return (
+        '<html><body style="margin:0; color:#111827;">'
+        '<table width="100%" cellspacing="0" cellpadding="0">'
+        f'{"".join(table_rows)}</table></body></html>'
+    )
+
+
+class LogStatsOutput(QTextEdit):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._stats: LogStats | None = None
+        self._located_reason = ""
+        self._rendered_columns = 0
+
+    @staticmethod
+    def _column_count_for_width(width: int) -> int:
+        if width >= 1700:
+            return 5
+        if width >= 1320:
+            return 4
+        if width >= 920:
+            return 3
+        if width >= 620:
+            return 2
+        return 1
+
+    def setPlainText(self, text: str) -> None:  # noqa: N802
+        self._stats = None
+        self._rendered_columns = 0
+        super().setPlainText(text)
+
+    def show_stats(self, stats: LogStats, *, located_reason: str = "") -> None:
+        self._stats = stats
+        self._located_reason = normalise_located_reason(located_reason)
+        self._render_stats(force=True, reset_scroll=True)
+
+    def _render_stats(self, *, force: bool = False, reset_scroll: bool = False) -> None:
+        if self._stats is None:
+            return
+        columns = self._column_count_for_width(self.viewport().width())
+        if not force and columns == self._rendered_columns:
+            return
+        scroll_value = 0 if reset_scroll else self.verticalScrollBar().value()
+        self._rendered_columns = columns
+        super().setHtml(
+            _render_log_stats_html(
+                self._stats,
+                located_reason=self._located_reason,
+                columns=columns,
+            )
+        )
+        self.verticalScrollBar().setValue(
+            min(scroll_value, self.verticalScrollBar().maximum())
+        )
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._render_stats()
 
 
 class DashboardAccountTableModel(QAbstractTableModel):
@@ -1522,8 +1740,13 @@ class MainWindow(QMainWindow):
         return page
 
     def _result_dashboard_tab(self) -> QWidget:
+        scroll_area = QScrollArea()
+        scroll_area.setObjectName("resultDashboardScrollArea")
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.Shape.NoFrame)
         page = QWidget()
         layout = QVBoxLayout(page)
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         header = QHBoxLayout()
         header.addWidget(QLabel("任务"))
         self.dashboard_task_selector = QComboBox()
@@ -1728,7 +1951,7 @@ class MainWindow(QMainWindow):
         self.log_stats_cancel_button.clicked.connect(self._cancel_log_stats_task)
         self.log_stats_cancel_button.setEnabled(False)
         buttons.addWidget(self.log_stats_cancel_button)
-        self.log_stats_export_button = QPushButton("导出可安全分享的诊断报告")
+        self.log_stats_export_button = QPushButton("导出中英文安全诊断报告")
         self.log_stats_export_button.clicked.connect(self._start_log_stats_export)
         self.log_stats_export_button.setEnabled(False)
         buttons.addWidget(self.log_stats_export_button)
@@ -1736,9 +1959,16 @@ class MainWindow(QMainWindow):
         self.log_stats_history_reason = QLabel("尚未选择可分析的历史任务。")
         self.log_stats_history_reason.setWordWrap(True)
         log_stats_content_layout.addWidget(self.log_stats_history_reason)
-        self.log_stats_output = QTextEdit()
+        self.log_stats_result_context = QLabel("当前尚未显示日志统计结果。")
+        self.log_stats_result_context.setObjectName("logStatsResultContext")
+        self.log_stats_result_context.setProperty("stale", False)
+        self.log_stats_result_context.setWordWrap(True)
+        log_stats_content_layout.addWidget(self.log_stats_result_context)
+        self.log_stats_output = LogStatsOutput()
+        self.log_stats_output.setObjectName("logStatsOutput")
         self.log_stats_output.setReadOnly(True)
-        self.log_stats_output.setMinimumHeight(180)
+        self.log_stats_output.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.log_stats_output.setMinimumHeight(300)
         log_stats_content_layout.addWidget(self.log_stats_output)
         self.log_stats_self_check = QLabel("最近一次导出：尚未执行产物自检。")
         self.log_stats_self_check.setWordWrap(True)
@@ -1756,11 +1986,47 @@ class MainWindow(QMainWindow):
         )
         log_stats_layout.addWidget(self.log_stats_content)
         layout.addWidget(self.log_stats_group)
-        return page
+        scroll_area.setWidget(page)
+        return scroll_area
 
     @staticmethod
     def _dashboard_key(path: Path | str) -> str:
         return os.path.normcase(str(Path(path).resolve()))
+
+    def _set_log_stats_result_context(self, text: str, *, stale: bool) -> None:
+        if not hasattr(self, "log_stats_result_context"):
+            return
+        self.log_stats_result_context.setText(text)
+        self.log_stats_result_context.setProperty("stale", stale)
+        style = self.log_stats_result_context.style()
+        style.unpolish(self.log_stats_result_context)
+        style.polish(self.log_stats_result_context)
+
+    def _update_log_stats_result_context(self) -> None:
+        if self._log_stats_result is None or not self._log_stats_scope:
+            self._set_log_stats_result_context(
+                "当前尚未显示日志统计结果。", stale=False
+            )
+            return
+        entry = self._dashboard_current_entry()
+        if entry is None:
+            self._set_log_stats_result_context(
+                "当前显示的是最近一次分析结果；尚未选中用于对照的任务。",
+                stale=False,
+            )
+            return
+        analysed_name = Path(self._log_stats_scope).name.casefold()
+        selected_name = entry.task_log.name.casefold()
+        if analysed_name == selected_name:
+            self._set_log_stats_result_context(
+                "当前显示的是结果看板所选任务的日志统计结果。", stale=False
+            )
+            return
+        self._set_log_stats_result_context(
+            "注意：下方仍是上一次分析结果，不是当前所选任务；"
+            "请点击“分析该任务日志”后再据此判断。",
+            stale=True,
+        )
 
     def _dashboard_current_entry(self) -> DashboardTaskIndexEntry | None:
         if not hasattr(self, "dashboard_task_selector"):
@@ -1867,6 +2133,7 @@ class MainWindow(QMainWindow):
             self.dashboard_task_selector.blockSignals(False)
             self._dashboard_syncing_selector = False
 
+        self._update_log_stats_result_context()
         self.dashboard_open_task_button.setEnabled(
             self._dashboard_current_entry() is not None
         )
@@ -1899,6 +2166,7 @@ class MainWindow(QMainWindow):
         self.dashboard_open_task_button.setEnabled(
             self._dashboard_current_entry() is not None
         )
+        self._update_log_stats_result_context()
         self._load_dashboard_selection(force_refresh=False)
 
     def _load_dashboard_selection(self, *, force_refresh: bool) -> None:
@@ -1972,6 +2240,7 @@ class MainWindow(QMainWindow):
             return False
         self._dashboard_snapshot = snapshot
         self._render_dashboard_snapshot(snapshot)
+        self._update_log_stats_result_context()
         return True
 
     def _render_dashboard_snapshot(self, snapshot: ResultDashboardSnapshot) -> None:
@@ -2275,14 +2544,8 @@ class MainWindow(QMainWindow):
             return
         self._log_stats_result = stats
         self._log_stats_scope = scope
-        report_body = render_report(
-            stats, located_reason=located_reason
-        ).partition("\n[LEAK SELF-CHECK]")[0]
-        report_body = report_body.replace(
-            "[abnormal-path status]",
-            "异常路径状态码（不在上面那张响应码表里）",
-        )
-        self.log_stats_output.setPlainText(report_body)
+        self.log_stats_output.show_stats(stats, located_reason=located_reason)
+        self._update_log_stats_result_context()
         self.log_stats_export_button.setEnabled(True)
         self.log_stats_self_check.setText("最近一次导出：尚未执行产物自检。")
         self.log_stats_export_path.clear()
@@ -2326,7 +2589,7 @@ class MainWindow(QMainWindow):
         scope = self._log_stats_scope
         spec = TaskSpec(
             task_type="log_stats_export",
-            display_name="导出日志诊断报告",
+            display_name="导出中英文日志诊断报告",
             resource_keys=frozenset({"diagnostics_dir"}),
             deduplicate_key=f"log_stats_export:{scope}",
             cancellable=True,
@@ -2336,7 +2599,7 @@ class MainWindow(QMainWindow):
         )
         task_id = self._submit_background(
             spec,
-            lambda context: self.controller.engine.export_diagnostic_report(
+            lambda context: self.controller.engine.export_diagnostic_reports(
                 scope, context=context
             ),
             output=self.log_stats_output,
@@ -2351,12 +2614,17 @@ class MainWindow(QMainWindow):
             self._log_stats_export_task_id = task_id
             self.log_stats_cancel_button.setEnabled(True)
 
-    def _log_stats_exported(self, path: Path) -> None:
+    def _log_stats_exported(self, paths: tuple[Path, Path]) -> None:
         if self.controller.startup_state is StartupState.CLOSING:
             return
-        self.log_stats_self_check.setText("最近一次导出：RESULT: CLEAN")
+        chinese_path, english_path = paths
+        self.log_stats_self_check.setText(
+            "最近一次导出：RESULT: CLEAN（中文版、英文版均通过）"
+        )
         self.log_stats_self_check.setStyleSheet("color: #15803d; font-weight: 600;")
-        self.log_stats_export_path.setText(f"已导出：{path}")
+        self.log_stats_export_path.setText(
+            f"已导出中文版：{chinese_path}\n已导出英文版：{english_path}"
+        )
 
     def _log_stats_export_failed(self, payload: object) -> None:
         if self.controller.startup_state is StartupState.CLOSING:
@@ -5314,6 +5582,13 @@ class MainWindow(QMainWindow):
             QLabel#dashboardMetricTitle { color: #4b5563; font-size: 12px; }
             QLabel#dashboardMetricValue { color: #111827; font-size: 16px;
                                            font-weight: 700; }
+            QLabel#logStatsResultContext { background: #f8fafc; color: #374151;
+                                           border: 1px solid #cbd5e1;
+                                           padding: 8px 10px; font-size: 14px;
+                                           font-weight: 600; }
+            QLabel#logStatsResultContext[stale="true"] { background: #fff7ed;
+                                                          color: #9a3412;
+                                                          border-color: #fdba74; }
             QTableWidget { background: white; border: 1px solid #cbd5e1;
                            gridline-color: #e5e7eb; }
             """

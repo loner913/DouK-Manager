@@ -803,6 +803,70 @@ class EngineService:
             raise
         return target
 
+    def export_diagnostic_reports(
+        self, run_id: str, *, context=None
+    ) -> tuple[Path, Path]:
+        """Export a Chinese/English report pair from cached statistics."""
+
+        if context is not None:
+            context.raise_if_cancelled()
+        cached = self._log_stats_results.get(str(run_id))
+        if cached is None:
+            raise EngineError("没有可导出的日志统计结果。")
+        stats, located_reason = cached
+        reports = (
+            ("zh-CN", render_report(stats, located_reason=located_reason, language="zh-CN")),
+            ("en", render_report(stats, located_reason=located_reason, language="en")),
+        )
+        for _language, text in reports:
+            check = self_check_text(text)
+            if not check.clean:
+                raise LogStatsLeakError(check)
+        if context is not None:
+            context.raise_if_cancelled()
+
+        directory = self.paths.logs / "Diagnostics"
+        directory.mkdir(parents=True, exist_ok=True)
+        stem = f"{datetime.now():%Y-%m-%d_%H-%M-%S-%f}-diagnostic"
+        counter = 0
+        while True:
+            unique_stem = stem if counter == 0 else f"{stem}-{counter}"
+            targets = tuple(
+                directory / f"{unique_stem}-{language}.txt"
+                for language, _text in reports
+            )
+            if not any(target.exists() for target in targets):
+                break
+            counter += 1
+
+        temporaries = tuple(
+            directory / f".{target.name}.{os.getpid()}.tmp" for target in targets
+        )
+        created_temporaries: list[Path] = []
+        finalised_targets: list[Path] = []
+        try:
+            for (_language, text), temporary in zip(
+                reports, temporaries, strict=True
+            ):
+                with temporary.open("x", encoding="utf-8", newline="\n") as handle:
+                    created_temporaries.append(temporary)
+                    handle.write(text)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            if context is not None:
+                context.raise_if_cancelled()
+            for temporary, target in zip(temporaries, targets, strict=True):
+                os.replace(temporary, target)
+                finalised_targets.append(target)
+        except BaseException:
+            for temporary in created_temporaries:
+                temporary.unlink(missing_ok=True)
+            for target in finalised_targets:
+                target.unlink(missing_ok=True)
+            raise
+        chinese_target, english_target = targets
+        return chinese_target, english_target
+
     def _request_monitor_stop(self, run: EngineRun, *, timeout: float) -> None:
         """Stop monitor gracefully, using its documented clipboard sentinel."""
 
