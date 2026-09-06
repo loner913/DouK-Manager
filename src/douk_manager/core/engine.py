@@ -30,11 +30,22 @@ from douk_manager.core.download_summary import (
 )
 from douk_manager.core.json_store import read_json, write_json_atomic
 from douk_manager.core.locks import critical_section
+from douk_manager.core.log_stats import (
+    LogStats,
+    LogStatsLeakError,
+    analyse_segments,
+    render_report,
+    self_check_text,
+)
 from douk_manager.ui_messages import format_information
 
 
 class EngineError(RuntimeError):
     pass
+
+
+def _log_stats_scope(task_log: Path) -> str:
+    return os.path.normcase(os.path.abspath(os.path.normpath(os.fspath(task_log))))
 
 
 class ProcessProbeState(Enum):
@@ -159,6 +170,7 @@ class EngineService:
         self.config = config
         self.backup = backup
         self.current: EngineRun | None = None
+        self._log_stats_results: dict[str, tuple[LogStats, str]] = {}
 
     def probe_external_running(self) -> ProcessProbe:
         """Probe manager-owned engine processes without treating uncertainty as safe."""
@@ -727,6 +739,69 @@ class EngineService:
                 raise error from exc
             run._summary_result = summary
             return summary
+
+    def analyse_run_logs(
+        self,
+        run_id: str,
+        *,
+        context=None,
+        segments=None,
+        located_reason: str = "",
+    ) -> LogStats:
+        """Analyse one already-located run without scanning the native-log directory."""
+
+        current = self.current
+        if current is not None and current.running:
+            raise EngineError("下载引擎运行中，不能分析原生日志。")
+        if segments is None:
+            if current is None or _log_stats_scope(current.task_log) != str(run_id):
+                raise EngineError("没有可分析的已完成下载任务。")
+            summary = current._summary_result
+            if summary is None:
+                raise EngineError("下载账号汇总尚未完成，不能分析原生日志。")
+            segments = summary.located.segments
+            located_reason = summary.located.reason
+        stats = analyse_segments(tuple(segments), context=context)
+        self._log_stats_results[str(run_id)] = (stats, located_reason)
+        return stats
+
+    def export_diagnostic_report(self, run_id: str, *, context=None) -> Path:
+        """Render cached whitelist statistics and atomically write a clean report."""
+
+        if context is not None:
+            context.raise_if_cancelled()
+        cached = self._log_stats_results.get(str(run_id))
+        if cached is None:
+            raise EngineError("没有可导出的日志统计结果。")
+        stats, located_reason = cached
+        text = render_report(stats, located_reason=located_reason)
+        check = self_check_text(text)
+        if not check.clean:
+            raise LogStatsLeakError(check)
+        if context is not None:
+            context.raise_if_cancelled()
+
+        directory = self.paths.logs / "Diagnostics"
+        directory.mkdir(parents=True, exist_ok=True)
+        stem = f"{datetime.now():%Y-%m-%d_%H-%M-%S-%f}-diagnostic"
+        target = directory / f"{stem}.txt"
+        counter = 1
+        while target.exists():
+            target = directory / f"{stem}-{counter}.txt"
+            counter += 1
+        temporary = directory / f".{target.name}.{os.getpid()}.tmp"
+        try:
+            with temporary.open("x", encoding="utf-8", newline="\n") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if context is not None:
+                context.raise_if_cancelled()
+            os.replace(temporary, target)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+        return target
 
     def _request_monitor_stop(self, run: EngineRun, *, timeout: float) -> None:
         """Stop monitor gracefully, using its documented clipboard sentinel."""

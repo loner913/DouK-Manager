@@ -62,6 +62,12 @@ from douk_manager.background import (
 )
 from douk_manager.core.download_summary import AccountStatus, format_summary_for_ui
 from douk_manager.core.engine import ENGINE_MODE_MONITOR, assess_process_exit
+from douk_manager.core.log_stats import (
+    LogStats,
+    SegmentSelectionStatus,
+    render_report,
+    select_dashboard_segments,
+)
 from douk_manager.core.power import request_normal_shutdown
 from douk_manager.core.result_history import ResultPageSnapshot
 from douk_manager.core.result_dashboard import (
@@ -496,6 +502,14 @@ class MainWindow(QMainWindow):
         self._dashboard_user_selected = False
         self._dashboard_syncing_selector = False
         self._dashboard_index_load_pending: bool | None = None
+        self._latest_log_stats_run: Any | None = None
+        self._pending_auto_log_stats_run: Any | None = None
+        self._log_stats_result: LogStats | None = None
+        self._log_stats_scope: str | None = None
+        self._log_stats_task_id: str | None = None
+        self._log_stats_export_task_id: str | None = None
+        self._queue_start_waiting_for_log_stats = False
+        self._log_stats_auto_enabled = self._read_log_stats_auto_enabled()
         self._collector_stop_task_id: str | None = None
         self.startup_generation = 0
         self._startup_task_id: str | None = None
@@ -541,6 +555,29 @@ class MainWindow(QMainWindow):
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self._poll_processes)
         self.poll_timer.start(500)
+
+    def _read_log_stats_auto_enabled(self) -> bool:
+        settings = getattr(self._window_state_store, "_settings", None)
+        if settings is None:
+            return False
+        try:
+            value = settings.value("log_stats/auto_analyse", False)
+        except Exception:
+            return False
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().casefold() in {"1", "true"}
+
+    def _save_log_stats_auto_enabled(self, enabled: bool) -> None:
+        self._log_stats_auto_enabled = bool(enabled)
+        settings = getattr(self._window_state_store, "_settings", None)
+        if settings is None:
+            return
+        try:
+            settings.setValue("log_stats/auto_analyse", self._log_stats_auto_enabled)
+            settings.sync()
+        except Exception as exc:
+            self.controller.logger.warning("日志统计自动分析开关保存失败：%s", exc)
 
     def _mark_safe_widget(self, widget: QWidget) -> QWidget:
         if widget not in self._safe_widgets:
@@ -605,6 +642,21 @@ class MainWindow(QMainWindow):
         if hasattr(self, "dashboard_open_native_button"):
             self.dashboard_open_native_button.setEnabled(
                 dashboard_enabled and self.dashboard_native_selector.count() > 0
+            )
+        if hasattr(self, "log_stats_group"):
+            self._update_log_stats_current_availability()
+            self._update_log_stats_history_availability()
+            self.log_stats_export_button.setEnabled(
+                dashboard_enabled
+                and self._log_stats_result is not None
+                and self._log_stats_export_task_id is None
+            )
+            self.log_stats_cancel_button.setEnabled(
+                dashboard_enabled
+                and (
+                    self._log_stats_task_id is not None
+                    or self._log_stats_export_task_id is not None
+                )
             )
 
     def begin_startup_check(self) -> bool:
@@ -1640,6 +1692,70 @@ class MainWindow(QMainWindow):
         )
         account_layout.addWidget(self.dashboard_account_table)
         layout.addWidget(account_box)
+
+        self.log_stats_group = QGroupBox("本次运行日志统计（只含统计量）")
+        log_stats_layout = QVBoxLayout(self.log_stats_group)
+        self.log_stats_expand_button = QPushButton("展开日志统计")
+        self.log_stats_expand_button.setCheckable(True)
+        log_stats_layout.addWidget(self.log_stats_expand_button)
+        self.log_stats_content = QWidget()
+        log_stats_content_layout = QVBoxLayout(self.log_stats_content)
+        log_stats_content_layout.setContentsMargins(0, 0, 0, 0)
+        log_stats_note = QLabel(
+            "以下数字来自本次分析所选任务新增的引擎原生日志片段。\n"
+            "a_bogus 与 x-secsdk-web-signature 次数相同属于正常，不代表签名降级；"
+            "判断外挂签名是否生效只看后者。\n"
+            "本报告不含 Cookie、Token、账号标识、作品标识、昵称、本地路径或 URL 查询串。"
+        )
+        log_stats_note.setWordWrap(True)
+        log_stats_content_layout.addWidget(log_stats_note)
+        self.log_stats_auto_checkbox = QCheckBox(
+            "任务完成后自动分析本次日志（默认关闭；大批量运行时会多占一会儿后台）"
+        )
+        self.log_stats_auto_checkbox.setChecked(self._log_stats_auto_enabled)
+        self.log_stats_auto_checkbox.toggled.connect(self._save_log_stats_auto_enabled)
+        log_stats_content_layout.addWidget(self.log_stats_auto_checkbox)
+        buttons = QHBoxLayout()
+        self.log_stats_current_button = QPushButton("分析本次日志")
+        self.log_stats_current_button.clicked.connect(self._start_current_log_stats)
+        self.log_stats_current_button.setEnabled(False)
+        buttons.addWidget(self.log_stats_current_button)
+        self.log_stats_history_button = QPushButton("分析该任务日志")
+        self.log_stats_history_button.clicked.connect(self._start_historical_log_stats)
+        self.log_stats_history_button.setEnabled(False)
+        buttons.addWidget(self.log_stats_history_button)
+        self.log_stats_cancel_button = QPushButton("取消")
+        self.log_stats_cancel_button.clicked.connect(self._cancel_log_stats_task)
+        self.log_stats_cancel_button.setEnabled(False)
+        buttons.addWidget(self.log_stats_cancel_button)
+        self.log_stats_export_button = QPushButton("导出可安全分享的诊断报告")
+        self.log_stats_export_button.clicked.connect(self._start_log_stats_export)
+        self.log_stats_export_button.setEnabled(False)
+        buttons.addWidget(self.log_stats_export_button)
+        log_stats_content_layout.addLayout(buttons)
+        self.log_stats_history_reason = QLabel("尚未选择可分析的历史任务。")
+        self.log_stats_history_reason.setWordWrap(True)
+        log_stats_content_layout.addWidget(self.log_stats_history_reason)
+        self.log_stats_output = QTextEdit()
+        self.log_stats_output.setReadOnly(True)
+        self.log_stats_output.setMinimumHeight(180)
+        log_stats_content_layout.addWidget(self.log_stats_output)
+        self.log_stats_self_check = QLabel("最近一次导出：尚未执行产物自检。")
+        self.log_stats_self_check.setWordWrap(True)
+        log_stats_content_layout.addWidget(self.log_stats_self_check)
+        self.log_stats_export_path = QLabel("")
+        self.log_stats_export_path.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.log_stats_export_path.setWordWrap(True)
+        log_stats_content_layout.addWidget(self.log_stats_export_path)
+        self.log_stats_content.setVisible(False)
+        self.log_stats_expand_button.toggled.connect(self.log_stats_content.setVisible)
+        self.log_stats_expand_button.toggled.connect(
+            lambda checked: self.log_stats_expand_button.setText(
+                "收起日志统计" if checked else "展开日志统计"
+            )
+        )
+        log_stats_layout.addWidget(self.log_stats_content)
+        layout.addWidget(self.log_stats_group)
         return page
 
     @staticmethod
@@ -1949,6 +2065,7 @@ class MainWindow(QMainWindow):
         self.dashboard_open_native_button.setEnabled(
             self.dashboard_native_selector.count() > 0
         )
+        self._update_log_stats_history_availability()
 
     def _apply_dashboard_account_filter(self, _value: object = None) -> None:
         if not hasattr(self, "_dashboard_account_model"):
@@ -1980,6 +2097,7 @@ class MainWindow(QMainWindow):
         self.dashboard_integrity.setText("尚无稳定结果")
         self.dashboard_native_selector.clear()
         self.dashboard_open_native_button.setEnabled(False)
+        self._update_log_stats_history_availability()
 
     def _dashboard_load_failed(self, payload: object, prefix: str) -> None:
         if self.controller.startup_state is StartupState.CLOSING:
@@ -2013,6 +2131,259 @@ class MainWindow(QMainWindow):
             return
         if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
             QMessageBox.information(self, f"无法打开{label}", f"无法打开{label}：\n{path}")
+
+    def _update_log_stats_history_availability(self) -> None:
+        if not hasattr(self, "log_stats_history_button"):
+            return
+        snapshot = getattr(self, "_dashboard_snapshot", None)
+        if snapshot is None:
+            self.log_stats_history_button.setEnabled(False)
+            self.log_stats_history_reason.setText("尚未选择可分析的历史任务。")
+            return
+        _segments, status = select_dashboard_segments(snapshot.native_log_segments)
+        messages = {
+            SegmentSelectionStatus.READY: "所选任务的日志区间可用。",
+            SegmentSelectionStatus.PARTIAL: "部分原生日志文件不可用，只分析可用片段。",
+            SegmentSelectionStatus.MISSING_RANGE: "该任务日志未记录日志区间，无法定位分析范围。",
+            SegmentSelectionStatus.MISSING_FILE: "原生日志文件已不存在。",
+        }
+        self.log_stats_history_reason.setText(messages[status])
+        self.log_stats_history_button.setEnabled(
+            self.controller.startup_state is StartupState.READY
+            and status in {SegmentSelectionStatus.READY, SegmentSelectionStatus.PARTIAL}
+        )
+
+    def _update_log_stats_current_availability(self) -> None:
+        if not hasattr(self, "log_stats_current_button"):
+            return
+        run = getattr(self, "_latest_log_stats_run", None)
+        self.log_stats_current_button.setEnabled(
+            self.controller.startup_state is StartupState.READY
+            and run is not None
+            and not getattr(run, "running", False)
+            and getattr(run, "_summary_result", None) is not None
+        )
+
+    def _start_current_log_stats(self, _checked: bool = False, *, automatic: bool = False) -> None:
+        if self.controller.startup_state is StartupState.CLOSING:
+            return
+        run = getattr(self, "_latest_log_stats_run", None)
+        if run is None or getattr(run, "_summary_result", None) is None:
+            if hasattr(self, "log_stats_output"):
+                self.log_stats_output.setPlainText("没有可分析的已完成下载任务。")
+            return
+        if getattr(run, "running", False):
+            self.log_stats_output.setPlainText("下载引擎运行中，不能分析原生日志。")
+            return
+        summary = run._summary_result
+        scope = MainWindow._canonical_task_log(run.task_log)
+        self._submit_log_stats_analysis(
+            scope,
+            lambda context: self.controller.engine.analyse_run_logs(
+                scope,
+                context=context,
+                segments=summary.located.segments,
+                located_reason=summary.located.reason,
+            ),
+            automatic=automatic,
+            refresh_targets=("run_result",),
+            located_reason=summary.located.reason,
+        )
+
+    def _start_historical_log_stats(self, _checked: bool = False) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        snapshot = getattr(self, "_dashboard_snapshot", None)
+        if snapshot is None:
+            self._update_log_stats_history_availability()
+            return
+        segments, status = select_dashboard_segments(snapshot.native_log_segments)
+        if status not in {SegmentSelectionStatus.READY, SegmentSelectionStatus.PARTIAL}:
+            self._update_log_stats_history_availability()
+            return
+        scope = snapshot.task_log.name
+        reason = (
+            "仅分析了可用的部分原生日志片段。"
+            if status is SegmentSelectionStatus.PARTIAL
+            else ""
+        )
+        self._submit_log_stats_analysis(
+            scope,
+            lambda context: self.controller.engine.analyse_run_logs(
+                scope,
+                context=context,
+                segments=segments,
+                located_reason=reason,
+            ),
+            automatic=False,
+            refresh_targets=("result_dashboard",),
+            located_reason=reason,
+        )
+
+    def _submit_log_stats_analysis(
+        self,
+        scope: str,
+        action: Callable[[object], object],
+        *,
+        automatic: bool,
+        refresh_targets: tuple[str, ...],
+        located_reason: str = "",
+    ) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        current = getattr(self.controller.engine, "current", None)
+        if current is not None and getattr(current, "running", False):
+            self.log_stats_output.setPlainText("下载引擎运行中，不能分析原生日志。")
+            return
+        spec = TaskSpec(
+            task_type="log_stats_analyse",
+            display_name="分析引擎原生日志统计",
+            resource_keys=frozenset({"task_logs"}),
+            deduplicate_key=f"log_stats_analyse:{scope}",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            refresh_targets=refresh_targets,
+            dynamic_cancellation=True,
+        )
+        if any(
+            binding.generation_key == spec.deduplicate_key
+            for binding in self._background_bindings.values()
+        ) or spec.deduplicate_key in self._background_pending:
+            return
+        self.log_stats_output.setPlainText("正在分析…")
+        task_id = self._submit_background(
+            spec,
+            action,
+            output=self.log_stats_output,
+            buttons=(self.log_stats_current_button, self.log_stats_history_button),
+            on_success=lambda stats: self._apply_log_stats_result(
+                stats, scope, located_reason=located_reason
+            ),
+            on_failure=lambda payload: self._log_stats_failed(payload, automatic=automatic),
+            on_cancelled=lambda payload: self._log_stats_cancelled(automatic=automatic),
+            on_removed=self._log_stats_analysis_removed,
+            generation_key=spec.deduplicate_key,
+        )
+        if task_id is not None:
+            self._log_stats_task_id = task_id
+            self.log_stats_cancel_button.setEnabled(True)
+
+    def _apply_log_stats_result(
+        self, stats: LogStats, scope: str, *, located_reason: str = ""
+    ) -> None:
+        if self.controller.startup_state is StartupState.CLOSING:
+            return
+        self._log_stats_result = stats
+        self._log_stats_scope = scope
+        report_body = render_report(
+            stats, located_reason=located_reason
+        ).partition("\n[LEAK SELF-CHECK]")[0]
+        report_body = report_body.replace(
+            "[abnormal-path status]",
+            "异常路径状态码（不在上面那张响应码表里）",
+        )
+        self.log_stats_output.setPlainText(report_body)
+        self.log_stats_export_button.setEnabled(True)
+        self.log_stats_self_check.setText("最近一次导出：尚未执行产物自检。")
+        self.log_stats_export_path.clear()
+
+    def _log_stats_failed(self, payload: object, *, automatic: bool) -> None:
+        if self.controller.startup_state is StartupState.CLOSING:
+            return
+        if isinstance(payload, TaskFailure) and payload.error_type == "LogStatsReadError":
+            message = "原生日志片段不可读取、编码无效或记录不完整。"
+        else:
+            message = "分析发生内部错误，未显示任何原始日志内容。"
+        prefix = "自动分析失败" if automatic else "分析失败"
+        self.log_stats_output.setPlainText(f"{prefix}：{message}")
+
+    def _log_stats_cancelled(self, *, automatic: bool) -> None:
+        if self.controller.startup_state is StartupState.CLOSING:
+            return
+        self.log_stats_output.setPlainText("自动分析已取消。" if automatic else "分析已取消。")
+
+    def _log_stats_analysis_removed(self) -> None:
+        self._log_stats_task_id = None
+        if hasattr(self, "log_stats_cancel_button"):
+            self.log_stats_cancel_button.setEnabled(
+                self._log_stats_export_task_id is not None
+            )
+        MainWindow._update_log_stats_current_availability(self)
+        self._update_log_stats_history_availability()
+        if (
+            getattr(self, "_queue_start_waiting_for_log_stats", False)
+            and self.controller.startup_state is StartupState.READY
+        ):
+            self._queue_start_waiting_for_log_stats = False
+            MainWindow._start_next_queue_item(self)
+
+    def _start_log_stats_export(self, _checked: bool = False) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        if self._log_stats_result is None or self._log_stats_scope is None:
+            self.log_stats_output.setPlainText("没有可导出的日志统计结果。")
+            return
+        scope = self._log_stats_scope
+        spec = TaskSpec(
+            task_type="log_stats_export",
+            display_name="导出日志诊断报告",
+            resource_keys=frozenset({"diagnostics_dir"}),
+            deduplicate_key=f"log_stats_export:{scope}",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            refresh_targets=(),
+            dynamic_cancellation=True,
+        )
+        task_id = self._submit_background(
+            spec,
+            lambda context: self.controller.engine.export_diagnostic_report(
+                scope, context=context
+            ),
+            output=self.log_stats_output,
+            buttons=(self.log_stats_export_button,),
+            on_success=self._log_stats_exported,
+            on_failure=self._log_stats_export_failed,
+            on_cancelled=lambda _payload: self._log_stats_export_cancelled(),
+            on_removed=self._log_stats_export_removed,
+            generation_key=spec.deduplicate_key,
+        )
+        if task_id is not None:
+            self._log_stats_export_task_id = task_id
+            self.log_stats_cancel_button.setEnabled(True)
+
+    def _log_stats_exported(self, path: Path) -> None:
+        if self.controller.startup_state is StartupState.CLOSING:
+            return
+        self.log_stats_self_check.setText("最近一次导出：RESULT: CLEAN")
+        self.log_stats_self_check.setStyleSheet("color: #15803d; font-weight: 600;")
+        self.log_stats_export_path.setText(f"已导出：{path}")
+
+    def _log_stats_export_failed(self, payload: object) -> None:
+        if self.controller.startup_state is StartupState.CLOSING:
+            return
+        if isinstance(payload, TaskFailure) and payload.error_type == "LogStatsLeakError":
+            message = payload.message
+        else:
+            message = "诊断报告导出失败；未显示任何日志内容。"
+        self.controller.logger.error("日志诊断报告导出失败：%s", message)
+        self.log_stats_self_check.setText(f"最近一次导出：REVIEW NEEDED；{message}")
+        self.log_stats_self_check.setStyleSheet("color: #b91c1c; font-weight: 600;")
+
+    def _log_stats_export_cancelled(self) -> None:
+        if self.controller.startup_state is not StartupState.CLOSING:
+            self.log_stats_self_check.setText("最近一次导出：已取消，未写入报告。")
+
+    def _log_stats_export_removed(self) -> None:
+        self._log_stats_export_task_id = None
+        if hasattr(self, "log_stats_cancel_button"):
+            self.log_stats_cancel_button.setEnabled(self._log_stats_task_id is not None)
+        if self._log_stats_result is not None:
+            self.log_stats_export_button.setEnabled(True)
+
+    def _cancel_log_stats_task(self) -> None:
+        task_id = self._log_stats_task_id or self._log_stats_export_task_id
+        if task_id is not None:
+            self._cancel_background(task_id)
 
     def _defer_dashboard_refresh_until_results_idle(self) -> None:
         if (
@@ -3619,6 +3990,9 @@ class MainWindow(QMainWindow):
     def _start_next_queue_item(self) -> None:
         if getattr(self.controller, "startup_state", None) is StartupState.CLOSING:
             return
+        if getattr(self, "_log_stats_task_id", None) is not None:
+            self._queue_start_waiting_for_log_stats = True
+            return
         if self.queue_pending and self.queue_paused:
             self._append_info(
                 self.queue_output,
@@ -3879,6 +4253,12 @@ class MainWindow(QMainWindow):
         self._append_info(self.queue_output, *format_summary_for_ui(summary))
         run = binding.run
         run._summary_result = summary
+        self._latest_log_stats_run = run
+        MainWindow._update_log_stats_current_availability(self)
+        if getattr(self, "log_stats_auto_checkbox", None) is not None and (
+            self.log_stats_auto_checkbox.isChecked()
+        ):
+            self._pending_auto_log_stats_run = run
         if getattr(run, "completion_marker", None) is not None and run.running:
             if getattr(run, "pause_after_exit", False):
                 run.result_review_waiting = True
@@ -3906,6 +4286,10 @@ class MainWindow(QMainWindow):
 
         self._refresh_background_targets(("download_results", "runtime_status"))
         MainWindow._defer_dashboard_refresh_until_results_idle(self)
+        pending_auto = getattr(self, "_pending_auto_log_stats_run", None)
+        if pending_auto is binding.run:
+            self._pending_auto_log_stats_run = None
+            self._start_current_log_stats_for_run(pending_auto)
         if getattr(self.controller, "startup_state", None) is StartupState.CLOSING:
             MainWindow._finalize_download_summary_for_closing(self, binding)
             return
@@ -3955,6 +4339,12 @@ class MainWindow(QMainWindow):
         self.queue_active = False
         self._release_download_lifecycle()
         MainWindow._retire_download_summary_binding(self, binding)
+
+    def _start_current_log_stats_for_run(self, run) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        self._latest_log_stats_run = run
+        self._start_current_log_stats(automatic=True)
 
     def _collector_is_enabled(self) -> bool:
         return bool(self.controller.collector.running or self.controller.collector.health())
