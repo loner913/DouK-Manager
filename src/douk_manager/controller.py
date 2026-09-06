@@ -18,6 +18,10 @@ from douk_manager.core.engine import (
 )
 from douk_manager.core.engine_update import (
     EnginePackagePreview,
+    EngineRollbackPoint,
+    EngineRollbackPreview,
+    EngineRollbackResult,
+    EngineRollbackUsage,
     EngineUpdateResult,
     EngineUpdateService,
 )
@@ -74,7 +78,11 @@ class ManagerController:
         self.results = ResultHistoryService(self.paths.download_task_logs)
         self.result_dashboard = ResultDashboardService(self.paths.download_task_logs)
         self.engine = EngineService(self.paths, self.config, self.backup)
-        self.engine_updates = EngineUpdateService(self.paths, self.backup)
+        self.engine_updates = EngineUpdateService(
+            self.paths,
+            self.backup,
+            process_guard=lambda: self._require_engine_change_processes_idle("回退"),
+        )
         self.collector = CollectorService(self.config, self.paths)
         self.screenshots = ScreenshotService()
         self.indexer = IndexService()
@@ -700,6 +708,79 @@ class ManagerController:
             result.rollback_path,
         )
         return result
+
+    def list_engine_rollbacks(
+        self,
+        *,
+        context: OperationContext | None = None,
+    ) -> tuple[EngineRollbackPoint, ...]:
+        self._require_operational_ready_with_context(
+            "列举下载引擎回退点",
+            context=context,
+        )
+        return self.engine_updates.list_rollback_points(context=context)
+
+    def preview_engine_rollback(
+        self,
+        point_dir: Path,
+        *,
+        context: OperationContext | None = None,
+    ) -> EngineRollbackPreview:
+        self._require_operational_ready_with_context(
+            "预检下载引擎回退点",
+            context=context,
+        )
+        return self.engine_updates.preview_rollback(point_dir, context=context)
+
+    def measure_engine_rollback_usage(
+        self,
+        *,
+        context: OperationContext | None = None,
+    ) -> EngineRollbackUsage:
+        self._require_operational_ready_with_context(
+            "统计下载引擎回退点占用",
+            context=context,
+        )
+        return self.engine_updates.measure_rollback_usage(context=context)
+
+    def apply_engine_rollback(
+        self,
+        point_dir: Path,
+        *,
+        accept_unverified: bool = False,
+        context: OperationContext | None = None,
+    ) -> EngineRollbackResult:
+        self.require_safe_write()
+        self._require_engine_change_processes_idle("回退")
+        if context is not None:
+            context.raise_if_cancelled()
+        # Repeat immediately before the service takes its process lock. This
+        # catches a process that appeared while the preflight checks ran.
+        self._require_engine_change_processes_idle("回退")
+        result = self.engine_updates.apply_rollback(
+            point_dir,
+            accept_unverified=accept_unverified,
+            context=context,
+        )
+        self.logger.info(
+            "下载引擎回退完成：备份=%s；被换下引擎=%s；来源清单=%s；清单已核对=%s",
+            result.backup_path,
+            result.superseded_path,
+            result.source_had_manifest,
+            result.manifest_verified,
+        )
+        return result
+
+    def _require_engine_change_processes_idle(self, operation: str) -> None:
+        if self.engine.external_running():
+            raise ControllerError(f"下载引擎正在运行，禁止{operation}。")
+        if self.collector.running or self.collector.health():
+            raise ControllerError(f"账号采集服务运行时不能{operation}下载引擎。")
+
+    # Descriptive aliases keep the controller vocabulary explicit at call sites.
+    list_engine_rollback_points = list_engine_rollbacks
+    preview_engine_rollback_point = preview_engine_rollback
+    apply_engine_rollback_point = apply_engine_rollback
 
     def start_collector(self, *, context: OperationContext | None = None) -> Path:
         self.require_collector_start()

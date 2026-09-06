@@ -21,7 +21,7 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut
+from PySide6.QtGui import QColor, QDesktopServices, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -65,6 +65,12 @@ from douk_manager.background import (
 )
 from douk_manager.core.download_summary import AccountStatus, format_summary_for_ui
 from douk_manager.core.engine import ENGINE_MODE_MONITOR, assess_process_exit
+from douk_manager.core.engine_update import (
+    EngineRollbackPoint,
+    RollbackApplyGate,
+    RollbackIntegrity,
+    rollback_can_apply,
+)
 from douk_manager.core.log_stats import (
     ENDPOINTS,
     FIELD_PRESENCE,
@@ -726,6 +732,10 @@ class MainWindow(QMainWindow):
         self._log_stats_scope: str | None = None
         self._log_stats_task_id: str | None = None
         self._log_stats_export_task_id: str | None = None
+        self._engine_rollback_points: tuple[EngineRollbackPoint, ...] = ()
+        self._engine_rollback_usage_task_id: str | None = None
+        self._engine_rollback_refresh_generation = 0
+        self._engine_rollback_usage_pending = False
         self._queue_start_waiting_for_log_stats = False
         self._log_stats_auto_enabled = self._read_log_stats_auto_enabled()
         self._collector_stop_task_id: str | None = None
@@ -876,6 +886,8 @@ class MainWindow(QMainWindow):
                     or self._log_stats_export_task_id is not None
                 )
             )
+        if hasattr(self, "engine_rollback_table"):
+            self._update_engine_rollback_buttons()
 
     def begin_startup_check(self) -> bool:
         if self.controller.startup_state is StartupState.CLOSING:
@@ -1681,6 +1693,49 @@ class MainWindow(QMainWindow):
         update_grid.addWidget(preview_update, 1, 1)
         update_grid.addWidget(apply_update, 1, 2)
         layout.addWidget(update_box)
+
+        rollback_box = QGroupBox("回退到历史引擎")
+        rollback_layout = QVBoxLayout(rollback_box)
+        rollback_controls = QHBoxLayout()
+        self.engine_rollback_refresh_button = QPushButton("刷新列表")
+        self.engine_rollback_refresh_button.clicked.connect(self._refresh_engine_rollbacks)
+        rollback_controls.addWidget(self.engine_rollback_refresh_button)
+        self.engine_rollback_usage_cancel_button = QPushButton("取消统计")
+        self.engine_rollback_usage_cancel_button.clicked.connect(
+            self._cancel_engine_rollback_usage
+        )
+        self.engine_rollback_usage_cancel_button.setEnabled(False)
+        rollback_controls.addWidget(self.engine_rollback_usage_cancel_button)
+        self.engine_rollback_preview_button = QPushButton("预检回退点")
+        self.engine_rollback_preview_button.clicked.connect(self._preview_engine_rollback)
+        rollback_controls.addWidget(self.engine_rollback_preview_button)
+        self.engine_rollback_apply_button = QPushButton("执行回退")
+        self.engine_rollback_apply_button.clicked.connect(self._apply_engine_rollback)
+        rollback_controls.addWidget(self.engine_rollback_apply_button)
+        rollback_controls.addStretch()
+        rollback_layout.addLayout(rollback_controls)
+        self.engine_rollback_usage_label = QLabel("尚未统计磁盘占用")
+        self.engine_rollback_usage_label.setWordWrap(True)
+        rollback_layout.addWidget(self.engine_rollback_usage_label)
+        self.engine_rollback_table = QTableWidget(0, 5)
+        self.engine_rollback_table.setHorizontalHeaderLabels(
+            ("换下时间", "来源", "来源包名", "main.exe 大小", "状态")
+        )
+        self.engine_rollback_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.engine_rollback_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.engine_rollback_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.engine_rollback_table.horizontalHeader().setStretchLastSection(True)
+        self.engine_rollback_table.itemSelectionChanged.connect(
+            self._update_engine_rollback_buttons
+        )
+        rollback_layout.addWidget(self.engine_rollback_table)
+        layout.addWidget(rollback_box)
         self.settings_output = QTextEdit()
         self.settings_output.setReadOnly(True)
         layout.addWidget(self.settings_output, 1)
@@ -5348,6 +5403,359 @@ class MainWindow(QMainWindow):
             lambda context: self.controller.apply_engine_update(archive, context=context),
             output=self.settings_output,
             buttons=(self.engine_update_apply_button,),
+            on_success=show_result,
+        )
+
+    @staticmethod
+    def _canonical_engine_rollback_point(point: Path) -> str:
+        return os.path.normcase(os.path.normpath(os.path.abspath(os.fspath(point))))
+
+    def _selected_engine_rollback_point(self) -> EngineRollbackPoint | None:
+        if not hasattr(self, "engine_rollback_table"):
+            return None
+        row = self.engine_rollback_table.currentRow()
+        if row < 0 or row >= len(self._engine_rollback_points):
+            return None
+        return self._engine_rollback_points[row]
+
+    def _update_engine_rollback_buttons(self) -> None:
+        if not hasattr(self, "engine_rollback_preview_button"):
+            return
+        selected = self._selected_engine_rollback_point()
+        ready = self.controller.startup_state is StartupState.READY
+        preview_busy = any(
+            binding.spec.task_type in {
+                "engine_rollback_preview",
+                "engine_rollback_preview_for_apply",
+            }
+            for binding in self._background_bindings.values()
+        )
+        apply_busy = any(
+            binding.spec.task_type == "engine_rollback_apply"
+            for binding in self._background_bindings.values()
+        )
+        self.engine_rollback_preview_button.setEnabled(
+            ready and selected is not None and not preview_busy
+        )
+        allowed = (
+            selected is not None
+            and rollback_can_apply(selected).gate is not RollbackApplyGate.REJECTED
+        )
+        self.engine_rollback_apply_button.setEnabled(
+            ready and allowed and not apply_busy and not preview_busy
+        )
+        if hasattr(self, "engine_rollback_usage_cancel_button"):
+            self.engine_rollback_usage_cancel_button.setEnabled(
+                ready and getattr(self, "_engine_rollback_usage_task_id", None) is not None
+            )
+
+    def _render_engine_rollback_points(self, points: tuple[EngineRollbackPoint, ...]) -> None:
+        self._engine_rollback_points = tuple(points)
+        table = self.engine_rollback_table
+        table.setRowCount(len(points))
+        origin_labels = {
+            "ROLLBACK": "更新时换下",
+            "SUPERSEDED": "回退时换下",
+        }
+        for row, point in enumerate(points):
+            decision = rollback_can_apply(point)
+            status = (
+                point.integrity.value
+                if decision.gate is not RollbackApplyGate.REJECTED
+                else f"{point.integrity.value}：{decision.reason}"
+            )
+            values = (
+                point.stamp,
+                origin_labels.get(point.origin.value, point.origin.value),
+                point.archive_name or "（无记录）",
+                f"{point.main_exe_bytes} bytes" if point.main_exe_bytes is not None else "未知",
+                status,
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if decision.gate is RollbackApplyGate.REJECTED:
+                    item.setForeground(QColor("#94a3b8"))
+                    item.setToolTip(decision.reason)
+                table.setItem(row, column, item)
+        self._update_engine_rollback_buttons()
+
+    def _refresh_engine_rollbacks(self) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        spec = TaskSpec(
+            task_type="engine_rollback_list",
+            display_name="刷新引擎回退点",
+            resource_keys=frozenset({"engine_files"}),
+            deduplicate_key="engine_rollback_list",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            dynamic_cancellation=True,
+        )
+        self._engine_rollback_usage_pending = False
+
+        def show_points(points: object) -> None:
+            self._render_engine_rollback_points(tuple(points))
+            self.engine_rollback_usage_label.setText("正在统计磁盘占用…")
+            self._engine_rollback_usage_pending = True
+
+        def submit_usage() -> None:
+            if self._engine_rollback_usage_pending:
+                self._engine_rollback_usage_pending = False
+                self._submit_engine_rollback_usage()
+
+        self._submit_background(
+            spec,
+            lambda context: self.controller.list_engine_rollbacks(context=context),
+            output=self.settings_output,
+            buttons=(self.engine_rollback_refresh_button,),
+            on_success=show_points,
+            on_removed=submit_usage,
+            generation_key="engine_rollback_list",
+        )
+
+    def _submit_engine_rollback_usage(self) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        spec = TaskSpec(
+            task_type="engine_rollback_usage",
+            display_name="统计引擎回退点占用",
+            resource_keys=frozenset({"engine_files"}),
+            deduplicate_key="engine_rollback_usage",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            dynamic_cancellation=True,
+        )
+
+        def show_usage(usage: object) -> None:
+            self.engine_rollback_usage_label.setText(
+                f"回退点 {usage.rollback_count} 份 · 已被换下的引擎 {usage.superseded_count} 份 · "
+                f"合计占用 {usage.total_bytes / 1024 / 1024 / 1024:.2f} GB"
+            )
+
+        def usage_cancelled(_payload: object) -> None:
+            self.engine_rollback_usage_label.setText(
+                "磁盘占用统计已取消（可重新刷新）"
+            )
+
+        task_id_holder: dict[str, str | None] = {"value": None}
+
+        def usage_removed() -> None:
+            if self._engine_rollback_usage_task_id == task_id_holder["value"]:
+                self._engine_rollback_usage_task_id = None
+                self.engine_rollback_usage_cancel_button.setEnabled(False)
+
+        task_id = self._submit_background(
+            spec,
+            lambda context: self.controller.measure_engine_rollback_usage(context=context),
+            output=self.settings_output,
+            buttons=(self.engine_rollback_refresh_button,),
+            on_success=show_usage,
+            on_cancelled=usage_cancelled,
+            on_removed=usage_removed,
+            generation_key="engine_rollback_usage",
+        )
+        task_id_holder["value"] = task_id
+        self._engine_rollback_usage_task_id = task_id
+        self.engine_rollback_usage_cancel_button.setEnabled(task_id is not None)
+        if task_id is None:
+            self.engine_rollback_usage_label.setText(
+                "磁盘占用统计未启动（可重新刷新）"
+            )
+
+    def _cancel_engine_rollback_usage(self) -> None:
+        task_id = self._engine_rollback_usage_task_id
+        if task_id is not None:
+            self._cancel_background(task_id)
+
+    def _preview_engine_rollback(self) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        point = self._selected_engine_rollback_point()
+        if point is None:
+            return
+        spec = TaskSpec(
+            task_type="engine_rollback_preview",
+            display_name="预检引擎回退点",
+            resource_keys=frozenset({"engine_files"}),
+            deduplicate_key=(
+                "engine_rollback_preview:"
+                f"{self._canonical_engine_rollback_point(point.directory)}"
+            ),
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            dynamic_cancellation=True,
+        )
+
+        def show_preview(preview: object) -> None:
+            item = preview.point
+            messages = [
+                f"回退点状态：{item.integrity.value}",
+                f"目标 main.exe SHA-256：{item.main_exe_sha256 or '无清单，未核对'}",
+                f"当前 main.exe SHA-256：{preview.current_main_sha256}",
+                f"正式 Volume 不会被替换：{'是' if preview.volume_stays else '否'}",
+            ]
+            if item.integrity is RollbackIntegrity.NO_MANIFEST:
+                messages.extend(
+                    (
+                        "main.exe：存在",
+                        "_internal：存在",
+                        "_internal/Volume：不存在",
+                        item.reject_reason,
+                        "无法核对与已安装版本的一致性。",
+                    )
+                )
+            elif rollback_can_apply(item).gate is RollbackApplyGate.REJECTED:
+                messages.extend((item.reject_reason, "此回退点不可执行，任何确认都无法放行。"))
+            else:
+                messages.append(f"与当前引擎相同：{'是' if preview.is_same_as_current else '否'}")
+            self._replace_info(self.settings_output, *messages)
+
+        self._submit_coalesced_background(
+            spec,
+            lambda context: self.controller.preview_engine_rollback(
+                point.directory,
+                context=context,
+            ),
+            output=self.settings_output,
+            buttons=(self.engine_rollback_preview_button,),
+            on_success=show_preview,
+            generation_key="engine_rollback_preview",
+        )
+
+    def _apply_engine_rollback(self) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        point = self._selected_engine_rollback_point()
+        if point is None:
+            return
+        decision = rollback_can_apply(point)
+        if decision.gate is RollbackApplyGate.REJECTED:
+            self._replace_info(
+                self.settings_output,
+                "该回退点不可执行。",
+                decision.reason,
+                "任何确认都不能放行。",
+            )
+            return
+        spec = TaskSpec(
+            task_type="engine_rollback_preview_for_apply",
+            display_name="预检引擎回退点",
+            resource_keys=frozenset({"engine_files"}),
+            deduplicate_key=(
+                "engine_rollback_preview:"
+                f"{self._canonical_engine_rollback_point(point.directory)}"
+            ),
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            dynamic_cancellation=True,
+        )
+        accepted = {"value": False}
+        accept_unverified = {"value": False}
+
+        def confirm(preview: object) -> None:
+            item = preview.point
+            if rollback_can_apply(item).gate is RollbackApplyGate.REJECTED:
+                self._replace_info(self.settings_output, "该回退点不可执行。", item.reject_reason)
+                return
+            answer = QMessageBox.question(
+                self,
+                "确认回退下载引擎",
+                "将只替换下载引擎程序文件，正式 Volume 不会被替换，也不会回到旧状态。\n\n"
+                f"安装时间：{item.installed_at.isoformat(sep=' ') if item.installed_at else item.stamp}\n"
+                f"来源：{item.archive_name or '无记录'}\n"
+                f"目标 main.exe SHA-256：{item.main_exe_sha256 or '无清单，未核对'}\n"
+                f"当前 main.exe SHA-256：{preview.current_main_sha256}\n\n"
+                "管理器会先永久备份完整正式 Volume，当前引擎会永久保存在 Updates\\EngineSuperseded。\n\n"
+                "确认继续？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+            if rollback_can_apply(item).requires_second_confirm:
+                warning_answer = QMessageBox.question(
+                    self,
+                    "确认无清单回退",
+                    "该回退点缺少安装清单，无法核对与已安装版本的一致性。\n\n"
+                    "已确认 main.exe、_internal 存在且 _internal 内不含 Volume。\n\n"
+                    "回退记录将保存本次实际读取的哈希、大小与来源目录。\n\n"
+                    "仍然回退？（不建议）",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if warning_answer != QMessageBox.Yes:
+                    return
+                accept_unverified["value"] = True
+            accepted["value"] = True
+
+        self._submit_coalesced_background(
+            spec,
+            lambda context: self.controller.preview_engine_rollback(
+                point.directory,
+                context=context,
+            ),
+            output=self.settings_output,
+            buttons=(self.engine_rollback_apply_button,),
+            on_success=confirm,
+            on_removed=lambda: self._submit_engine_rollback_apply(
+                point.directory,
+                accept_unverified=accept_unverified["value"],
+            )
+            if accepted["value"]
+            else None,
+            generation_key="engine_rollback_preview",
+        )
+
+    def _submit_engine_rollback_apply(
+        self,
+        point_dir: Path,
+        *,
+        accept_unverified: bool = False,
+    ) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        spec = TaskSpec(
+            task_type="engine_rollback_apply",
+            display_name="执行引擎回退",
+            resource_keys=frozenset(
+                {
+                    "engine_process",
+                    "collector_process",
+                    "engine_files",
+                    "volume",
+                    "settings",
+                }
+            ),
+            deduplicate_key="engine_rollback_apply",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            refresh_targets=("runtime_status",),
+            dynamic_cancellation=True,
+        )
+
+        def show_result(result: object) -> None:
+            if result.manifest_verified:
+                first = "下载引擎回退完成。"
+            else:
+                first = "回退完成（来源无清单，未与已安装版本核对）。"
+            self._replace_info(
+                self.settings_output,
+                first,
+                f"回退前永久备份：{result.backup_path}",
+                f"被换下引擎：{result.superseded_path}",
+                f"实际恢复 main.exe SHA-256：{result.restored_main_sha256}",
+                f"来源目录：{result.source_directory}",
+            )
+
+        self._submit_background(
+            spec,
+            lambda context: self.controller.apply_engine_rollback(
+                point_dir,
+                accept_unverified=accept_unverified,
+                context=context,
+            ),
+            output=self.settings_output,
+            buttons=(self.engine_rollback_apply_button,),
             on_success=show_result,
         )
 
