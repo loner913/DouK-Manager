@@ -517,10 +517,12 @@ class EngineUpdateService:
                 self._process_guard()
 
             superseded = self._next_history_directory("EngineSuperseded")
+            source_main_recovery = superseded / ".rollback-source-main"
             if context is not None:
                 context.enter_critical_phase()
             try:
                 superseded.mkdir(parents=True)
+                shutil.copy2(point.directory / "main.exe", source_main_recovery)
                 shutil.move(
                     str(self.paths.engine_exe),
                     str(superseded / self.paths.engine_exe.name),
@@ -541,7 +543,6 @@ class EngineUpdateService:
                 self._verify_after_rollback(
                     critical_before,
                     observed_main_sha256,
-                    decision,
                     sidecar_before=sidecar_before,
                 )
                 manifest = {
@@ -566,12 +567,14 @@ class EngineUpdateService:
                 )
                 if json.loads(manifest_path.read_text(encoding="utf-8")) != manifest:
                     raise EngineUpdateError("回退结果清单复读校验失败。")
+                source_main_recovery.unlink()
             except Exception as exc:
                 restore_error = self._restore_failed_rollback(
                     superseded,
                     point.directory,
                     critical_before=critical_before,
                     sidecar_before=sidecar_before,
+                    source_main_recovery=source_main_recovery,
                 )
                 if restore_error:
                     raise EngineUpdateError(
@@ -825,15 +828,23 @@ class EngineUpdateService:
         manifest: dict[str, Any] | None = None
         manifest_unreadable = False
         try:
-            manifest_present = manifest_path.is_file()
-            if manifest_present:
+            manifest_path.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            manifest_present = True
+            manifest_unreadable = True
+        else:
+            manifest_present = True
+            try:
                 parsed = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
+                manifest_unreadable = True
+            else:
                 if isinstance(parsed, dict):
                     manifest = parsed
-        except OSError:
-            manifest_unreadable = True
-        except (UnicodeError, json.JSONDecodeError, TypeError):
-            manifest = None
+                else:
+                    manifest_unreadable = True
 
         installed_at = self._parse_datetime(
             manifest.get("installed_at") if manifest is not None else None
@@ -854,8 +865,9 @@ class EngineUpdateService:
                 else "replaced_main_sha256"
             )
             raw_expected = manifest.get(expected_key)
-            if raw_expected:
-                expected_sha256 = str(raw_expected)
+            expected_sha256 = self._normalize_sha256(raw_expected)
+            if expected_sha256 is None:
+                manifest_unreadable = True
 
         integrity = (
             RollbackIntegrity.UNREADABLE
@@ -867,7 +879,9 @@ class EngineUpdateService:
         try:
             main = point_dir / "main.exe"
             internal = point_dir / "_internal"
-            if not main.is_file():
+            if manifest_unreadable:
+                integrity = RollbackIntegrity.UNREADABLE
+            elif not main.is_file():
                 integrity = RollbackIntegrity.MISSING_MAIN
             elif not internal.is_dir():
                 integrity = RollbackIntegrity.MISSING_INTERNAL
@@ -878,9 +892,7 @@ class EngineUpdateService:
                 actual_sha256 = self._sha256_file_with_context(main, context=context)
                 main_bytes = main.stat().st_size
                 internal_file_count = self._count_files(internal, context=context)
-                if manifest_unreadable:
-                    integrity = RollbackIntegrity.UNREADABLE
-                elif manifest is not None and expected_sha256:
+                if manifest is not None:
                     integrity = (
                         RollbackIntegrity.OK
                         if actual_sha256 == expected_sha256
@@ -907,6 +919,16 @@ class EngineUpdateService:
             integrity=integrity,
             reject_reason=_ROLLBACK_REASONS[integrity],
         )
+
+    @staticmethod
+    def _normalize_sha256(value: object) -> str | None:
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdefABCDEF" for character in value)
+        ):
+            return None
+        return value.lower()
 
     @staticmethod
     def _parse_datetime(value: object) -> datetime | None:
@@ -1015,17 +1037,13 @@ class EngineUpdateService:
         self,
         critical_before: dict[str, str],
         target_main_sha256: str,
-        decision: RollbackApplyDecision,
         *,
         sidecar_before: dict[str, str] | None = None,
     ) -> None:
         if not self.paths.engine_exe.is_file():
             raise EngineUpdateError("回退后 main.exe 缺失。")
         actual_sha256 = sha256_file(self.paths.engine_exe)
-        if (
-            decision.gate is RollbackApplyGate.ALLOWED
-            and actual_sha256 != target_main_sha256
-        ):
+        if actual_sha256 != target_main_sha256:
             raise EngineUpdateError("回退后 main.exe 哈希校验失败。")
         if self._critical_hashes() != critical_before:
             raise EngineUpdateError("回退前后正式 Volume 关键文件哈希不一致。")
@@ -1042,6 +1060,7 @@ class EngineUpdateService:
         *,
         critical_before: dict[str, str] | None = None,
         sidecar_before: dict[str, str] | None = None,
+        source_main_recovery: Path | None = None,
     ) -> str:
         current_internal = self.paths.engine_root / "_internal"
         old_internal = superseded / "_internal"
@@ -1049,6 +1068,11 @@ class EngineUpdateService:
         point_internal = point_dir / "_internal"
         point_exe = point_dir / "main.exe"
         try:
+            if source_main_recovery is not None and source_main_recovery.is_file():
+                if point_exe.exists():
+                    source_main_recovery.unlink()
+                else:
+                    shutil.move(str(source_main_recovery), str(point_exe))
             if old_internal.is_dir():
                 old_volume = old_internal / "Volume"
                 current_volume = current_internal / "Volume"

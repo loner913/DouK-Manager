@@ -221,7 +221,7 @@ class EngineRollbackTests(unittest.TestCase):
                     self.assertNotIn("/", point.reject_reason)
                     self.assertNotIn(str(base), point.reject_reason)
 
-    def test_bad_manifest_is_unverified_even_when_file_exists(self) -> None:
+    def test_malformed_json_manifest_is_unreadable_and_rejected(self) -> None:
         with self.temporary_directory() as directory:
             base = Path(directory)
             paths = make_paths(base)
@@ -233,12 +233,125 @@ class EngineRollbackTests(unittest.TestCase):
             )
             (point / "update-manifest.json").write_text("{bad", encoding="utf-8")
             inspected = service.list_rollback_points()[0]
-            self.assertEqual(inspected.integrity, RollbackIntegrity.NO_MANIFEST)
+            self.assertEqual(inspected.integrity, RollbackIntegrity.UNREADABLE)
             self.assertTrue(inspected.has_manifest)
             self.assertEqual(
                 rollback_can_apply(inspected).gate,
-                RollbackApplyGate.ALLOWED_WITH_WARNING,
+                RollbackApplyGate.REJECTED,
             )
+
+    def test_non_object_manifest_is_unreadable_and_rejected(self) -> None:
+        with self.temporary_directory() as directory:
+            base = Path(directory)
+            paths = make_paths(base)
+            service = EngineUpdateService(paths, BackupService(paths))
+            point = write_point(
+                paths.updates / "EngineRollback",
+                "2026-09-06_10-00-00-000000",
+                b"old",
+            )
+            (point / "update-manifest.json").write_text("[]", encoding="utf-8")
+            inspected = service.list_rollback_points()[0]
+            self.assertEqual(inspected.integrity, RollbackIntegrity.UNREADABLE)
+            self.assertEqual(
+                rollback_can_apply(inspected).gate,
+                RollbackApplyGate.REJECTED,
+            )
+
+    def test_non_utf8_manifest_is_unreadable_and_rejected(self) -> None:
+        with self.temporary_directory() as directory:
+            base = Path(directory)
+            paths = make_paths(base)
+            service = EngineUpdateService(paths, BackupService(paths))
+            point = write_point(
+                paths.updates / "EngineRollback",
+                "2026-09-06_10-00-00-000000",
+                b"old",
+            )
+            (point / "update-manifest.json").write_bytes(b"\xff\xfe")
+            inspected = service.list_rollback_points()[0]
+            self.assertEqual(inspected.integrity, RollbackIntegrity.UNREADABLE)
+            self.assertEqual(
+                rollback_can_apply(inspected).gate,
+                RollbackApplyGate.REJECTED,
+            )
+
+    def test_each_origin_requires_its_manifest_main_hash(self) -> None:
+        cases = (
+            (
+                "EngineRollback",
+                "update-manifest.json",
+                "old_main_sha256",
+                RollbackOrigin.ROLLBACK,
+            ),
+            (
+                "EngineSuperseded",
+                "rollback-manifest.json",
+                "replaced_main_sha256",
+                RollbackOrigin.SUPERSEDED,
+            ),
+        )
+        for root_name, manifest_name, required_key, origin in cases:
+            with self.subTest(origin=origin):
+                with self.temporary_directory() as directory:
+                    base = Path(directory)
+                    paths = make_paths(base)
+                    service = EngineUpdateService(paths, BackupService(paths))
+                    point = write_point(
+                        paths.updates / root_name,
+                        "2026-09-06_10-00-00-000000",
+                        b"old",
+                        manifest_name=manifest_name,
+                    )
+                    manifest_path = point / manifest_name
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    manifest.pop(required_key)
+                    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                    inspected = service.list_rollback_points()[0]
+                    self.assertIs(inspected.origin, origin)
+                    self.assertEqual(
+                        inspected.integrity,
+                        RollbackIntegrity.UNREADABLE,
+                    )
+                    self.assertEqual(
+                        rollback_can_apply(inspected).gate,
+                        RollbackApplyGate.REJECTED,
+                    )
+
+    def test_invalid_required_manifest_hash_is_unreadable_and_rejected(self) -> None:
+        invalid_values = (
+            None,
+            "",
+            "not-a-sha256",
+            "g" * 64,
+            "0x" + "0" * 62,
+            "+" + "0" * 63,
+            123,
+        )
+        for index, value in enumerate(invalid_values):
+            with self.subTest(value=value):
+                with self.temporary_directory() as directory:
+                    base = Path(directory)
+                    paths = make_paths(base)
+                    service = EngineUpdateService(paths, BackupService(paths))
+                    point = write_point(
+                        paths.updates / "EngineRollback",
+                        f"2026-09-06_10-00-{index:02d}-000000",
+                        b"old",
+                    )
+                    manifest_path = point / "update-manifest.json"
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    manifest["old_main_sha256"] = value
+                    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                    inspected = service.list_rollback_points()[0]
+                    self.assertEqual(
+                        inspected.integrity,
+                        RollbackIntegrity.UNREADABLE,
+                    )
+                    self.assertEqual(
+                        rollback_can_apply(inspected).gate,
+                        RollbackApplyGate.REJECTED,
+                    )
 
     def test_unreadable_manifest_is_hard_rejected(self) -> None:
         with self.temporary_directory() as directory:
@@ -329,6 +442,12 @@ class EngineRollbackTests(unittest.TestCase):
             service = EngineUpdateService(paths, BackupService(paths))
             payload = b"unverified-engine"
             point = write_point(paths.updates / "EngineRollback", "2026-09-06_10-00-00-000000", payload, manifest_name=None)
+            inspected = service.list_rollback_points()[0]
+            self.assertEqual(inspected.integrity, RollbackIntegrity.NO_MANIFEST)
+            self.assertEqual(
+                rollback_can_apply(inspected).gate,
+                RollbackApplyGate.ALLOWED_WITH_WARNING,
+            )
             result = service.apply_rollback(point, accept_unverified=True)
             self.assertFalse(result.source_had_manifest)
             self.assertFalse(result.manifest_verified)
@@ -338,26 +457,81 @@ class EngineRollbackTests(unittest.TestCase):
             self.assertNotIn("校验通过", text)
             self.assertNotIn("已验证", text)
 
-    def test_invalid_manifest_success_records_observed_values_not_manifest_values(self) -> None:
+    def test_existing_invalid_manifest_cannot_be_forced_or_start_transaction(self) -> None:
+        cases = (
+            ("EngineRollback", "update-manifest.json"),
+            ("EngineSuperseded", "rollback-manifest.json"),
+        )
+        for root_name, manifest_name in cases:
+            with self.subTest(root_name=root_name):
+                with self.temporary_directory() as directory:
+                    base = Path(directory)
+                    paths = make_paths(base)
+                    point = write_point(
+                        paths.updates / root_name,
+                        "2026-09-06_10-00-00-000000",
+                        b"invalid-manifest-engine",
+                        manifest_name=manifest_name,
+                    )
+                    (point / manifest_name).write_text("{invalid", encoding="utf-8")
+                    backup = BackupService(paths)
+                    service = EngineUpdateService(paths, backup)
+                    original_engine = paths.engine_exe.read_bytes()
+                    with (
+                        patch.object(backup, "create_full_snapshot") as create_backup,
+                        patch("douk_manager.core.engine_update.shutil.move") as move,
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "无法读取"):
+                            service.apply_rollback(point, accept_unverified=True)
+                    create_backup.assert_not_called()
+                    move.assert_not_called()
+                    self.assertEqual(paths.engine_exe.read_bytes(), original_engine)
+                    self.assertTrue(point.joinpath("main.exe").is_file())
+                    self.assertTrue(point.joinpath("_internal").is_dir())
+
+    def test_no_manifest_post_move_hash_mismatch_restores_engine_volume_and_source(self) -> None:
         with self.temporary_directory() as directory:
             base = Path(directory)
             paths = make_paths(base)
-            payload = b"invalid-manifest-engine"
+            payload = b"unverified-engine"
             point = write_point(
                 paths.updates / "EngineRollback",
                 "2026-09-06_10-00-00-000000",
                 payload,
+                manifest_name=None,
             )
-            (point / "update-manifest.json").write_text("{invalid", encoding="utf-8")
             service = EngineUpdateService(paths, BackupService(paths))
-            result = service.apply_rollback(point, accept_unverified=True)
-            self.assertTrue(result.source_had_manifest)
-            self.assertFalse(result.manifest_verified)
+            original_engine = paths.engine_exe.read_bytes()
+            volume_hashes = {
+                name: sha256_file(paths.volume / name)
+                for name in EngineUpdateService.CRITICAL_NAMES
+            }
+            real_move = shutil.move
+
+            def move_then_corrupt(source, destination, *args, **kwargs):
+                result = real_move(source, destination, *args, **kwargs)
+                if Path(source) == point / "main.exe":
+                    self.assertEqual(Path(destination), paths.engine_exe)
+                    paths.engine_exe.write_bytes(b"changed-after-move")
+                return result
+
+            with patch(
+                "douk_manager.core.engine_update.shutil.move",
+                side_effect=move_then_corrupt,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "哈希校验失败"):
+                    service.apply_rollback(point, accept_unverified=True)
+
+            self.assertEqual(paths.engine_exe.read_bytes(), original_engine)
             self.assertEqual(
-                result.observed_main_sha256,
-                hashlib.sha256(payload).hexdigest(),
+                {
+                    name: sha256_file(paths.volume / name)
+                    for name in EngineUpdateService.CRITICAL_NAMES
+                },
+                volume_hashes,
             )
-            self.assertEqual(result.observed_main_bytes, len(payload))
+            self.assertEqual(point.joinpath("main.exe").read_bytes(), payload)
+            self.assertTrue(point.joinpath("_internal").is_dir())
 
     def test_superseded_engine_is_listed_and_can_be_used_as_next_source(self) -> None:
         with self.temporary_directory() as directory:
