@@ -8,12 +8,14 @@ import tempfile
 import unittest
 import zipfile
 from contextlib import closing
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from PySide6.QtWidgets import QMessageBox
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication, QMessageBox, QTableWidget, QTableWidgetItem
 
 from douk_manager.background import ClosePolicy
 from douk_manager.config import AppConfig, ManagedPaths
@@ -22,6 +24,7 @@ from douk_manager.core.backup import BackupService, sha256_file
 from douk_manager.core.engine_update import (
     EngineRollbackPoint,
     EngineRollbackPreview,
+    EngineUpdateError,
     EngineUpdateService,
     RollbackApplyGate,
     RollbackIntegrity,
@@ -164,6 +167,136 @@ class EngineRollbackTests(unittest.TestCase):
             points = service.list_rollback_points()
             self.assertEqual([point.origin.value for point in points], ["SUPERSEDED", "ROLLBACK"])
             self.assertEqual(points[0].archive_name, "engine-package.zip")
+
+    def test_list_exposes_observed_main_hash_without_a_manifest(self) -> None:
+        with self.temporary_directory() as directory:
+            base = Path(directory)
+            paths = make_paths(base)
+            payload = b"unverified-engine"
+            write_point(
+                paths.updates / "EngineRollback",
+                "2026-09-06_10-00-00-000000",
+                payload,
+                manifest_name=None,
+            )
+            service = EngineUpdateService(paths, BackupService(paths))
+
+            point = service.list_rollback_points()[0]
+
+            self.assertEqual(point.integrity, RollbackIntegrity.NO_MANIFEST)
+            self.assertEqual(
+                point.observed_main_sha256,
+                hashlib.sha256(payload).hexdigest(),
+            )
+
+    def test_rejected_point_still_exposes_observed_main_hash(self) -> None:
+        with self.temporary_directory() as directory:
+            base = Path(directory)
+            paths = make_paths(base)
+            payload = b"incomplete-engine"
+            point_dir = write_point(
+                paths.updates / "EngineRollback",
+                "2026-09-06_10-00-00-000000",
+                payload,
+                expected_sha="a" * 64,
+            )
+            shutil.rmtree(point_dir / "_internal")
+            service = EngineUpdateService(paths, BackupService(paths))
+
+            point = service.list_rollback_points()[0]
+
+            self.assertEqual(point.integrity, RollbackIntegrity.MISSING_INTERNAL)
+            self.assertEqual(point.main_exe_sha256, "a" * 64)
+            self.assertEqual(
+                point.observed_main_sha256,
+                hashlib.sha256(payload).hexdigest(),
+            )
+
+    def test_note_persists_across_refresh_and_restart_without_touching_manifest(self) -> None:
+        with self.temporary_directory() as directory:
+            base = Path(directory)
+            paths = make_paths(base)
+            stamp = "2026-09-06_10-00-00-000000"
+            point_dir = write_point(
+                paths.updates / "EngineRollback",
+                stamp,
+                b"old",
+            )
+            superseded_dir = write_point(
+                paths.updates / "EngineSuperseded",
+                stamp,
+                b"newer",
+                manifest_name="rollback-manifest.json",
+            )
+            manifest = point_dir / "update-manifest.json"
+            manifest_before = manifest.read_bytes()
+            superseded_manifest = superseded_dir / "rollback-manifest.json"
+            superseded_manifest_before = superseded_manifest.read_bytes()
+            service = EngineUpdateService(paths, BackupService(paths))
+
+            self.assertEqual(service.set_rollback_note(point_dir, "  first note  "), "first note")
+            self.assertEqual(
+                service.set_rollback_note(superseded_dir, "newer note"),
+                "newer note",
+            )
+            notes_by_origin = {
+                point.origin: point.note for point in service.list_rollback_points()
+            }
+            self.assertEqual(notes_by_origin[RollbackOrigin.ROLLBACK], "first note")
+            self.assertEqual(notes_by_origin[RollbackOrigin.SUPERSEDED], "newer note")
+
+            restarted = EngineUpdateService(paths, BackupService(paths))
+            notes_by_origin = {
+                point.origin: point.note for point in restarted.list_rollback_points()
+            }
+            self.assertEqual(notes_by_origin[RollbackOrigin.ROLLBACK], "first note")
+            self.assertEqual(notes_by_origin[RollbackOrigin.SUPERSEDED], "newer note")
+            self.assertEqual(restarted.set_rollback_note(point_dir, "updated note"), "updated note")
+            notes_by_origin = {
+                point.origin: point.note for point in restarted.list_rollback_points()
+            }
+            self.assertEqual(notes_by_origin[RollbackOrigin.ROLLBACK], "updated note")
+            self.assertEqual(notes_by_origin[RollbackOrigin.SUPERSEDED], "newer note")
+            self.assertEqual(manifest.read_bytes(), manifest_before)
+            self.assertEqual(superseded_manifest.read_bytes(), superseded_manifest_before)
+
+            self.assertEqual(restarted.set_rollback_note(point_dir, "   "), "")
+            notes_by_origin = {
+                point.origin: point.note for point in restarted.list_rollback_points()
+            }
+            self.assertEqual(notes_by_origin[RollbackOrigin.ROLLBACK], "")
+            self.assertEqual(notes_by_origin[RollbackOrigin.SUPERSEDED], "newer note")
+            notes = json.loads(restarted.rollback_notes_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                notes,
+                {
+                    "schema": 1,
+                    "notes": {f"SUPERSEDED:{stamp}": "newer note"},
+                },
+            )
+            self.assertEqual(manifest.read_bytes(), manifest_before)
+            self.assertEqual(superseded_manifest.read_bytes(), superseded_manifest_before)
+
+    def test_invalid_note_store_is_not_overwritten(self) -> None:
+        with self.temporary_directory() as directory:
+            base = Path(directory)
+            paths = make_paths(base)
+            point_dir = write_point(
+                paths.updates / "EngineRollback",
+                "2026-09-06_10-00-00-000000",
+                b"old",
+            )
+            service = EngineUpdateService(paths, BackupService(paths))
+            invalid_document = b"{not valid json"
+            service.rollback_notes_path.write_bytes(invalid_document)
+
+            with self.assertRaisesRegex(
+                EngineUpdateError,
+                "回退点备注记录无法读取",
+            ):
+                service.set_rollback_note(point_dir, "must not replace the file")
+
+            self.assertEqual(service.rollback_notes_path.read_bytes(), invalid_document)
 
     def test_all_rejected_integrity_states_are_classified_without_paths(self) -> None:
         with self.temporary_directory() as directory:
@@ -961,8 +1094,30 @@ class EngineRollbackTests(unittest.TestCase):
             controller.apply_engine_rollback(Path("point"))
         controller.engine_updates.apply_rollback.assert_not_called()
 
+    def test_controller_saves_rollback_note_after_ready_gate(self) -> None:
+        controller = ManagerController.__new__(ManagerController)
+        controller.require_operational_ready = Mock()
+        controller.engine_updates = Mock()
+        controller.engine_updates.set_rollback_note.return_value = "saved note"
+        point = Path("synthetic") / "EngineRollback" / "point"
+
+        self.assertEqual(
+            controller.save_engine_rollback_note(point, " saved note "),
+            "saved note",
+        )
+
+        controller.require_operational_ready.assert_called_once_with()
+        controller.engine_updates.set_rollback_note.assert_called_once_with(
+            point,
+            " saved note ",
+        )
+
 
 class EngineRollbackGuiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
     @staticmethod
     def _button() -> SimpleNamespace:
         return SimpleNamespace(setEnabled=Mock())
@@ -1001,6 +1156,88 @@ class EngineRollbackGuiTests(unittest.TestCase):
         submitted.kwargs["on_removed"]()
         submitted.kwargs["on_removed"]()
         window._submit_engine_rollback_usage.assert_called_once_with()
+
+    def test_table_renders_full_hash_and_persistent_editable_note_columns(self) -> None:
+        observed_hash = "c" * 64
+        point = replace(
+            rollback_point(RollbackIntegrity.OK),
+            observed_main_sha256=observed_hash,
+            note="known-good",
+        )
+        table = QTableWidget(0, 7)
+        window = SimpleNamespace(
+            _engine_rollback_points=(),
+            engine_rollback_table=table,
+            _update_engine_rollback_buttons=Mock(),
+        )
+
+        unobserved = rollback_point(RollbackIntegrity.UNREADABLE)
+        MainWindow._render_engine_rollback_points(window, (point, unobserved))
+
+        self.assertEqual(table.item(0, 4).text(), observed_hash)
+        self.assertEqual(table.item(0, 5).text(), "known-good")
+        self.assertEqual(table.item(1, 4).text(), "不可用")
+        self.assertTrue(table.item(0, 5).flags() & Qt.ItemFlag.ItemIsEditable)
+        for column in (0, 1, 2, 3, 4, 6):
+            self.assertFalse(table.item(0, column).flags() & Qt.ItemFlag.ItemIsEditable)
+
+    def test_editing_note_saves_it_and_updates_the_rendered_point(self) -> None:
+        point = replace(rollback_point(RollbackIntegrity.OK), note="old note")
+        table = QTableWidget(1, 7)
+        note_item = table.item(0, 5)
+        if note_item is None:
+            note_item = QTableWidgetItem("new note")
+            table.setItem(0, 5, note_item)
+        controller = SimpleNamespace(
+            save_engine_rollback_note=Mock(return_value="new note")
+        )
+        window = SimpleNamespace(
+            controller=controller,
+            settings_output=object(),
+            engine_rollback_table=table,
+            _engine_rollback_points=(point,),
+            _replace_info=Mock(),
+            statusBar=Mock(return_value=SimpleNamespace(showMessage=Mock())),
+        )
+
+        MainWindow._save_engine_rollback_note(window, note_item)
+
+        controller.save_engine_rollback_note.assert_called_once_with(
+            point.directory,
+            "new note",
+        )
+        self.assertEqual(window._engine_rollback_points[0].note, "new note")
+
+    def test_note_save_failure_restores_rendered_value(self) -> None:
+        point = replace(rollback_point(RollbackIntegrity.OK), note="old note")
+        table = QTableWidget(1, 7)
+        note_item = QTableWidgetItem("unsaved note")
+        table.setItem(0, 5, note_item)
+        controller = SimpleNamespace(
+            save_engine_rollback_note=Mock(
+                side_effect=ControllerError("synthetic save failure")
+            )
+        )
+        status_bar = SimpleNamespace(showMessage=Mock())
+        window = SimpleNamespace(
+            controller=controller,
+            settings_output=object(),
+            engine_rollback_table=table,
+            _engine_rollback_points=(point,),
+            _replace_info=Mock(),
+            statusBar=Mock(return_value=status_bar),
+        )
+
+        MainWindow._save_engine_rollback_note(window, note_item)
+
+        self.assertEqual(note_item.text(), "old note")
+        self.assertEqual(window._engine_rollback_points, (point,))
+        window._replace_info.assert_called_once_with(
+            window.settings_output,
+            "【备注保存失败】",
+            "synthetic save failure",
+        )
+        status_bar.showMessage.assert_called_once_with("回退点备注保存失败")
 
     def test_usage_task_is_cancellable_and_reports_cancelled_state(self) -> None:
         controller = SimpleNamespace(

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from html import escape
 from pathlib import Path
@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QGroupBox,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -1717,12 +1718,21 @@ class MainWindow(QMainWindow):
         self.engine_rollback_usage_label = QLabel("尚未统计磁盘占用")
         self.engine_rollback_usage_label.setWordWrap(True)
         rollback_layout.addWidget(self.engine_rollback_usage_label)
-        self.engine_rollback_table = QTableWidget(0, 5)
+        self.engine_rollback_table = QTableWidget(0, 7)
         self.engine_rollback_table.setHorizontalHeaderLabels(
-            ("换下时间", "来源", "来源包名", "main.exe 大小", "状态")
+            (
+                "换下时间",
+                "来源",
+                "来源包名",
+                "main.exe 大小",
+                "main.exe SHA-256",
+                "备注",
+                "状态",
+            )
         )
         self.engine_rollback_table.setEditTriggers(
-            QAbstractItemView.EditTrigger.NoEditTriggers
+            QAbstractItemView.EditTrigger.DoubleClicked
+            | QAbstractItemView.EditTrigger.EditKeyPressed
         )
         self.engine_rollback_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -1730,9 +1740,21 @@ class MainWindow(QMainWindow):
         self.engine_rollback_table.setSelectionMode(
             QAbstractItemView.SelectionMode.SingleSelection
         )
-        self.engine_rollback_table.horizontalHeader().setStretchLastSection(True)
+        rollback_header = self.engine_rollback_table.horizontalHeader()
+        rollback_header.setStretchLastSection(False)
+        rollback_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        rollback_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        rollback_header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self.engine_rollback_table.setColumnWidth(0, 190)
+        self.engine_rollback_table.setColumnWidth(1, 90)
+        self.engine_rollback_table.setColumnWidth(3, 120)
+        self.engine_rollback_table.setColumnWidth(4, 220)
+        self.engine_rollback_table.setColumnWidth(6, 180)
         self.engine_rollback_table.itemSelectionChanged.connect(
             self._update_engine_rollback_buttons
+        )
+        self.engine_rollback_table.itemChanged.connect(
+            self._save_engine_rollback_note
         )
         rollback_layout.addWidget(self.engine_rollback_table)
         layout.addWidget(rollback_box)
@@ -5452,32 +5474,88 @@ class MainWindow(QMainWindow):
     def _render_engine_rollback_points(self, points: tuple[EngineRollbackPoint, ...]) -> None:
         self._engine_rollback_points = tuple(points)
         table = self.engine_rollback_table
-        table.setRowCount(len(points))
-        origin_labels = {
-            "ROLLBACK": "更新时换下",
-            "SUPERSEDED": "回退时换下",
-        }
-        for row, point in enumerate(points):
-            decision = rollback_can_apply(point)
-            status = (
-                point.integrity.value
-                if decision.gate is not RollbackApplyGate.REJECTED
-                else f"{point.integrity.value}：{decision.reason}"
-            )
-            values = (
-                point.stamp,
-                origin_labels.get(point.origin.value, point.origin.value),
-                point.archive_name or "（无记录）",
-                f"{point.main_exe_bytes} bytes" if point.main_exe_bytes is not None else "未知",
-                status,
-            )
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                if decision.gate is RollbackApplyGate.REJECTED:
-                    item.setForeground(QColor("#94a3b8"))
-                    item.setToolTip(decision.reason)
-                table.setItem(row, column, item)
+        signals_were_blocked = table.blockSignals(True)
+        try:
+            table.setRowCount(len(points))
+            origin_labels = {
+                "ROLLBACK": "更新时换下",
+                "SUPERSEDED": "回退时换下",
+            }
+            for row, point in enumerate(points):
+                decision = rollback_can_apply(point)
+                status = (
+                    point.integrity.value
+                    if decision.gate is not RollbackApplyGate.REJECTED
+                    else f"{point.integrity.value}：{decision.reason}"
+                )
+                observed_hash = point.observed_main_sha256
+                values = (
+                    point.stamp,
+                    origin_labels.get(point.origin.value, point.origin.value),
+                    point.archive_name or "（无记录）",
+                    (
+                        f"{point.main_exe_bytes} bytes"
+                        if point.main_exe_bytes is not None
+                        else "未知"
+                    ),
+                    observed_hash or "不可用",
+                    point.note,
+                    status,
+                )
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    tooltips: list[str] = []
+                    if column == 5:
+                        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
+                        tooltips.append("双击编辑备注；清空并确认后删除备注。")
+                    else:
+                        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    if column == 4 and observed_hash:
+                        tooltips.append(f"main.exe SHA-256：{observed_hash}")
+                    if decision.gate is RollbackApplyGate.REJECTED:
+                        item.setForeground(QColor("#94a3b8"))
+                        tooltips.append(decision.reason)
+                    if tooltips:
+                        item.setToolTip("\n".join(tooltips))
+                    table.setItem(row, column, item)
+        finally:
+            table.blockSignals(signals_were_blocked)
         self._update_engine_rollback_buttons()
+
+    def _save_engine_rollback_note(self, item: QTableWidgetItem) -> None:
+        if item.column() != 5:
+            return
+        row = item.row()
+        if row < 0 or row >= len(self._engine_rollback_points):
+            return
+        point = self._engine_rollback_points[row]
+        if item.text() == point.note:
+            return
+        try:
+            saved_note = self.controller.save_engine_rollback_note(
+                point.directory,
+                item.text(),
+            )
+        except Exception as exc:
+            signals_were_blocked = self.engine_rollback_table.blockSignals(True)
+            try:
+                item.setText(point.note)
+            finally:
+                self.engine_rollback_table.blockSignals(signals_were_blocked)
+            self._replace_info(self.settings_output, "【备注保存失败】", str(exc))
+            self.statusBar().showMessage("回退点备注保存失败")
+            return
+
+        signals_were_blocked = self.engine_rollback_table.blockSignals(True)
+        try:
+            item.setText(saved_note)
+        finally:
+            self.engine_rollback_table.blockSignals(signals_were_blocked)
+        self._engine_rollback_points = tuple(
+            replace(candidate, note=saved_note) if index == row else candidate
+            for index, candidate in enumerate(self._engine_rollback_points)
+        )
+        self.statusBar().showMessage("回退点备注已保存")
 
     def _refresh_engine_rollbacks(self) -> None:
         if self.controller.startup_state is not StartupState.READY:

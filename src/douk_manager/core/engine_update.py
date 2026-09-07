@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from douk_manager.config import ManagedPaths
 from douk_manager.core.backup import BackupService, sha256_file, sqlite_quick_check
-from douk_manager.core.json_store import read_json
+from douk_manager.core.json_store import JsonFileError, read_json, write_json_atomic
 from douk_manager.core.locks import critical_section
 from douk_manager.operation import TaskCancelled
 
@@ -65,6 +65,8 @@ class EngineRollbackPoint:
     has_manifest: bool
     integrity: RollbackIntegrity
     reject_reason: str
+    observed_main_sha256: str | None = None
+    note: str = ""
 
 
 @dataclass(frozen=True)
@@ -180,6 +182,9 @@ class EngineUpdateService:
         "DouK-Downloader.db",
     )
     ENGINE_SIDECAR_NAMES = ("encipher.py",)
+    ROLLBACK_NOTES_SCHEMA = 1
+    ROLLBACK_NOTES_FILENAME = "engine_rollback_notes.json"
+    MAX_ROLLBACK_NOTE_CHARS = 200
 
     _ROLLBACK_ROOTS = (
         ("EngineRollback", RollbackOrigin.ROLLBACK, "update-manifest.json"),
@@ -337,6 +342,7 @@ class EngineUpdateService:
         """Read both managed engine-history directories without changing them."""
 
         points: list[EngineRollbackPoint] = []
+        notes = self._read_rollback_notes()
         for directory_name, origin, manifest_name in self._ROLLBACK_ROOTS:
             self._raise_if_cancelled(context)
             root = self.paths.updates / directory_name
@@ -364,6 +370,7 @@ class EngineUpdateService:
                         origin=origin,
                         manifest_name=manifest_name,
                         context=context,
+                        note=notes.get(self._rollback_note_key(origin, candidate.name), ""),
                     )
                 )
         return tuple(sorted(points, key=lambda point: point.stamp, reverse=True))
@@ -378,11 +385,13 @@ class EngineUpdateService:
 
         self._raise_if_cancelled(context)
         point_path, origin, manifest_name = self._rollback_location(point_dir)
+        notes = self._read_rollback_notes()
         point = self._inspect_rollback_point(
             point_path,
             origin=origin,
             manifest_name=manifest_name,
             context=context,
+            note=notes.get(self._rollback_note_key(origin, point_path.name), ""),
         )
         self._raise_if_cancelled(context)
         self.backup.validate_live_data()
@@ -459,6 +468,44 @@ class EngineUpdateService:
             superseded_bytes=superseded_bytes,
             total_bytes=rollback_bytes + superseded_bytes,
         )
+
+    @property
+    def rollback_notes_path(self) -> Path:
+        return self.paths.data / self.ROLLBACK_NOTES_FILENAME
+
+    def set_rollback_note(self, point_dir: Path, note: str) -> str:
+        """Persist user metadata separately from immutable engine history."""
+
+        point_path, origin, _manifest_name = self._rollback_location(point_dir)
+        normalized = self._normalize_rollback_note(note)
+        try:
+            is_visible_point = point_path.is_dir() and (
+                (point_path / "main.exe").exists()
+                or (point_path / "_internal").exists()
+            )
+        except OSError as exc:
+            raise EngineUpdateError("回退点状态无法读取，备注未保存。") from exc
+        if not is_visible_point:
+            raise EngineUpdateError("回退点已不在当前列表中，备注未保存。")
+
+        key = self._rollback_note_key(origin, point_path.name)
+        with critical_section(self.paths.lock_file, timeout=1.0):
+            notes = self._read_rollback_notes()
+            if normalized:
+                notes[key] = normalized
+            else:
+                notes.pop(key, None)
+            try:
+                write_json_atomic(
+                    self.rollback_notes_path,
+                    {
+                        "schema": self.ROLLBACK_NOTES_SCHEMA,
+                        "notes": notes,
+                    },
+                )
+            except (OSError, JsonFileError) as exc:
+                raise EngineUpdateError("回退点备注保存失败。") from exc
+        return normalized
 
     def apply_rollback(
         self,
@@ -821,6 +868,7 @@ class EngineUpdateService:
         origin: RollbackOrigin,
         manifest_name: str,
         context: OperationContext | None,
+        note: str = "",
     ) -> EngineRollbackPoint:
         self._raise_if_cancelled(context)
         manifest_path = point_dir / manifest_name
@@ -875,27 +923,35 @@ class EngineUpdateService:
             else RollbackIntegrity.NO_MANIFEST
         )
         main_bytes: int | None = None
+        observed_main_sha256: str | None = None
         internal_file_count: int | None = None
         try:
             main = point_dir / "main.exe"
             internal = point_dir / "_internal"
+            main_is_file = main.is_file()
+            internal_is_dir = internal.is_dir()
+            if main_is_file:
+                self._raise_if_cancelled(context)
+                observed_main_sha256 = self._sha256_file_with_context(
+                    main,
+                    context=context,
+                )
+                main_bytes = main.stat().st_size
             if manifest_unreadable:
                 integrity = RollbackIntegrity.UNREADABLE
-            elif not main.is_file():
+            elif not main_is_file:
                 integrity = RollbackIntegrity.MISSING_MAIN
-            elif not internal.is_dir():
+            elif not internal_is_dir:
                 integrity = RollbackIntegrity.MISSING_INTERNAL
             elif (internal / "Volume").exists():
                 integrity = RollbackIntegrity.CONTAINS_VOLUME
             else:
                 self._raise_if_cancelled(context)
-                actual_sha256 = self._sha256_file_with_context(main, context=context)
-                main_bytes = main.stat().st_size
                 internal_file_count = self._count_files(internal, context=context)
                 if manifest is not None:
                     integrity = (
                         RollbackIntegrity.OK
-                        if actual_sha256 == expected_sha256
+                        if observed_main_sha256 == expected_sha256
                         else RollbackIntegrity.HASH_MISMATCH
                     )
                 else:
@@ -918,7 +974,50 @@ class EngineUpdateService:
             has_manifest=manifest_present,
             integrity=integrity,
             reject_reason=_ROLLBACK_REASONS[integrity],
+            observed_main_sha256=observed_main_sha256,
+            note=note,
         )
+
+    @staticmethod
+    def _rollback_note_key(origin: RollbackOrigin, stamp: str) -> str:
+        return f"{origin.value}:{stamp}"
+
+    def _read_rollback_notes(self) -> dict[str, str]:
+        path = self.rollback_notes_path
+        try:
+            if not path.exists():
+                return {}
+            if not path.is_file():
+                raise EngineUpdateError("回退点备注记录无法读取。")
+            document = read_json(path)
+        except (OSError, JsonFileError) as exc:
+            raise EngineUpdateError("回退点备注记录无法读取。") from exc
+
+        raw_notes = document.get("notes")
+        if document.get("schema") != self.ROLLBACK_NOTES_SCHEMA or not isinstance(
+            raw_notes, dict
+        ):
+            raise EngineUpdateError("回退点备注记录格式无效，拒绝覆盖。")
+        notes: dict[str, str] = {}
+        for key, value in raw_notes.items():
+            if (
+                not isinstance(key, str)
+                or not isinstance(value, str)
+                or len(value) > self.MAX_ROLLBACK_NOTE_CHARS
+            ):
+                raise EngineUpdateError("回退点备注记录格式无效，拒绝覆盖。")
+            notes[key] = value
+        return notes
+
+    def _normalize_rollback_note(self, note: str) -> str:
+        if not isinstance(note, str):
+            raise EngineUpdateError("回退点备注必须是文本。")
+        normalized = " ".join(note.split())
+        if len(normalized) > self.MAX_ROLLBACK_NOTE_CHARS:
+            raise EngineUpdateError(
+                f"回退点备注不能超过 {self.MAX_ROLLBACK_NOTE_CHARS} 个字符。"
+            )
+        return normalized
 
     @staticmethod
     def _normalize_sha256(value: object) -> str | None:
