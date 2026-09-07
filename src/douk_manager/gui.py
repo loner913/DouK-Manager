@@ -705,6 +705,27 @@ class TaskTemplateList(QListWidget):
             )
 
 
+class EngineRollbackTable(QTableWidget):
+    """Clear the rollback target once keyboard focus leaves the table."""
+
+    def focusOutEvent(self, event) -> None:  # noqa: N802
+        super().focusOutEvent(event)
+        QTimer.singleShot(0, self._clear_selection_if_unfocused)
+
+    def _clear_selection_if_unfocused(self) -> None:
+        focus_widget = QApplication.focusWidget()
+        if focus_widget is self or (
+            focus_widget is not None and self.isAncestorOf(focus_widget)
+        ):
+            return
+        if QApplication.mouseButtons() != Qt.MouseButton.NoButton:
+            # Let a click on an action button consume the selected row first.
+            QTimer.singleShot(50, self._clear_selection_if_unfocused)
+            return
+        self.clearSelection()
+        self.setCurrentCell(-1, -1)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, *, window_state_store: WindowStateStore | None = None) -> None:
         super().__init__()
@@ -1718,7 +1739,8 @@ class MainWindow(QMainWindow):
         self.engine_rollback_usage_label = QLabel("尚未统计磁盘占用")
         self.engine_rollback_usage_label.setWordWrap(True)
         rollback_layout.addWidget(self.engine_rollback_usage_label)
-        self.engine_rollback_table = QTableWidget(0, 7)
+        self.engine_rollback_table = EngineRollbackTable(0, 7, self)
+        self.engine_rollback_table.setObjectName("engineRollbackTable")
         self.engine_rollback_table.setHorizontalHeaderLabels(
             (
                 "换下时间",
@@ -5555,6 +5577,7 @@ class MainWindow(QMainWindow):
             replace(candidate, note=saved_note) if index == row else candidate
             for index, candidate in enumerate(self._engine_rollback_points)
         )
+        self._replace_info(self.settings_output, "回退点备注已保存。")
         self.statusBar().showMessage("回退点备注已保存")
 
     def _refresh_engine_rollbacks(self) -> None:
@@ -6077,5 +6100,11 @@ class MainWindow(QMainWindow):
                                                           border-color: #fdba74; }
             QTableWidget { background: white; border: 1px solid #cbd5e1;
                            gridline-color: #e5e7eb; }
+            QTableWidget#engineRollbackTable::item:selected {
+                background: #dbeafe; color: #1e3a5f;
+            }
+            QTableWidget#engineRollbackTable::item:selected:!active {
+                background: #f1f5f9; color: #334155;
+            }
             """
         )

@@ -15,7 +15,15 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QMessageBox, QTableWidget, QTableWidgetItem
+from PySide6.QtWidgets import (
+    QApplication,
+    QMessageBox,
+    QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
 
 from douk_manager.background import ClosePolicy
 from douk_manager.config import AppConfig, ManagedPaths
@@ -31,7 +39,7 @@ from douk_manager.core.engine_update import (
     RollbackOrigin,
     rollback_can_apply,
 )
-from douk_manager.gui import MainWindow
+from douk_manager.gui import EngineRollbackTable, MainWindow
 from douk_manager.operation import OperationContext, TaskCancelled
 from douk_manager.startup import StartupState
 
@@ -1209,6 +1217,37 @@ class EngineRollbackGuiTests(unittest.TestCase):
             "new note",
         )
         self.assertEqual(window._engine_rollback_points[0].note, "new note")
+        window._replace_info.assert_called_once_with(
+            window.settings_output,
+            "回退点备注已保存。",
+        )
+
+    def test_rollback_table_clears_visual_selection_after_focus_moves_out(self) -> None:
+        host = QWidget()
+        layout = QVBoxLayout(host)
+        table = EngineRollbackTable(1, 7, host)
+        table.setItem(0, 0, QTableWidgetItem("point"))
+        outside = QPushButton("outside", host)
+        layout.addWidget(table)
+        layout.addWidget(outside)
+        host.show()
+        self.app.processEvents()
+
+        table.selectRow(0)
+        table.setFocus()
+        self.app.processEvents()
+        self.assertEqual(table.currentRow(), 0)
+        self.assertTrue(table.selectedItems())
+
+        outside.setFocus()
+        self.app.processEvents()
+        self.app.processEvents()
+
+        self.assertEqual(table.currentRow(), -1)
+        self.assertEqual(table.selectedItems(), [])
+        host.close()
+        host.deleteLater()
+        self.app.processEvents()
 
     def test_note_save_failure_restores_rendered_value(self) -> None:
         point = replace(rollback_point(RollbackIntegrity.OK), note="old note")
