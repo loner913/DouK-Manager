@@ -25,6 +25,7 @@ from douk_manager.core.download_summary import (
     format_summary_for_task_log,
 )
 from douk_manager.core.result_dashboard import DashboardAccountRow
+from douk_manager.core.result_history import AccountHistoryRow, ResultPageSnapshot
 from douk_manager.gui import BackgroundTaskBinding, MainWindow
 from douk_manager.startup import StartupState
 
@@ -221,6 +222,50 @@ class ResultDashboardGuiTests(unittest.TestCase):
                     window._open_dashboard_native_log()
                 information.assert_called_once()
                 open_url.assert_not_called()
+            finally:
+                self._dispose(window, home_patch)
+
+    def test_result_table_renders_in_event_loop_chunks_and_new_snapshot_wins(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window, home_patch = self._window(Path(directory))
+            try:
+                rows = tuple(
+                    AccountHistoryRow(
+                        task_log=Path(directory) / f"DownloadTask_{index}.log",
+                        task_template="synthetic.json",
+                        ended_at=datetime(2026, 9, 7, 12, 0, 0),
+                        a_number=index,
+                        status=AccountStatus.DOWNLOADED,
+                    )
+                    for index in range(350)
+                )
+                window._render_result_snapshot(
+                    ResultPageSnapshot(runs=(), rows=rows, incomplete_old_runs=0)
+                )
+
+                self.assertEqual(window.result_table.rowCount(), 350)
+                self.assertIsNone(window.result_table.item(0, 0))
+                self.assertIn("正在显示", window.result_note.text())
+                window._render_result_rows_chunk()
+                self.assertIsNotNone(window.result_table.item(0, 0))
+                self.assertIsNone(window.result_table.item(100, 0))
+
+                newer = AccountHistoryRow(
+                    task_log=Path(directory) / "DownloadTask_new.log",
+                    task_template="newer.json",
+                    ended_at=datetime(2026, 9, 7, 12, 1, 0),
+                    a_number=999,
+                    status=AccountStatus.PRIVATE,
+                )
+                window._render_result_snapshot(
+                    ResultPageSnapshot(runs=(), rows=(newer,), incomplete_old_runs=0)
+                )
+                self._run_until(lambda: window.result_table.item(0, 0) is not None)
+
+                self.assertEqual(window.result_table.rowCount(), 1)
+                self.assertEqual(window.result_table.item(0, 1).text(), "A999")
+                self.assertEqual(window.result_table.item(0, 4).text(), "newer.json")
+                self.assertIn("显示 1 条账号结果", window.result_note.text())
             finally:
                 self._dispose(window, home_patch)
 

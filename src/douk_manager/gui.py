@@ -727,6 +727,8 @@ class EngineRollbackTable(QTableWidget):
 
 
 class MainWindow(QMainWindow):
+    _RESULT_RENDER_BATCH_SIZE = 100
+
     def __init__(self, *, window_state_store: WindowStateStore | None = None) -> None:
         super().__init__()
         self.controller = ManagerController()
@@ -748,6 +750,10 @@ class MainWindow(QMainWindow):
         self._dashboard_user_selected = False
         self._dashboard_syncing_selector = False
         self._dashboard_index_load_pending: bool | None = None
+        self._result_render_rows: tuple[object, ...] = ()
+        self._result_render_cursor = 0
+        self._result_render_runs = 0
+        self._result_render_incomplete_old_runs = 0
         self._latest_log_stats_run: Any | None = None
         self._pending_auto_log_stats_run: Any | None = None
         self._log_stats_result: LogStats | None = None
@@ -794,6 +800,9 @@ class MainWindow(QMainWindow):
         self.result_refresh_timer = QTimer(self)
         self.result_refresh_timer.setSingleShot(True)
         self.result_refresh_timer.timeout.connect(self._refresh_results_if_startup_applied)
+        self.result_render_timer = QTimer(self)
+        self.result_render_timer.setSingleShot(True)
+        self.result_render_timer.timeout.connect(self._render_result_rows_chunk)
         self.startup_recheck_timer = QTimer(self)
         self.startup_recheck_timer.setSingleShot(True)
         self.startup_recheck_timer.timeout.connect(self._run_startup_recheck)
@@ -3401,8 +3410,26 @@ class MainWindow(QMainWindow):
             and (account_number is None or row.a_number == account_number)
             and (not task_text or task_text in row.task_template.casefold())
         )
-        self.result_table.setRowCount(len(filtered))
-        for index, row in enumerate(filtered):
+        self._result_render_rows = filtered
+        self._result_render_cursor = 0
+        self._result_render_runs = len(snapshot.runs)
+        self._result_render_incomplete_old_runs = snapshot.incomplete_old_runs
+        self.result_table.setUpdatesEnabled(False)
+        try:
+            self.result_table.clearContents()
+            self.result_table.setRowCount(len(filtered))
+        finally:
+            self.result_table.setUpdatesEnabled(True)
+        self.result_note.setText(f"正在显示 {len(filtered)} 条账号结果……")
+        self.result_render_timer.start(0)
+
+    def _render_result_rows_chunk(self) -> None:
+        if not hasattr(self, "result_table"):
+            return
+        start = self._result_render_cursor
+        end = min(start + self._RESULT_RENDER_BATCH_SIZE, len(self._result_render_rows))
+        for index in range(start, end):
+            row = self._result_render_rows[index]
             values = (
                 row.ended_at.strftime("%Y-%m-%d %H:%M:%S"),
                 f"A{row.a_number}",
@@ -3416,9 +3443,13 @@ class MainWindow(QMainWindow):
                 if column == 5:
                     item.setToolTip("双击打开来源日志")
                 self.result_table.setItem(index, column, item)
-        incomplete_old = snapshot.incomplete_old_runs
+        self._result_render_cursor = end
+        if end < len(self._result_render_rows):
+            self.result_render_timer.start(0)
+            return
+        incomplete_old = self._result_render_incomplete_old_runs
         self.result_note.setText(
-            f"共读取 {len(snapshot.runs)} 次任务日志，显示 {len(filtered)} 条账号结果。"
+            f"共读取 {self._result_render_runs} 次任务日志，显示 {len(self._result_render_rows)} 条账号结果。"
             + (f"其中 {incomplete_old} 次旧日志没有完整列出正常账号，页面不会猜测缺失状态。" if incomplete_old else "")
         )
         self.result_last_refresh.setText(
