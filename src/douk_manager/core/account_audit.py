@@ -1,23 +1,31 @@
-"""Pure account-audit models and evidence evaluation.
+"""Account-audit evidence evaluation and guarded tombstone persistence.
 
-This module deliberately contains no persistence, network, or GUI behavior.
-Checkpoint 03-A only turns already-classified, read-only history into audit
-evidence and conservative suggestions.  Applying a suggestion is a separate,
-explicit operation implemented by later checkpoints.
+Checkpoint 03-A supplies the read-only evidence model.  Checkpoint 03-B adds
+the explicit preview, backup, master-enable, and audit-sidecar transaction.
+Network, controller, and GUI behavior remain outside this module.
 """
 
 from __future__ import annotations
 
+import copy
+import hashlib
+import json
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, AbstractSet, Iterable, Mapping
 
+from douk_manager.config import ManagedPaths
+from douk_manager.core.backup import BackupService, sha256_file
 from douk_manager.core.download_summary import AccountStatus
+from douk_manager.core.json_store import read_json, write_json_atomic
+from douk_manager.core.locks import critical_section
 from douk_manager.core.result_history import AccountHistoryRow, ResultHistoryService
+from douk_manager.operation import TaskCancelled
 
 if TYPE_CHECKING:
     from douk_manager.operation import OperationContext
@@ -34,6 +42,10 @@ UNCERTAIN_EARLY_HISTORY_WARNING = (
     "未配置证据起始时间点时不作猜测性排除。"
 )
 NATIVE_LOG_DISABLED_WARNING = "未启用原生日志分析，可达性判定仅基于任务汇总。"
+
+
+class AccountAuditError(RuntimeError):
+    pass
 
 
 class IdentityState(str, Enum):
@@ -151,11 +163,29 @@ class AuditApplyPreview:
     array_length_after: int
 
 
-class AccountAuditService:
-    """Read-only checkpoint-03-A orchestration over result history."""
+@dataclass(frozen=True)
+class AuditApplyResult:
+    preview: AuditApplyPreview
+    backup_path: Path
+    audit_state_path: Path
+    master_sha256_after: str
 
-    def __init__(self, history_service: ResultHistoryService) -> None:
+
+class AccountAuditService:
+    """Audit reporting plus the explicit checkpoint-03-B write path."""
+
+    def __init__(
+        self,
+        history_service: ResultHistoryService,
+        *,
+        paths: ManagedPaths | None = None,
+        backup: BackupService | None = None,
+    ) -> None:
+        if (paths is None) != (backup is None):
+            raise ValueError("paths and backup must be supplied together")
         self.history_service = history_service
+        self.paths = paths
+        self.backup = backup
 
     def build_entries(
         self,
@@ -166,6 +196,7 @@ class AccountAuditService:
         explicitly_unavailable: AbstractSet[int] = frozenset(),
         error_threshold: int = DEFAULT_CONSECUTIVE_ERROR_THRESHOLD,
         minimum_evidence_runs: int = DEFAULT_MINIMUM_EVIDENCE_RUNS,
+        saved_dispositions: Mapping[int, Disposition] | None = None,
         context: OperationContext | None = None,
     ) -> tuple[AccountAuditEntry, ...]:
         numbers = tuple(sorted(master_enable_by_number))
@@ -181,6 +212,7 @@ class AccountAuditService:
             explicitly_unavailable=explicitly_unavailable,
             error_threshold=error_threshold,
             minimum_evidence_runs=minimum_evidence_runs,
+            saved_dispositions=saved_dispositions,
         )
 
     def build_report(
@@ -195,6 +227,7 @@ class AccountAuditService:
         explicitly_unavailable: AbstractSet[int] = frozenset(),
         error_threshold: int = DEFAULT_CONSECUTIVE_ERROR_THRESHOLD,
         minimum_evidence_runs: int = DEFAULT_MINIMUM_EVIDENCE_RUNS,
+        saved_dispositions: Mapping[int, Disposition] | None = None,
         context: OperationContext | None = None,
     ) -> AccountAuditReport:
         """Build a read-only report from one historical scan."""
@@ -216,6 +249,7 @@ class AccountAuditService:
             explicitly_unavailable=explicitly_unavailable,
             error_threshold=error_threshold,
             minimum_evidence_runs=minimum_evidence_runs,
+            saved_dispositions=saved_dispositions,
         )
         warnings = [UNCERTAIN_EARLY_HISTORY_WARNING]
         if evidence_since is not None:
@@ -239,6 +273,134 @@ class AccountAuditService:
             duplicate_groups=len(groups),
             warnings=tuple(warnings),
         )
+
+    def build_current_report(
+        self,
+        *,
+        generated_at: datetime | None = None,
+        evidence_since: datetime | None = None,
+        error_threshold: int = DEFAULT_CONSECUTIVE_ERROR_THRESHOLD,
+        minimum_evidence_runs: int = DEFAULT_MINIMUM_EVIDENCE_RUNS,
+        context: OperationContext | None = None,
+    ) -> AccountAuditReport:
+        paths, _backup = self._persistence_services()
+        with critical_section(paths.lock_file):
+            document, master_sha256 = _read_master_with_sha(paths.master_settings)
+            accounts = _accounts(document)
+            master_enable = {
+                number: bool(account.get("enable", True))
+                for number, account in enumerate(accounts, start=1)
+            }
+            saved = _load_saved_dispositions(paths.account_audit / "audit-state.json")
+            if not set(saved).issubset(master_enable):
+                raise AccountAuditError("审计侧档的 A 编号超出当前主档范围。")
+        return self.build_report(
+            master_enable,
+            master_sha256=master_sha256,
+            generated_at=generated_at,
+            evidence_since=evidence_since,
+            error_threshold=error_threshold,
+            minimum_evidence_runs=minimum_evidence_runs,
+            saved_dispositions=saved,
+            context=context,
+        )
+
+    @staticmethod
+    def preview_decisions(
+        report: AccountAuditReport,
+        decisions: Iterable[AuditDecision],
+    ) -> AuditApplyPreview:
+        return preview_audit_decisions(report, decisions)
+
+    def apply_decisions(
+        self,
+        report: AccountAuditReport,
+        decisions: Iterable[AuditDecision],
+        *,
+        context: OperationContext | None = None,
+    ) -> AuditApplyResult:
+        paths, backup = self._persistence_services()
+        decision_tuple = tuple(decisions)
+        preview = preview_audit_decisions(report, decision_tuple)
+        if context is not None:
+            context.raise_if_cancelled()
+
+        with critical_section(paths.lock_file):
+            try:
+                backup.validate_live_data()
+                snapshot = backup.create_full_snapshot(
+                    "BeforeAccountAudit",
+                    {
+                        "operation": "apply_account_audit",
+                        "to_disable": list(preview.to_disable),
+                        "to_enable": list(preview.to_enable),
+                        "to_pending": list(preview.to_pending),
+                    },
+                    keep_latest=2,
+                    context=context,
+                )
+            except Exception as exc:
+                if isinstance(exc, TaskCancelled):
+                    raise
+                raise AccountAuditError(f"账号审计备份失败：{exc}") from exc
+
+            document, current_sha256 = _read_master_with_sha(paths.master_settings)
+            if current_sha256 != report.master_sha256:
+                raise AccountAuditError("主档在审计后发生变化，请重新审计后再应用。")
+            accounts = _accounts(document)
+            if len(accounts) != report.total_accounts:
+                raise AccountAuditError("主档账号数量已变化，请重新审计后再应用。")
+
+            expected = _build_expected_master(document, decision_tuple)
+            expected_accounts = _accounts(expected)
+            if not any(bool(account.get("enable", True)) for account in expected_accounts):
+                raise AccountAuditError("应用后必须至少保留一个启用账号。")
+            state_path = paths.account_audit / "audit-state.json"
+            previous_state = _read_existing_state(state_path)
+            master_write_attempted = False
+            try:
+                if context is not None:
+                    context.enter_critical_phase()
+                if expected != document:
+                    master_write_attempted = True
+                    write_json_atomic(paths.master_settings, expected)
+                    verified = read_json(paths.master_settings)
+                    _verify_master_write(document, expected, verified, decision_tuple)
+                    master_sha256_after = sha256_file(paths.master_settings)
+                else:
+                    master_sha256_after = current_sha256
+                state = _build_audit_state(
+                    previous_state,
+                    report,
+                    decision_tuple,
+                    master_sha256_after=master_sha256_after,
+                    decided_at=datetime.now(),
+                )
+                write_json_atomic(state_path, state)
+                if read_json(state_path) != state:
+                    raise AccountAuditError("审计侧档复读校验失败。")
+            except Exception as exc:
+                _restore_after_apply_failure(
+                    backup,
+                    snapshot,
+                    state_path,
+                    previous_state,
+                    restore_master=master_write_attempted,
+                )
+                if isinstance(exc, AccountAuditError):
+                    raise
+                raise AccountAuditError(f"账号审计写入失败：{exc}") from exc
+            return AuditApplyResult(
+                preview=preview,
+                backup_path=snapshot,
+                audit_state_path=state_path,
+                master_sha256_after=master_sha256_after,
+            )
+
+    def _persistence_services(self) -> tuple[ManagedPaths, BackupService]:
+        if self.paths is None or self.backup is None:
+            raise AccountAuditError("账号审计写入服务尚未配置。")
+        return self.paths, self.backup
 
 
 _SAFE_TASK_NAME = re.compile(r"DownloadTask_[0-9A-Za-z_-]+\.log$", re.IGNORECASE)
@@ -354,6 +516,7 @@ def build_audit_entries(
     explicitly_unavailable: AbstractSet[int] = frozenset(),
     error_threshold: int = DEFAULT_CONSECUTIVE_ERROR_THRESHOLD,
     minimum_evidence_runs: int = DEFAULT_MINIMUM_EVIDENCE_RUNS,
+    saved_dispositions: Mapping[int, Disposition] | None = None,
 ) -> tuple[AccountAuditEntry, ...]:
     """Build immutable audit entries without changing files or input objects."""
 
@@ -371,11 +534,15 @@ def build_audit_entries(
             evidence, unavailable=number in explicitly_unavailable
         )
         privacy = _derive_privacy(evidence)
-        disposition = (
-            Disposition.ENABLED
-            if bool(master_enable_by_number[number])
-            else Disposition.PERMANENTLY_DISABLED
-        )
+        saved = (saved_dispositions or {}).get(number)
+        if saved is Disposition.PENDING_REVIEW:
+            disposition = Disposition.PENDING_REVIEW
+        else:
+            disposition = (
+                Disposition.ENABLED
+                if bool(master_enable_by_number[number])
+                else Disposition.PERMANENTLY_DISABLED
+            )
         suggestion, reason = _derive_suggestion(
             number=number,
             disposition=disposition,
@@ -401,6 +568,245 @@ def build_audit_entries(
             )
         )
     return tuple(entries)
+
+
+def preview_audit_decisions(
+    report: AccountAuditReport,
+    decisions: Iterable[AuditDecision],
+) -> AuditApplyPreview:
+    entries = {entry.a_number: entry for entry in report.entries}
+    expected_numbers = set(range(1, report.total_accounts + 1))
+    if len(entries) != len(report.entries) or set(entries) != expected_numbers:
+        raise AccountAuditError("审计报告的 A 编号与主档位置不一致，请重新审计。")
+
+    decision_tuple = tuple(decisions)
+    seen: set[int] = set()
+    to_disable: list[int] = []
+    to_enable: list[int] = []
+    to_pending: list[int] = []
+    enabled_after = {
+        number: entry.master_enable for number, entry in entries.items()
+    }
+    for decision in decision_tuple:
+        if decision.a_number in seen:
+            raise AccountAuditError(f"A{decision.a_number} 出现重复决定。")
+        seen.add(decision.a_number)
+        entry = entries.get(decision.a_number)
+        if entry is None:
+            raise AccountAuditError(f"A{decision.a_number} 不在当前审计报告中。")
+        if not isinstance(decision.disposition, Disposition):
+            raise AccountAuditError(f"A{decision.a_number} 的决定类型无效。")
+        _safe_decision_reason(decision.reason)
+        if decision.disposition is entry.disposition:
+            continue
+        if decision.disposition is Disposition.PERMANENTLY_DISABLED:
+            to_disable.append(decision.a_number)
+            enabled_after[decision.a_number] = False
+        elif decision.disposition is Disposition.ENABLED:
+            to_enable.append(decision.a_number)
+            enabled_after[decision.a_number] = True
+        else:
+            to_pending.append(decision.a_number)
+
+    changed = len(to_disable) + len(to_enable) + len(to_pending)
+    enabled_count = sum(enabled_after.values())
+    if enabled_count < 1:
+        raise AccountAuditError("应用后必须至少保留一个启用账号。")
+    return AuditApplyPreview(
+        to_disable=tuple(sorted(to_disable)),
+        to_enable=tuple(sorted(to_enable)),
+        to_pending=tuple(sorted(to_pending)),
+        unchanged=report.total_accounts - changed,
+        enabled_after=enabled_count,
+        array_length_before=report.total_accounts,
+        array_length_after=report.total_accounts,
+    )
+
+
+def _read_master_with_sha(path: Path) -> tuple[dict, str]:
+    try:
+        raw = path.read_bytes()
+        document = json.loads(raw.decode("utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise AccountAuditError(f"无法读取有效账号主档：{exc}") from exc
+    if not isinstance(document, dict):
+        raise AccountAuditError("账号主档顶层必须是对象。")
+    return document, hashlib.sha256(raw).hexdigest()
+
+
+def _accounts(document: dict) -> list[dict]:
+    accounts = document.get("accounts_urls")
+    if not isinstance(accounts, list):
+        raise AccountAuditError("账号主档缺少 accounts_urls 数组。")
+    for number, account in enumerate(accounts, start=1):
+        if not isinstance(account, dict):
+            raise AccountAuditError(f"账号主档的 A{number} 不是对象。")
+    return accounts
+
+
+def _build_expected_master(
+    document: dict,
+    decisions: tuple[AuditDecision, ...],
+) -> dict:
+    expected = copy.deepcopy(document)
+    accounts = _accounts(expected)
+    for decision in decisions:
+        if decision.disposition is Disposition.PENDING_REVIEW:
+            continue
+        if decision.a_number < 1 or decision.a_number > len(accounts):
+            raise AccountAuditError(f"A{decision.a_number} 不在当前主档中。")
+        accounts[decision.a_number - 1]["enable"] = (
+            decision.disposition is Disposition.ENABLED
+        )
+    return expected
+
+
+def _verify_master_write(
+    before: dict,
+    expected: dict,
+    actual: dict,
+    decisions: tuple[AuditDecision, ...],
+) -> None:
+    before_accounts = _accounts(before)
+    expected_accounts = _accounts(expected)
+    actual_accounts = _accounts(actual)
+    if len(before_accounts) != len(expected_accounts) or len(actual_accounts) != len(
+        before_accounts
+    ):
+        raise AccountAuditError("主档复读校验失败：账号数组长度发生变化。")
+    targets = {
+        decision.a_number
+        for decision in decisions
+        if decision.disposition is not Disposition.PENDING_REVIEW
+    }
+    for number, (old, wanted, current) in enumerate(
+        zip(before_accounts, expected_accounts, actual_accounts), start=1
+    ):
+        old_without_enable = {key: value for key, value in old.items() if key != "enable"}
+        wanted_without_enable = {
+            key: value for key, value in wanted.items() if key != "enable"
+        }
+        current_without_enable = {
+            key: value for key, value in current.items() if key != "enable"
+        }
+        if not (
+            old_without_enable == wanted_without_enable == current_without_enable
+        ):
+            raise AccountAuditError(
+                f"主档复读校验失败：A{number} 的非 enable 字段发生变化。"
+            )
+        if current.get("enable", True) != wanted.get("enable", True):
+            raise AccountAuditError(
+                f"主档复读校验失败：A{number} 的 enable 与决定不一致。"
+            )
+        if number not in targets and current.get("enable", True) != old.get(
+            "enable", True
+        ):
+            raise AccountAuditError(
+                f"主档复读校验失败：A{number} 的 enable 被意外修改。"
+            )
+    if actual != expected:
+        raise AccountAuditError("主档复读校验失败：写入结果与预期不一致。")
+
+
+def _read_existing_state(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        state = read_json(path)
+    except Exception as exc:
+        raise AccountAuditError(f"无法读取有效审计侧档：{exc}") from exc
+    _validate_state_document(state)
+    return state
+
+
+def _load_saved_dispositions(path: Path) -> dict[int, Disposition]:
+    state = _read_existing_state(path)
+    if state is None:
+        return {}
+    result: dict[int, Disposition] = {}
+    for raw_number, entry in state["entries"].items():
+        try:
+            result[int(raw_number)] = Disposition(entry["disposition"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise AccountAuditError("审计侧档包含无效决定。") from exc
+    return result
+
+
+def _validate_state_document(state: dict) -> None:
+    if state.get("schema") != 1 or not isinstance(state.get("entries"), dict):
+        raise AccountAuditError("审计侧档结构无效。")
+    for raw_number, entry in state["entries"].items():
+        if not str(raw_number).isdigit() or int(raw_number) < 1:
+            raise AccountAuditError("审计侧档包含无效 A 编号。")
+        if not isinstance(entry, dict):
+            raise AccountAuditError("审计侧档条目必须是对象。")
+        try:
+            Disposition(entry.get("disposition"))
+        except ValueError as exc:
+            raise AccountAuditError("审计侧档包含无效决定。") from exc
+        _safe_decision_reason(str(entry.get("decided_reason", "")))
+
+
+def _build_audit_state(
+    previous: dict | None,
+    report: AccountAuditReport,
+    decisions: tuple[AuditDecision, ...],
+    *,
+    master_sha256_after: str,
+    decided_at: datetime,
+) -> dict:
+    entries = copy.deepcopy(previous.get("entries", {}) if previous else {})
+    report_entries = {entry.a_number: entry for entry in report.entries}
+    timestamp = decided_at.isoformat(timespec="seconds")
+    for decision in decisions:
+        observed = report_entries[decision.a_number]
+        entries[str(decision.a_number)] = {
+            "disposition": decision.disposition.value,
+            "decided_at": timestamp,
+            "decided_reason": _safe_decision_reason(decision.reason),
+            "last_observed": {
+                "identity": observed.identity.value,
+                "reachability": observed.reachability.value,
+                "privacy": observed.privacy.value,
+            },
+        }
+    return {
+        "schema": 1,
+        "generated_at": timestamp,
+        "source_master_sha256": master_sha256_after,
+        "entries": entries,
+    }
+
+
+def _safe_decision_reason(reason: str) -> str:
+    cleaned = reason.strip()
+    if len(cleaned) > 200 or "\n" in cleaned or "\r" in cleaned:
+        raise AccountAuditError("决定备注必须是最多 200 字的单行文本。")
+    lowered = cleaned.casefold()
+    forbidden = ("://", "sec_user_id", "cookie", "authorization", "uid=")
+    if any(token in lowered for token in forbidden):
+        raise AccountAuditError("决定备注不能包含账号标识或认证信息。")
+    return cleaned
+
+
+def _restore_after_apply_failure(
+    backup: BackupService,
+    snapshot: Path,
+    state_path: Path,
+    previous_state: dict | None,
+    *,
+    restore_master: bool,
+) -> None:
+    try:
+        if restore_master:
+            backup.restore_named_files(snapshot, ("settings_master.json",))
+        if previous_state is None:
+            state_path.unlink(missing_ok=True)
+        else:
+            write_json_atomic(state_path, previous_state)
+    except Exception as exc:
+        raise AccountAuditError(f"账号审计失败后的恢复也失败：{exc}") from exc
 
 
 def _trailing_streak(

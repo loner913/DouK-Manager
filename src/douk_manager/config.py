@@ -78,6 +78,7 @@ class ManagedPaths:
     index_cleanup_logs: Path
     backups: Path
     tasks: Path
+    account_audit: Path
     updates: Path
     lock_file: Path
     screenshot_inbox: Path
@@ -113,6 +114,7 @@ class ManagedPaths:
             index_cleanup_logs=logs / "IndexCleanup",
             backups=app_root / "Backups",
             tasks=data / "Tasks",
+            account_audit=data / "AccountAudit",
             updates=app_root / "Updates",
             lock_file=data / ".douk_manager.lock",
             screenshot_inbox=data / "Screenshots" / "Inbox",
@@ -139,6 +141,7 @@ class ManagedPaths:
             self.index_cleanup_logs,
             self.backups,
             self.tasks,
+            self.account_audit,
             self.updates,
             self.screenshot_inbox,
             self.collector_data,

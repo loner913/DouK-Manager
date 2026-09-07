@@ -64,6 +64,19 @@ class GeneratedTask:
 
 
 @dataclass(frozen=True)
+class ActivatedTask:
+    active_path: Path
+    vetoed_numbers: tuple[int, ...]
+    backup_path: Path
+
+    def __fspath__(self) -> str:
+        return str(self.active_path)
+
+    def __str__(self) -> str:
+        return str(self.active_path)
+
+
+@dataclass(frozen=True)
 class SmartSelectionPreview:
     requested: SelectionPreview
     effective: SelectionPreview | None
@@ -106,8 +119,21 @@ class SettingsTaskService:
     def preview(self, expression: str) -> SelectionPreview:
         master = self.load_master()
         accounts = self._accounts(master, "settings_master.json")
-        selection = parse_selection(expression, len(accounts))
+        selection = self._master_enabled_selection(
+            accounts, parse_selection(expression, len(accounts))
+        )
         return self._preview_selection(accounts, selection)
+
+    @staticmethod
+    def _master_enabled_selection(
+        accounts: list[dict[str, Any]], selection: Selection
+    ) -> Selection:
+        numbers = tuple(
+            number
+            for number in selection.numbers
+            if bool(accounts[number - 1].get("enable", True))
+        )
+        return Selection(numbers, selection.duplicate_numbers, compact_numbers(numbers))
 
     @staticmethod
     def _preview_selection(
@@ -137,7 +163,9 @@ class SettingsTaskService:
     ) -> SmartSelectionPreview:
         master = self.load_master()
         accounts = self._accounts(master, "settings_master.json")
-        requested_selection = parse_selection(expression, len(accounts))
+        requested_selection = self._master_enabled_selection(
+            accounts, parse_selection(expression, len(accounts))
+        )
         requested = self._preview_selection(accounts, requested_selection)
         excluded = {match.a_number for match in private_matches}
         effective_numbers = tuple(
@@ -169,7 +197,7 @@ class SettingsTaskService:
         accounts = self._accounts(task, "任务配置")
         selected = set(selection.numbers)
         for position, account in enumerate(accounts, start=1):
-            account["enable"] = position in selected
+            account["enable"] = bool(account.get("enable", True)) and position in selected
             if position in selected and task_earliest.change:
                 account["earliest"] = task_earliest.value
         task["run_command"] = "5 1 1 Q"
@@ -198,10 +226,17 @@ class SettingsTaskService:
                 raise SettingsTaskError(
                     "智能跳过后没有剩余账号；可以选择强制包含全部账号，或取消创建。"
                 )
+            master_enabled_numbers = tuple(
+                number
+                for number in effective_numbers
+                if bool(accounts[number - 1].get("enable", True))
+            )
+            if not master_enabled_numbers:
+                raise SettingsTaskError("所选账号均被主档永久停用。")
             selection = Selection(
-                effective_numbers,
+                master_enabled_numbers,
                 requested_selection.duplicate_numbers,
-                compact_numbers(effective_numbers),
+                compact_numbers(master_enabled_numbers),
             )
             preview = self._preview_selection(accounts, selection)
 
@@ -269,7 +304,7 @@ class SettingsTaskService:
                 path.unlink()
         return tuple(validated)
 
-    def activate_existing_task(self, task_path: Path) -> Path:
+    def activate_existing_task(self, task_path: Path) -> ActivatedTask:
         with critical_section(self.paths.lock_file):
             stored_task = read_json(task_path)
             stored_accounts = self._accounts(stored_task, task_path.name)
@@ -282,12 +317,20 @@ class SettingsTaskService:
             # cannot be reverted by an old task JSON.
             task = copy.deepcopy(latest_master)
             active_accounts = self._accounts(task, "待激活 settings.json")
+            vetoed_numbers: list[int] = []
+            template_enabled_numbers: list[int] = []
             for position, active_account in enumerate(active_accounts):
                 if position >= len(stored_accounts):
                     active_account["enable"] = False
                     continue
                 stored_account = stored_accounts[position]
-                active_account["enable"] = bool(stored_account.get("enable", True))
+                template_enabled = bool(stored_account.get("enable", True))
+                master_enabled = bool(latest_accounts[position].get("enable", True))
+                if template_enabled:
+                    template_enabled_numbers.append(position + 1)
+                if template_enabled and not master_enabled:
+                    vetoed_numbers.append(position + 1)
+                active_account["enable"] = master_enabled and template_enabled
                 if "earliest" in stored_account:
                     active_account["earliest"] = copy.deepcopy(
                         stored_account["earliest"]
@@ -296,6 +339,10 @@ class SettingsTaskService:
             task["run_command"] = "5 1 1 Q"
             enabled = sum(bool(account.get("enable", True)) for account in active_accounts)
             if enabled < 1:
+                if template_enabled_numbers and len(vetoed_numbers) == len(
+                    template_enabled_numbers
+                ):
+                    raise SettingsTaskError("模板内账号均被主档永久停用。")
                 raise SettingsTaskError("任务没有启用任何账号。")
             snapshot = self.backup.create_critical_snapshot(
                 "BeforeChange",
@@ -305,6 +352,7 @@ class SettingsTaskService:
                     "stored_accounts": len(stored_accounts),
                     "latest_master_accounts": len(latest_accounts),
                     "account_identity_source": "latest_settings_master",
+                    "vetoed_numbers": vetoed_numbers,
                 },
                 keep_latest=20,
             )
@@ -313,7 +361,11 @@ class SettingsTaskService:
             except Exception:
                 self.backup.restore_named_files(snapshot, ("settings.json",))
                 raise
-            return self.paths.active_settings
+            return ActivatedTask(
+                self.paths.active_settings,
+                tuple(vetoed_numbers),
+                snapshot,
+            )
 
     def generate_batches(
         self,

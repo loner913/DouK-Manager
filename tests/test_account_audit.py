@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 from douk_manager.core.account_audit import (
     DEFAULT_CONSECUTIVE_ERROR_THRESHOLD,
     AccountAuditService,
+    AccountAuditError,
+    AuditApplyResult,
+    AuditDecision,
     NATIVE_LOG_DISABLED_WARNING,
     UNCERTAIN_EARLY_HISTORY_WARNING,
     AccountAuditEntry,
@@ -22,11 +28,16 @@ from douk_manager.core.account_audit import (
     summarize_account_history,
 )
 from douk_manager.core.download_summary import AccountStatus
+from douk_manager.core.backup import BackupService, sha256_file
+from douk_manager.core.download_summary import freeze_planned_accounts
+from douk_manager.core.json_store import read_json, write_json_atomic
 from douk_manager.core.result_history import (
     AccountHistoryRow,
     DownloadTaskHistory,
     ResultHistoryService,
 )
+from douk_manager.operation import OperationContext, TaskCancelled
+from tests.helpers import make_test_paths
 
 
 BASE_TIME = datetime(2026, 9, 1, 12, 0, 0)
@@ -344,6 +355,268 @@ class AccountAuditPureLogicTests(unittest.TestCase):
         self.assertIsInstance(entries[0], AccountAuditEntry)
         self.assertEqual(master, {1: True})
         self.assertEqual(tuple(history[1]), original_rows)
+
+
+class AccountAuditPersistenceTests(unittest.TestCase):
+    def _service_and_report(self, root: Path, account_count: int = 5):
+        paths = make_test_paths(root, account_count)
+        service = AccountAuditService(
+            ResultHistoryService(paths.download_task_logs),
+            paths=paths,
+            backup=BackupService(paths),
+        )
+        report = service.build_current_report(
+            generated_at=datetime(2026, 9, 8, 12, 0, 0)
+        )
+        return paths, service, report
+
+    def test_managed_paths_declares_isolated_account_audit_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_test_paths(Path(directory), 3)
+
+            self.assertEqual(paths.account_audit, paths.data / "AccountAudit")
+            self.assertTrue(paths.account_audit.is_dir())
+
+    def test_preview_lists_changes_and_keeps_array_length(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _paths, service, report = self._service_and_report(Path(directory))
+            decisions = (
+                AuditDecision(1, Disposition.PERMANENTLY_DISABLED),
+                AuditDecision(2, Disposition.ENABLED),
+                AuditDecision(3, Disposition.PENDING_REVIEW),
+            )
+
+            preview = service.preview_decisions(report, decisions)
+
+            self.assertEqual(preview.to_disable, (1,))
+            self.assertEqual(preview.to_enable, (2,))
+            self.assertEqual(preview.to_pending, (3,))
+            self.assertEqual(preview.unchanged, 2)
+            self.assertEqual(preview.enabled_after, 3)
+            self.assertEqual(preview.array_length_before, 5)
+            self.assertEqual(preview.array_length_after, 5)
+
+    def test_apply_changes_only_enable_preserves_positions_and_writes_safe_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths, service, report = self._service_and_report(Path(directory))
+            master_before = read_json(paths.master_settings)
+            decisions = (
+                AuditDecision(1, Disposition.PERMANENTLY_DISABLED, "manual review"),
+                AuditDecision(2, Disposition.ENABLED),
+                AuditDecision(3, Disposition.PENDING_REVIEW),
+            )
+
+            result = service.apply_decisions(report, decisions)
+
+            self.assertIsInstance(result, AuditApplyResult)
+            self.assertTrue(result.backup_path.is_dir())
+            self.assertEqual(result.backup_path.parent.name, "BeforeAccountAudit")
+            manifest = json.loads(
+                (result.backup_path / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["scope"], "full")
+            master_after = read_json(paths.master_settings)
+            self.assertEqual(len(master_after["accounts_urls"]), 5)
+            self.assertEqual(
+                [item["enable"] for item in master_after["accounts_urls"]],
+                [False, True, True, False, True],
+            )
+            for before, after in zip(
+                master_before["accounts_urls"], master_after["accounts_urls"]
+            ):
+                self.assertEqual(
+                    {key: value for key, value in before.items() if key != "enable"},
+                    {key: value for key, value in after.items() if key != "enable"},
+                )
+            planned_after = freeze_planned_accounts(master_after)
+            before_by_number = {
+                number: item["mark"]
+                for number, item in enumerate(master_before["accounts_urls"], start=1)
+            }
+            after_by_number = {item.a_number: item.mark for item in planned_after}
+            for number in after_by_number:
+                self.assertEqual(after_by_number[number], before_by_number[number])
+            state = read_json(paths.account_audit / "audit-state.json")
+            self.assertEqual(set(state["entries"]), {"1", "2", "3"})
+            state_text = str(state)
+            for forbidden in ("accounts_urls", "url", "mark", "account1"):
+                self.assertNotIn(forbidden, state_text)
+            self.assertEqual(result.master_sha256_after, sha256_file(paths.master_settings))
+
+    def test_pending_disposition_round_trips_without_changing_master_enable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths, service, report = self._service_and_report(Path(directory), 3)
+            master_before = paths.master_settings.read_bytes()
+
+            service.apply_decisions(
+                report, (AuditDecision(3, Disposition.PENDING_REVIEW),)
+            )
+            refreshed = service.build_current_report()
+
+            self.assertEqual(paths.master_settings.read_bytes(), master_before)
+            self.assertEqual(refreshed.entries[2].disposition, Disposition.PENDING_REVIEW)
+
+    def test_master_enable_remains_authoritative_over_sidecar_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths, service, report = self._service_and_report(Path(directory), 3)
+            service.apply_decisions(
+                report, (AuditDecision(1, Disposition.PERMANENTLY_DISABLED),)
+            )
+            state_path = paths.account_audit / "audit-state.json"
+            state = read_json(state_path)
+            state["entries"]["1"]["disposition"] = Disposition.ENABLED.value
+            write_json_atomic(state_path, state)
+
+            refreshed = service.build_current_report()
+
+            self.assertFalse(refreshed.entries[0].master_enable)
+            self.assertEqual(
+                refreshed.entries[0].disposition,
+                Disposition.PERMANENTLY_DISABLED,
+            )
+
+    def test_stale_master_fingerprint_rejects_without_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths, service, report = self._service_and_report(Path(directory), 3)
+            changed = read_json(paths.master_settings)
+            changed["run_command"] = "changed-after-audit"
+            write_json_atomic(paths.master_settings, changed)
+            changed_bytes = paths.master_settings.read_bytes()
+
+            with self.assertRaisesRegex(AccountAuditError, "重新审计"):
+                service.apply_decisions(
+                    report, (AuditDecision(1, Disposition.PERMANENTLY_DISABLED),)
+                )
+
+            self.assertEqual(paths.master_settings.read_bytes(), changed_bytes)
+            self.assertFalse((paths.account_audit / "audit-state.json").exists())
+
+    def test_rejects_decisions_that_would_disable_every_account(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths, service, report = self._service_and_report(Path(directory), 3)
+            decisions = tuple(
+                AuditDecision(number, Disposition.PERMANENTLY_DISABLED)
+                for number in (1, 2, 3)
+            )
+            master_before = paths.master_settings.read_bytes()
+
+            with self.assertRaisesRegex(AccountAuditError, "至少保留一个启用账号"):
+                service.apply_decisions(report, decisions)
+
+            self.assertEqual(paths.master_settings.read_bytes(), master_before)
+            self.assertFalse((paths.backups / "BeforeAccountAudit").exists())
+
+    def test_verification_failure_restores_master_from_full_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths, service, report = self._service_and_report(Path(directory), 3)
+            master_before = paths.master_settings.read_bytes()
+            real_write = write_json_atomic
+
+            def corrupt_master(path: Path, document: dict) -> None:
+                if path == paths.master_settings:
+                    damaged = deepcopy(document)
+                    damaged["accounts_urls"].pop()
+                    real_write(path, damaged)
+                    return
+                real_write(path, document)
+
+            with patch(
+                "douk_manager.core.account_audit.write_json_atomic",
+                side_effect=corrupt_master,
+            ):
+                with self.assertRaisesRegex(AccountAuditError, "复读校验"):
+                    service.apply_decisions(
+                        report,
+                        (AuditDecision(1, Disposition.PERMANENTLY_DISABLED),),
+                    )
+
+            self.assertEqual(paths.master_settings.read_bytes(), master_before)
+            self.assertFalse((paths.account_audit / "audit-state.json").exists())
+
+    def test_cancel_before_critical_write_leaves_master_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths, service, report = self._service_and_report(Path(directory), 3)
+            master_before = paths.master_settings.read_bytes()
+            context = OperationContext()
+            self.assertTrue(context.request_cancel())
+
+            with self.assertRaises(TaskCancelled):
+                service.apply_decisions(
+                    report,
+                    (AuditDecision(1, Disposition.PERMANENTLY_DISABLED),),
+                    context=context,
+                )
+
+            self.assertEqual(paths.master_settings.read_bytes(), master_before)
+            self.assertFalse((paths.backups / "BeforeAccountAudit").exists())
+
+    def test_invalid_master_is_rejected_without_sidecar_or_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths, service, report = self._service_and_report(Path(directory), 3)
+            paths.master_settings.write_text("{invalid", encoding="utf-8")
+            invalid_bytes = paths.master_settings.read_bytes()
+
+            with self.assertRaisesRegex(AccountAuditError, "备份失败"):
+                service.apply_decisions(
+                    report, (AuditDecision(1, Disposition.PERMANENTLY_DISABLED),)
+                )
+
+            self.assertEqual(paths.master_settings.read_bytes(), invalid_bytes)
+            self.assertFalse((paths.backups / "BeforeAccountAudit").exists())
+            self.assertFalse((paths.account_audit / "audit-state.json").exists())
+
+    def test_sidecar_verification_failure_restores_master_and_previous_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths, service, report = self._service_and_report(Path(directory), 3)
+            service.apply_decisions(
+                report, (AuditDecision(3, Disposition.PENDING_REVIEW),)
+            )
+            refreshed = service.build_current_report()
+            master_before = paths.master_settings.read_bytes()
+            state_path = paths.account_audit / "audit-state.json"
+            state_before = read_json(state_path)
+            real_write = write_json_atomic
+            state_writes = 0
+
+            def corrupt_state(path: Path, document: dict) -> None:
+                nonlocal state_writes
+                if path == state_path:
+                    state_writes += 1
+                    if state_writes == 1:
+                        real_write(path, {"schema": 1, "entries": {}})
+                        return
+                real_write(path, document)
+
+            with patch(
+                "douk_manager.core.account_audit.write_json_atomic",
+                side_effect=corrupt_state,
+            ):
+                with self.assertRaisesRegex(AccountAuditError, "侧档复读校验"):
+                    service.apply_decisions(
+                        refreshed,
+                        (AuditDecision(1, Disposition.PERMANENTLY_DISABLED),),
+                    )
+
+            self.assertEqual(paths.master_settings.read_bytes(), master_before)
+            self.assertEqual(read_json(state_path), state_before)
+
+    def test_sensitive_decision_reason_is_rejected_before_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths, service, report = self._service_and_report(Path(directory), 3)
+
+            with self.assertRaisesRegex(AccountAuditError, "认证信息"):
+                service.apply_decisions(
+                    report,
+                    (
+                        AuditDecision(
+                            1,
+                            Disposition.PERMANENTLY_DISABLED,
+                            "cookie=synthetic-secret",
+                        ),
+                    ),
+                )
+
+            self.assertFalse((paths.backups / "BeforeAccountAudit").exists())
 
 
 if __name__ == "__main__":
