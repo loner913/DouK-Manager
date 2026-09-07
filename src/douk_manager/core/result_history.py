@@ -4,7 +4,8 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Mapping
 
 from douk_manager.core.download_summary import AccountStatus
 
@@ -43,6 +44,15 @@ class ResultPageSnapshot:
     runs: tuple[DownloadTaskHistory, ...]
     rows: tuple[AccountHistoryRow, ...]
     incomplete_old_runs: int
+
+
+@dataclass(frozen=True)
+class AccountAuditHistorySnapshot:
+    runs_scanned: int
+    oldest_run: datetime | None
+    newest_run: datetime | None
+    rows_by_number: Mapping[int, tuple[AccountHistoryRow, ...]]
+    excluded_old_rows: int
 
 
 @dataclass(frozen=True)
@@ -114,7 +124,8 @@ class ResultHistoryService:
             return ()
         if context is not None:
             context.raise_if_cancelled()
-        self.log_directory.mkdir(parents=True, exist_ok=True)
+        if not self.log_directory.is_dir():
+            return ()
         paths_with_mtime: list[tuple[int, Path]] = []
         for path in self.log_directory.glob("DownloadTask_*.log"):
             try:
@@ -135,6 +146,71 @@ class ResultHistoryService:
                 result.append(parsed)
         result.sort(key=lambda item: item.ended_at, reverse=True)
         return tuple(result)
+
+    def account_rows_by_number(
+        self,
+        *,
+        numbers: tuple[int, ...] | None = None,
+        evidence_since: datetime | None = None,
+        context: OperationContext | None = None,
+    ) -> dict[int, tuple[AccountHistoryRow, ...]]:
+        """Return audit evidence grouped by stable array position.
+
+        Rows are chronological within each account.  Missing task rows are not
+        invented: an account absent from a run is unselected or unknown and
+        therefore neither increments nor clears any status streak.  A caller-
+        supplied evidence boundary conservatively excludes older rows without
+        trying to infer historical array-position changes.
+        """
+
+        return dict(
+            self.account_audit_snapshot(
+                numbers=numbers,
+                evidence_since=evidence_since,
+                context=context,
+            ).rows_by_number
+        )
+
+    def account_audit_snapshot(
+        self,
+        *,
+        numbers: tuple[int, ...] | None = None,
+        evidence_since: datetime | None = None,
+        context: OperationContext | None = None,
+    ) -> AccountAuditHistorySnapshot:
+        """Scan history once and return immutable audit-oriented metadata."""
+
+        requested = None if numbers is None else tuple(sorted(set(numbers)))
+        requested_set = None if requested is None else set(requested)
+        grouped: dict[int, list[AccountHistoryRow]] = (
+            {} if requested is None else {number: [] for number in requested}
+        )
+        excluded_old_rows = 0
+        runs = self.list_runs(limit=None, context=context)
+        for run in runs:
+            if context is not None:
+                context.raise_if_cancelled()
+            for row in run.account_rows:
+                if requested_set is not None and row.a_number not in requested_set:
+                    continue
+                if evidence_since is not None and row.ended_at < evidence_since:
+                    excluded_old_rows += 1
+                    continue
+                grouped.setdefault(row.a_number, []).append(row)
+        frozen_rows = {
+            number: tuple(
+                sorted(rows, key=lambda row: (row.ended_at, row.task_log.name))
+            )
+            for number, rows in sorted(grouped.items())
+        }
+        ended_times = tuple(run.ended_at for run in runs)
+        return AccountAuditHistorySnapshot(
+            runs_scanned=len(runs),
+            oldest_run=min(ended_times, default=None),
+            newest_run=max(ended_times, default=None),
+            rows_by_number=MappingProxyType(frozen_rows),
+            excluded_old_rows=excluded_old_rows,
+        )
 
     def page_snapshot(
         self,
