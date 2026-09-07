@@ -1106,7 +1106,9 @@ class EngineRollbackTests(unittest.TestCase):
             "saved note",
         )
 
-        controller.require_operational_ready.assert_called_once_with()
+        controller.require_operational_ready.assert_called_once_with(
+            "保存下载引擎回退点备注"
+        )
         controller.engine_updates.set_rollback_note.assert_called_once_with(
             point,
             " saved note ",

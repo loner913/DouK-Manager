@@ -744,7 +744,7 @@ class ManagerController:
         return self.engine_updates.measure_rollback_usage(context=context)
 
     def save_engine_rollback_note(self, point_dir: Path, note: str) -> str:
-        self.require_operational_ready()
+        self.require_operational_ready("保存下载引擎回退点备注")
         return self.engine_updates.set_rollback_note(point_dir, note)
 
     def apply_engine_rollback(
