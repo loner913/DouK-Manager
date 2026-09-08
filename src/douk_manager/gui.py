@@ -1623,7 +1623,7 @@ class MainWindow(QMainWindow):
         for column in range(7):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
-        self.account_audit_table.setColumnWidth(2, 56)
+        self.account_audit_table.setColumnWidth(2, 48)
         self.account_audit_table.selectionModel().selectionChanged.connect(
             self._show_account_audit_selection_details
         )

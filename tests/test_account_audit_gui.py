@@ -338,7 +338,7 @@ class AccountAuditGuiTests(unittest.TestCase):
                         Qt.ItemDataRole.TextAlignmentRole,
                     )
                 )
-                self.assertEqual(window.account_audit_table.columnWidth(2), 56)
+                self.assertEqual(window.account_audit_table.columnWidth(2), 48)
                 self.assertFalse(window.account_audit_native_logs.isChecked())
                 self.assertIn("建议不会自动生效", window.account_audit_notice.text())
                 self.assertLess(len(window.account_audit_page.findChildren(QWidget)), 80)
