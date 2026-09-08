@@ -7,7 +7,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
 
-from douk_manager.core.download_summary import AccountStatus
+from douk_manager.core.download_summary import AccountStatus, NativeLogSegment
 from douk_manager.operation import OperationContext, OperationProgress
 
 
@@ -35,6 +35,7 @@ class DownloadTaskHistory:
     reliable: bool
     account_rows: tuple[AccountHistoryRow, ...]
     details_complete: bool
+    native_log_segments: tuple[NativeLogSegment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,7 @@ class AccountAuditHistorySnapshot:
     newest_run: datetime | None
     rows_by_number: Mapping[int, tuple[AccountHistoryRow, ...]]
     excluded_old_rows: int
+    runs: tuple[DownloadTaskHistory, ...]
 
 
 @dataclass(frozen=True)
@@ -88,6 +90,9 @@ _DATE_IN_FILENAME = re.compile(
     re.IGNORECASE,
 )
 _A_TOKEN = re.compile(r"A(\d+)(?:-A(\d+))?", re.IGNORECASE)
+_NATIVE_SEGMENT_LINE = re.compile(
+    r"^日志区间：(.*)；偏移=(\d+)；长度=(\d+)$"
+)
 _STATUS_LINES: tuple[tuple[str, AccountStatus | str], ...] = (
     ("有新作品下载", AccountStatus.DOWNLOADED),
     ("作品均被引擎跳过", AccountStatus.ALL_SKIPPED),
@@ -231,6 +236,7 @@ class ResultHistoryService:
             newest_run=max(ended_times, default=None),
             rows_by_number=MappingProxyType(frozen_rows),
             excluded_old_rows=excluded_old_rows,
+            runs=runs,
         )
 
     def account_audit_fingerprint(
@@ -392,6 +398,7 @@ class ResultHistoryService:
         details_complete_marker = False
         number_map: dict[int, AccountStatus | str] = {}
         anomaly_numbers: set[int] = set()
+        native_log_segments: list[NativeLogSegment] = []
         in_summary = False
 
         with path.open("r", encoding="utf-8-sig", errors="strict") as handle:
@@ -405,6 +412,7 @@ class ResultHistoryService:
                     in_summary = True
                     number_map.clear()
                     anomaly_numbers.clear()
+                    native_log_segments.clear()
                     reliable = False
                     explicit_unreliable_marker = False
                     complete = None
@@ -431,6 +439,16 @@ class ResultHistoryService:
                 elif line.startswith("附加状态：异常后完成（"):
                     anomaly_numbers.update(_numbers_from_line(line))
                 else:
+                    segment_match = _NATIVE_SEGMENT_LINE.match(line)
+                    if segment_match:
+                        native_log_segments.append(
+                            NativeLogSegment(
+                                Path(segment_match.group(1)),
+                                int(segment_match.group(2)),
+                                int(segment_match.group(3)),
+                            )
+                        )
+                        continue
                     for label, status in _STATUS_LINES:
                         if line.startswith(f"{label}（"):
                             for number in _numbers_from_line(line):
@@ -461,6 +479,7 @@ class ResultHistoryService:
             reliable=reliable,
             account_rows=rows,
             details_complete=details_complete_marker,
+            native_log_segments=tuple(native_log_segments),
         )
 
 

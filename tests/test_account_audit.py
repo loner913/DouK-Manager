@@ -160,15 +160,19 @@ class ResultHistoryAuditAggregationTests(unittest.TestCase):
         self.assertIn(UNCERTAIN_EARLY_HISTORY_WARNING, report.warnings)
         self.assertIn(NATIVE_LOG_DISABLED_WARNING, report.warnings)
 
-    def test_report_does_not_claim_unimplemented_native_log_analysis(self) -> None:
+    def test_enabled_native_log_analysis_without_sources_is_honest(self) -> None:
         history = ResultHistoryService(Path("unused"))
 
-        with self.assertRaisesRegex(NotImplementedError, "03-A"):
-            AccountAuditService(history).build_report(
-                {1: True},
-                master_sha256="synthetic-sha256",
-                native_log_analysis=True,
-            )
+        report = AccountAuditService(history).build_report(
+            {1: True},
+            master_sha256="synthetic-sha256",
+            native_log_analysis=True,
+        )
+
+        self.assertTrue(report.native_log_analysis)
+        self.assertEqual(report.native_log_runs_scanned, 0)
+        self.assertNotIn(NATIVE_LOG_DISABLED_WARNING, report.warnings)
+        self.assertTrue(any("没有可验证" in warning for warning in report.warnings))
 
 
 class AccountAuditPureLogicTests(unittest.TestCase):
@@ -376,6 +380,143 @@ class AccountAuditPersistenceTests(unittest.TestCase):
 
             self.assertEqual(paths.account_audit, paths.data / "AccountAudit")
             self.assertTrue(paths.account_audit.is_dir())
+
+    def test_native_log_analysis_rechecks_exact_historical_segments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_test_paths(Path(directory), 3)
+            native_root = paths.volume / "Log"
+            native_root.mkdir()
+            native_log = native_root / "synthetic-native.log"
+            native_log.write_text(
+                "共有 3 个账号的作品等待下载\n"
+                "开始处理第 1 个账号\n"
+                "标识：A1account1\n"
+                "[ERROR]: Response Code: 403\n"
+                "开始处理第 2 个账号\n"
+                "标识：A2account2\n"
+                "该账号为私密账号\n"
+                "开始处理第 3 个账号\n"
+                "标识：A3account3\n"
+                "筛选处理后作品数量: 0\n",
+                encoding="utf-8",
+            )
+            task_log = paths.download_task_logs / "DownloadTask_2026-09-08_12-00-00.log"
+            task_log.write_text(
+                "【下载账号汇总】\n"
+                "进程结束时间：2026-09-08 12:00:00\n"
+                "退出码：0\n"
+                "账号汇总：完整\n"
+                "账号明细版本：1\n"
+                "无符合条件作品（3）：A1-A3\n"
+                f"日志区间：{native_log.resolve()}；偏移=0；长度={native_log.stat().st_size}\n",
+                encoding="utf-8",
+            )
+            service = AccountAuditService(
+                ResultHistoryService(paths.download_task_logs),
+                paths=paths,
+                backup=BackupService(paths),
+            )
+
+            summary_only = service.build_current_report(native_log_analysis=False)
+            deep = service.build_current_report(native_log_analysis=True)
+            cached = service.build_current_report(native_log_analysis=True)
+
+            self.assertEqual(summary_only.entries[0].reachability, ReachabilityState.REACHABLE)
+            self.assertEqual(deep.entries[0].reachability, ReachabilityState.REQUEST_FAILED)
+            self.assertEqual(deep.entries[1].privacy, PrivacyState.PRIVATE)
+            self.assertEqual(deep.entries[2].privacy, PrivacyState.PUBLIC)
+            self.assertTrue(deep.native_log_analysis)
+            self.assertEqual(deep.native_log_runs_scanned, 1)
+            self.assertEqual(deep.native_log_segments_scanned, 1)
+            self.assertNotIn(NATIVE_LOG_DISABLED_WARNING, deep.warnings)
+            self.assertIs(cached, deep)
+            native_log.write_text(native_log.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+            refreshed = service.build_current_report(native_log_analysis=True)
+            self.assertIsNot(refreshed, deep)
+
+    def test_native_log_analysis_honours_cancel_after_last_run_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_test_paths(Path(directory), 1)
+            native_root = paths.volume / "Log"
+            native_root.mkdir()
+            native_log = native_root / "synthetic-native.log"
+            native_log.write_text(
+                "共有 1 个账号的作品等待下载\n"
+                "开始处理第 1 个账号\n"
+                "标识：A1account1\n"
+                "筛选处理后作品数量: 0\n",
+                encoding="utf-8",
+            )
+            task_log = paths.download_task_logs / "DownloadTask_2026-09-08_12-00-00.log"
+            task_log.write_text(
+                "【下载账号汇总】\n"
+                "进程结束时间：2026-09-08 12:00:00\n"
+                "退出码：0\n"
+                "账号汇总：完整\n"
+                "账号明细版本：1\n"
+                "无符合条件作品（1）：A1\n"
+                f"日志区间：{native_log.resolve()}；偏移=0；长度={native_log.stat().st_size}\n",
+                encoding="utf-8",
+            )
+            service = AccountAuditService(
+                ResultHistoryService(paths.download_task_logs),
+                paths=paths,
+                backup=BackupService(paths),
+            )
+            context = OperationContext(progress_interval_seconds=0)
+
+            def cancel_on_native_progress(progress) -> None:
+                if progress.phase == "account_audit_native_logs":
+                    context.request_cancel()
+
+            context.set_progress_callback(cancel_on_native_progress)
+            master_before = paths.master_settings.read_bytes()
+
+            with self.assertRaises(TaskCancelled):
+                service.build_current_report(
+                    native_log_analysis=True,
+                    context=context,
+                )
+
+            self.assertEqual(paths.master_settings.read_bytes(), master_before)
+            self.assertFalse((paths.account_audit / "audit-state.json").exists())
+
+    def test_native_log_analysis_never_reads_a_declared_path_outside_volume_log(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = make_test_paths(root, 1)
+            (paths.volume / "Log").mkdir()
+            outside = root / "outside-native.log"
+            outside.write_text(
+                "共有 1 个账号的作品等待下载\n"
+                "开始处理第 1 个账号\n"
+                "标识：A1account1\n"
+                "[ERROR]: Response Code: 403\n",
+                encoding="utf-8",
+            )
+            task_log = paths.download_task_logs / "DownloadTask_2026-09-08_12-00-00.log"
+            task_log.write_text(
+                "【下载账号汇总】\n"
+                "进程结束时间：2026-09-08 12:00:00\n"
+                "退出码：0\n"
+                "账号汇总：完整\n"
+                "账号明细版本：1\n"
+                "无符合条件作品（1）：A1\n"
+                f"日志区间：{outside.resolve()}；偏移=0；长度={outside.stat().st_size}\n",
+                encoding="utf-8",
+            )
+            service = AccountAuditService(
+                ResultHistoryService(paths.download_task_logs),
+                paths=paths,
+                backup=BackupService(paths),
+            )
+
+            report = service.build_current_report(native_log_analysis=True)
+
+            self.assertEqual(report.entries[0].reachability, ReachabilityState.REACHABLE)
+            self.assertEqual(report.native_log_runs_scanned, 0)
+            self.assertTrue(any("没有可验证" in warning for warning in report.warnings))
+            self.assertNotIn(str(outside), "\n".join(report.warnings))
 
     def test_preview_lists_changes_and_keeps_array_length(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

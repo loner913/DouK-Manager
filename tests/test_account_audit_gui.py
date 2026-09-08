@@ -151,6 +151,7 @@ class AccountAuditControllerIntegrationTests(unittest.TestCase):
             controller.audit_accounts(
                 error_threshold=6,
                 minimum_evidence_runs=4,
+                native_log_analysis=True,
                 context=context,
             ),
             report,
@@ -158,6 +159,7 @@ class AccountAuditControllerIntegrationTests(unittest.TestCase):
         controller.account_audit.build_current_report.assert_called_once_with(
             error_threshold=6,
             minimum_evidence_runs=4,
+            native_log_analysis=True,
             context=context,
         )
         self.assertIs(
@@ -381,11 +383,37 @@ class AccountAuditGuiTests(unittest.TestCase):
                 window.controller.audit_accounts.assert_called_once_with(
                     error_threshold=5,
                     minimum_evidence_runs=3,
+                    native_log_analysis=False,
                     context=context,
                 )
                 progress = OperationProgress("account_audit_scan", "已扫描 2 / 42 轮", 2, 42)
                 submit.call_args.kwargs["on_progress"](progress)
                 self.assertIn("2 / 42", window.account_audit_progress.text())
+            finally:
+                self._dispose(window, home_patch)
+
+    def test_native_log_checkbox_submits_enabled_background_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window, home_patch = self._window(Path(directory))
+            try:
+                report = _report()
+                window.controller.audit_accounts = Mock(return_value=report)
+                window.account_audit_native_logs.setChecked(True)
+                with patch.object(
+                    window, "_submit_coalesced_background", return_value="audit-task"
+                ) as submit, patch.object(QMessageBox, "information") as information:
+                    window._start_account_audit_scan()
+
+                information.assert_not_called()
+                action = submit.call_args.args[1]
+                context = OperationContext()
+                self.assertIs(action(context), report)
+                window.controller.audit_accounts.assert_called_once_with(
+                    error_threshold=5,
+                    minimum_evidence_runs=3,
+                    native_log_analysis=True,
+                    context=context,
+                )
             finally:
                 self._dispose(window, home_patch)
 

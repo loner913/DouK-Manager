@@ -627,6 +627,8 @@ def parse_download_summary(
     planned_accounts: tuple[PlannedAccount, ...],
     located: LocatedNativeLogs,
     exit_code: int | None,
+    *,
+    context=None,
 ) -> DownloadSummary:
     plan_by_index = {account.task_index: account for account in planned_accounts}
     cleaned_mark_aliases = _unique_cleaned_mark_aliases(planned_accounts)
@@ -716,7 +718,14 @@ def parse_download_summary(
         )
 
     try:
-        for line in _iter_located_lines(located.segments):
+        lines = (
+            _iter_located_lines(located.segments)
+            if context is None
+            else _iter_located_lines(located.segments, context=context)
+        )
+        for line in lines:
+            if context is not None:
+                context.raise_if_cancelled()
             start_match = _START_RE.search(line)
             if start_match:
                 if current is not None:
@@ -942,12 +951,19 @@ def _match_pre_start_mark(
     return exact[0] if len(exact) == 1 else None
 
 
-def _iter_located_lines(segments: tuple[NativeLogSegment, ...]) -> Iterator[str]:
+def _iter_located_lines(
+    segments: tuple[NativeLogSegment, ...], *, context=None
+) -> Iterator[str]:
     for segment in segments:
-        yield from _iter_segment_lines(segment)
+        if context is not None:
+            context.raise_if_cancelled()
+        if context is None:
+            yield from _iter_segment_lines(segment)
+        else:
+            yield from _iter_segment_lines(segment, context=context)
 
 
-def _iter_segment_lines(segment: NativeLogSegment) -> Iterator[str]:
+def _iter_segment_lines(segment: NativeLogSegment, *, context=None) -> Iterator[str]:
     with segment.path.open("rb") as handle:
         start = max(segment.offset, 0)
         remaining = max(segment.length, 0)
@@ -967,6 +983,8 @@ def _iter_segment_lines(segment: NativeLogSegment) -> Iterator[str]:
         handle.seek(start)
         if discard_partial:
             while remaining > 0:
+                if context is not None:
+                    context.raise_if_cancelled()
                 chunk = handle.read(min(_READ_CHUNK_SIZE, remaining))
                 if not chunk:
                     raise _LogReadError("原生日志在声明片段结束前提前结束。")
@@ -981,6 +999,8 @@ def _iter_segment_lines(segment: NativeLogSegment) -> Iterator[str]:
         decoder = getincrementaldecoder("utf-8-sig")(errors="replace")
         buffer = ""
         while remaining > 0:
+            if context is not None:
+                context.raise_if_cancelled()
             chunk = handle.read(min(_READ_CHUNK_SIZE, remaining))
             if not chunk:
                 raise _LogReadError("原生日志在声明片段结束前提前结束。")

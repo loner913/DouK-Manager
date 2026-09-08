@@ -1545,7 +1545,7 @@ class MainWindow(QMainWindow):
         self.account_audit_native_logs = QCheckBox("含原生日志分析（慢）")
         self.account_audit_native_logs.setChecked(False)
         self.account_audit_native_logs.setToolTip(
-            "默认关闭；当前审计仅使用任务汇总，不会自动读取原生日志。"
+            "默认关闭；勾选后会读取历史任务记录的精确原生日志区间。"
         )
         controls.addWidget(self.account_audit_native_logs)
         controls.addStretch()
@@ -3423,13 +3423,7 @@ class MainWindow(QMainWindow):
     def _start_account_audit_scan(self) -> None:
         if self.controller.startup_state is not StartupState.READY:
             return
-        if self.account_audit_native_logs.isChecked():
-            QMessageBox.information(
-                self,
-                "原生日志分析未启用",
-                "当前账号审计只读取任务汇总；不会自动读取原生日志。请取消勾选后重试。",
-            )
-            return
+        native_log_analysis = self.account_audit_native_logs.isChecked()
         threshold = self.account_audit_error_threshold.value()
         minimum_runs = self.account_audit_minimum_runs.value()
         spec = TaskSpec(
@@ -3448,6 +3442,7 @@ class MainWindow(QMainWindow):
             lambda context: self.controller.audit_accounts(
                 error_threshold=threshold,
                 minimum_evidence_runs=minimum_runs,
+                native_log_analysis=native_log_analysis,
                 context=context,
             ),
             output=self.account_audit_output,
@@ -3485,9 +3480,16 @@ class MainWindow(QMainWindow):
         self._account_audit_model.set_decisions({})
         self._account_audit_model.set_report(report)
         newest = report.newest_run or "无"
+        native_summary = (
+            f"；原生日志：已复核 {report.native_log_runs_scanned} 轮 / "
+            f"{report.native_log_segments_scanned} 个区间"
+            if report.native_log_analysis
+            else "；原生日志：未启用"
+        )
         self.account_audit_summary.setText(
             f"扫描轮次：{report.runs_scanned}；最近：{newest}；"
-            f"主档：{report.total_accounts} 项；重复组：{report.duplicate_groups}。"
+            f"主档：{report.total_accounts} 项；重复组：{report.duplicate_groups}"
+            f"{native_summary}。"
         )
         self.account_audit_progress.setText("账号审计完成。")
         self.account_audit_warnings.setText(

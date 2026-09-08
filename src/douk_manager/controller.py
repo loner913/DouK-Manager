@@ -564,6 +564,7 @@ class ManagerController:
         *,
         error_threshold: int = 5,
         minimum_evidence_runs: int = 3,
+        native_log_analysis: bool = False,
         context: OperationContext | None = None,
     ) -> AccountAuditReport:
         self._require_operational_ready_with_context(
@@ -572,6 +573,7 @@ class ManagerController:
         return self.account_audit.build_current_report(
             error_threshold=error_threshold,
             minimum_evidence_runs=minimum_evidence_runs,
+            native_log_analysis=native_log_analysis,
             context=context,
         )
 

@@ -10,9 +10,10 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import re
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -21,11 +22,17 @@ from typing import TYPE_CHECKING, AbstractSet, Iterable, Mapping
 
 from douk_manager.config import ManagedPaths
 from douk_manager.core.backup import BackupService, sha256_file
-from douk_manager.core.download_summary import AccountStatus
+from douk_manager.core.download_summary import (
+    AccountStatus,
+    LocatedNativeLogs,
+    NativeLogSegment,
+    PlannedAccount,
+    parse_download_summary,
+)
 from douk_manager.core.json_store import read_json, write_json_atomic
 from douk_manager.core.locks import critical_section
 from douk_manager.core.result_history import AccountHistoryRow, ResultHistoryService
-from douk_manager.operation import TaskCancelled
+from douk_manager.operation import OperationProgress, TaskCancelled
 
 if TYPE_CHECKING:
     from douk_manager.operation import OperationContext
@@ -42,6 +49,10 @@ UNCERTAIN_EARLY_HISTORY_WARNING = (
     "未配置证据起始时间点时不作猜测性排除。"
 )
 NATIVE_LOG_DISABLED_WARNING = "未启用原生日志分析，可达性判定仅基于任务汇总。"
+NATIVE_LOG_NO_EVIDENCE_WARNING = (
+    "已启用原生日志分析，但没有可验证的精确历史日志区间；"
+    "账号结论保留任务汇总结果。"
+)
 
 
 class AccountAuditError(RuntimeError):
@@ -143,6 +154,9 @@ class AccountAuditReport:
     newest_run: str | None
     duplicate_groups: int
     warnings: tuple[str, ...]
+    native_log_analysis: bool = False
+    native_log_runs_scanned: int = 0
+    native_log_segments_scanned: int = 0
 
 
 @dataclass(frozen=True)
@@ -225,6 +239,7 @@ class AccountAuditService:
         generated_at: datetime | None = None,
         evidence_since: datetime | None = None,
         native_log_analysis: bool = False,
+        master_marks_by_number: Mapping[int, str] | None = None,
         identity_observations: Iterable[IdentityObservation] = (),
         explicitly_unavailable: AbstractSet[int] = frozenset(),
         error_threshold: int = DEFAULT_CONSECUTIVE_ERROR_THRESHOLD,
@@ -234,19 +249,38 @@ class AccountAuditService:
     ) -> AccountAuditReport:
         """Build a read-only report from one historical scan."""
 
-        if native_log_analysis:
-            raise NotImplementedError(
-                "native-log analysis is outside checkpoint 03-A"
-            )
         numbers = tuple(sorted(master_enable_by_number))
         snapshot = self.history_service.account_audit_snapshot(
             numbers=numbers,
             evidence_since=evidence_since,
             context=context,
         )
+        rows_by_number = snapshot.rows_by_number
+        native_runs_scanned = 0
+        native_segments_scanned = 0
+        native_unusable_runs = 0
+        if native_log_analysis:
+            native_root = self.paths.volume / "Log" if self.paths is not None else None
+            eligible_runs = tuple(
+                run
+                for run in snapshot.runs
+                if evidence_since is None or run.ended_at >= evidence_since
+            )
+            (
+                rows_by_number,
+                native_runs_scanned,
+                native_segments_scanned,
+                native_unusable_runs,
+            ) = _merge_native_log_history(
+                eligible_runs,
+                rows_by_number,
+                master_marks_by_number or {},
+                native_root=native_root,
+                context=context,
+            )
         entries = build_audit_entries(
             master_enable_by_number,
-            snapshot.rows_by_number,
+            rows_by_number,
             identity_observations=identity_observations,
             explicitly_unavailable=explicitly_unavailable,
             error_threshold=error_threshold,
@@ -258,7 +292,15 @@ class AccountAuditService:
             warnings.append(
                 "证据起始时间点之前的历史记录已排除，不作为永久停用依据。"
             )
-        warnings.append(NATIVE_LOG_DISABLED_WARNING)
+        if not native_log_analysis:
+            warnings.append(NATIVE_LOG_DISABLED_WARNING)
+        elif native_runs_scanned == 0:
+            warnings.append(NATIVE_LOG_NO_EVIDENCE_WARNING)
+        elif native_unusable_runs:
+            warnings.append(
+                f"原生日志分析已复核 {native_runs_scanned} 轮；"
+                f"另有 {native_unusable_runs} 轮的日志区间无法安全验证，已跳过。"
+            )
         groups = {
             entry.duplicate_group
             for entry in entries
@@ -274,6 +316,9 @@ class AccountAuditService:
             newest_run=_format_run_time(snapshot.newest_run),
             duplicate_groups=len(groups),
             warnings=tuple(warnings),
+            native_log_analysis=native_log_analysis,
+            native_log_runs_scanned=native_runs_scanned,
+            native_log_segments_scanned=native_segments_scanned,
         )
 
     def build_current_report(
@@ -283,6 +328,7 @@ class AccountAuditService:
         evidence_since: datetime | None = None,
         error_threshold: int = DEFAULT_CONSECUTIVE_ERROR_THRESHOLD,
         minimum_evidence_runs: int = DEFAULT_MINIMUM_EVIDENCE_RUNS,
+        native_log_analysis: bool = False,
         context: OperationContext | None = None,
     ) -> AccountAuditReport:
         paths, _backup = self._persistence_services()
@@ -299,8 +345,14 @@ class AccountAuditService:
                 raise AccountAuditError("审计侧档的 A 编号超出当前主档范围。")
             state_sha256 = sha256_file(state_path) if state_path.is_file() else ""
             identity_observations = _master_identity_observations(accounts)
+            master_marks = _master_marks(accounts)
         history_fingerprint = self.history_service.account_audit_fingerprint(
             context=context
+        )
+        native_fingerprint = (
+            _native_log_directory_fingerprint(paths.volume / "Log", context=context)
+            if native_log_analysis
+            else ()
         )
         cache_key = (
             master_sha256,
@@ -310,6 +362,8 @@ class AccountAuditService:
             evidence_since,
             error_threshold,
             minimum_evidence_runs,
+            native_log_analysis,
+            native_fingerprint,
         )
         if self._cached_report_key == cache_key and self._cached_report is not None:
             if context is not None:
@@ -320,7 +374,9 @@ class AccountAuditService:
             master_sha256=master_sha256,
             generated_at=generated_at,
             evidence_since=evidence_since,
+            native_log_analysis=native_log_analysis,
             identity_observations=identity_observations,
+            master_marks_by_number=master_marks,
             error_threshold=error_threshold,
             minimum_evidence_runs=minimum_evidence_runs,
             saved_dispositions=saved,
@@ -442,6 +498,146 @@ _PUBLIC_STATUSES = frozenset(
         AccountStatus.NO_ELIGIBLE_WORKS,
     )
 )
+
+
+def _master_marks(accounts: list[dict]) -> dict[int, str]:
+    marks: dict[int, str] = {}
+    for number, account in enumerate(accounts, start=1):
+        value = account.get("mark")
+        if isinstance(value, str) and value.strip():
+            marks[number] = value.strip()
+    return marks
+
+
+def _native_log_directory_fingerprint(
+    native_root: Path, *, context: OperationContext | None
+) -> tuple[tuple[str, int, int], ...]:
+    if context is not None:
+        context.raise_if_cancelled()
+    if not native_root.is_dir():
+        return ()
+    entries: list[tuple[str, int, int]] = []
+    for path in native_root.glob("*.log"):
+        if context is not None:
+            context.raise_if_cancelled()
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        entries.append((path.name.casefold(), stat.st_mtime_ns, stat.st_size))
+    return tuple(sorted(entries))
+
+
+def _validated_native_segments(
+    segments: tuple[NativeLogSegment, ...], native_root: Path
+) -> tuple[NativeLogSegment, ...] | None:
+    try:
+        root = native_root.resolve()
+    except OSError:
+        return None
+    validated: list[NativeLogSegment] = []
+    for segment in segments:
+        if segment.offset < 0 or segment.length <= 0:
+            return None
+        candidate = Path(segment.path)
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            return None
+        if (
+            os.path.normcase(str(resolved.parent)) != os.path.normcase(str(root))
+            or resolved.suffix.casefold() != ".log"
+        ):
+            return None
+        try:
+            size = resolved.stat().st_size
+        except OSError:
+            return None
+        if segment.offset + segment.length > size:
+            return None
+        validated.append(NativeLogSegment(resolved, segment.offset, segment.length))
+    return tuple(validated) if validated else None
+
+
+def _merge_native_log_history(
+    runs: tuple[object, ...],
+    rows_by_number: Mapping[int, tuple[AccountHistoryRow, ...]],
+    master_marks_by_number: Mapping[int, str],
+    *,
+    native_root: Path | None,
+    context: OperationContext | None,
+) -> tuple[dict[int, tuple[AccountHistoryRow, ...]], int, int, int]:
+    replacements: dict[tuple[Path, int], AccountStatus] = {}
+    runs_scanned = 0
+    segments_scanned = 0
+    unusable_runs = 0
+    total = len(runs)
+    for index, run in enumerate(runs, start=1):
+        if context is not None:
+            context.raise_if_cancelled()
+        segments = tuple(getattr(run, "native_log_segments", ()))
+        if segments:
+            rows = tuple(getattr(run, "account_rows", ()))
+            numbers = tuple(sorted({row.a_number for row in rows}))
+            marks_available = all(number in master_marks_by_number for number in numbers)
+            validated = (
+                _validated_native_segments(segments, native_root)
+                if native_root is not None
+                else None
+            )
+            if (
+                not getattr(run, "details_complete", False)
+                or not getattr(run, "reliable", False)
+                or not numbers
+                or len(numbers) != len(rows)
+                or not marks_available
+                or validated is None
+            ):
+                unusable_runs += 1
+            else:
+                planned = tuple(
+                    PlannedAccount(
+                        task_index,
+                        number,
+                        master_marks_by_number[number],
+                    )
+                    for task_index, number in enumerate(numbers, start=1)
+                )
+                deep = parse_download_summary(
+                    planned,
+                    LocatedNativeLogs(validated, "account-audit-history", True),
+                    getattr(run, "exit_code", None),
+                    context=context,
+                )
+                if deep.reliable:
+                    task_log = Path(getattr(run, "task_log"))
+                    for outcome in deep.started_outcomes:
+                        replacements[(task_log, outcome.a_number)] = outcome.status
+                    runs_scanned += 1
+                    segments_scanned += len(validated)
+                else:
+                    unusable_runs += 1
+        else:
+            unusable_runs += 1
+        if context is not None:
+            context.report_progress(
+                OperationProgress(
+                    "account_audit_native_logs",
+                    f"已分析原生日志 {index} / {total} 轮",
+                    index,
+                    total,
+                )
+            )
+    if context is not None:
+        context.raise_if_cancelled()
+
+    merged: dict[int, tuple[AccountHistoryRow, ...]] = {}
+    for number, rows in rows_by_number.items():
+        merged[number] = tuple(
+            replace(row, status=replacements.get((row.task_log, number), row.status))
+            for row in rows
+        )
+    return merged, runs_scanned, segments_scanned, unusable_runs
 
 
 def classify_identities(
