@@ -342,6 +342,18 @@ class AccountAuditGuiTests(unittest.TestCase):
                 )
                 self.assertEqual(window.account_audit_table.columnWidth(2), 48)
                 self.assertFalse(window.account_audit_native_logs.isChecked())
+                native_logs_tooltip = window.account_audit_native_logs.toolTip()
+                for phrase in (
+                    "日常查看、筛选和查重",
+                    "永久停用",
+                    "403",
+                    "私密",
+                    "异常原因",
+                    "耗时更长",
+                    "不是实时联网检测",
+                    "不会自动修改账号状态",
+                ):
+                    self.assertIn(phrase, native_logs_tooltip)
                 self.assertIn("建议不会自动生效", window.account_audit_notice.text())
                 self.assertLess(len(window.account_audit_page.findChildren(QWidget)), 80)
                 window._apply_account_audit_report(_report())

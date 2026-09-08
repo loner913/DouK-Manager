@@ -1545,7 +1545,10 @@ class MainWindow(QMainWindow):
         self.account_audit_native_logs = QCheckBox("含原生日志分析（慢）")
         self.account_audit_native_logs.setChecked(False)
         self.account_audit_native_logs.setToolTip(
-            "默认关闭；勾选后会读取历史任务记录的精确原生日志区间。"
+            "默认关闭。日常查看、筛选和查重时只读取任务汇总，速度更快。\n"
+            "准备永久停用账号，或需要核查 403、私密和异常原因时再勾选；"
+            "开启后会读取历史任务记录的精确原生日志区间，耗时更长。\n"
+            "这不是实时联网检测；分析结果仍只是建议，不会自动修改账号状态。"
         )
         controls.addWidget(self.account_audit_native_logs)
         controls.addStretch()
