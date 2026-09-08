@@ -3642,6 +3642,8 @@ class MainWindow(QMainWindow):
             "正在创建完整备份并应用账号审计决定，请等待操作完成。",
             "待应用决定会在成功后刷新；当前显示不代表已写入主档。",
         )
+        self.account_audit_progress.repaint()
+        self.account_audit_output.viewport().repaint()
         task_id = self._submit_background(
             spec,
             lambda context: self.controller.apply_audit_decisions(

@@ -503,6 +503,50 @@ class AccountAuditGuiTests(unittest.TestCase):
             finally:
                 self._dispose(window, home_patch)
 
+    def test_apply_status_repaints_before_background_submission(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window, home_patch = self._window(Path(directory))
+            try:
+                report = _report()
+                window._apply_account_audit_report(report)
+                window._account_audit_decisions = {
+                    1: Disposition.PERMANENTLY_DISABLED,
+                }
+                window._update_account_audit_pending()
+                window.controller.account_audit.preview_decisions = Mock(
+                    return_value=AuditApplyPreview((1,), (), (), 3, 3, 4, 4)
+                )
+                call_order: list[str] = []
+                output_viewport = window.account_audit_output.viewport()
+
+                with patch.object(
+                    QMessageBox,
+                    "question",
+                    return_value=QMessageBox.StandardButton.Yes,
+                ), patch.object(
+                    window.account_audit_progress,
+                    "repaint",
+                    side_effect=lambda: call_order.append("progress.repaint"),
+                ), patch.object(
+                    output_viewport,
+                    "repaint",
+                    side_effect=lambda: call_order.append("output.repaint"),
+                ), patch.object(
+                    window,
+                    "_submit_background",
+                    side_effect=lambda *_args, **_kwargs: (
+                        call_order.append("submit") or "apply-task"
+                    ),
+                ):
+                    window._preview_and_apply_account_audit()
+
+                self.assertEqual(
+                    call_order,
+                    ["progress.repaint", "output.repaint", "submit"],
+                )
+            finally:
+                self._dispose(window, home_patch)
+
     def test_apply_submission_rejection_keeps_decisions_and_reason_visible(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             window, home_patch = self._window(Path(directory))
