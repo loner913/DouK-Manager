@@ -3634,6 +3634,14 @@ class MainWindow(QMainWindow):
             dynamic_cancellation=True,
         )
         self._account_audit_refresh_after_apply = False
+        self.account_audit_progress.setText(
+            "正在创建完整备份并应用决定，请等待操作完成。"
+        )
+        self._replace_info(
+            self.account_audit_output,
+            "正在创建完整备份并应用账号审计决定，请等待操作完成。",
+            "待应用决定会在成功后刷新；当前显示不代表已写入主档。",
+        )
         task_id = self._submit_background(
             spec,
             lambda context: self.controller.apply_audit_decisions(
@@ -3656,6 +3664,12 @@ class MainWindow(QMainWindow):
         if task_id is not None:
             self._account_audit_task_id = task_id
             self.account_audit_cancel_button.setEnabled(True)
+        else:
+            self.account_audit_progress.setText("应用未启动，决定仍待应用。")
+            self._append_info(
+                self.account_audit_output,
+                "决定仍待应用；账号主档未被本次操作修改。",
+            )
 
     def _account_audit_applied(self, result: AuditApplyResult) -> None:
         if self.controller.startup_state is StartupState.CLOSING:

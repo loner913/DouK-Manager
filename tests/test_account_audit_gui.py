@@ -440,6 +440,7 @@ class AccountAuditGuiTests(unittest.TestCase):
                     2: Disposition.ENABLED,
                     3: Disposition.PENDING_REVIEW,
                 }
+                window._update_account_audit_pending()
                 preview = AuditApplyPreview((1,), (2,), (3,), 1, 3, 4, 4)
                 window.controller.account_audit.preview_decisions = Mock(
                     return_value=preview
@@ -479,9 +480,69 @@ class AccountAuditGuiTests(unittest.TestCase):
                     spec.resource_keys,
                     frozenset({"settings", "volume", "collector_process"}),
                 )
+                self.assertEqual(
+                    window.account_audit_progress.text(),
+                    "正在创建完整备份并应用决定，请等待操作完成。",
+                )
+                self.assertIn(
+                    "待应用决定会在成功后刷新",
+                    window.account_audit_output.toPlainText(),
+                )
+                self.assertEqual(
+                    window._account_audit_decisions,
+                    {
+                        1: Disposition.PERMANENTLY_DISABLED,
+                        2: Disposition.ENABLED,
+                        3: Disposition.PENDING_REVIEW,
+                    },
+                )
+                self.assertIn("停用 1", window.account_audit_pending.text())
                 context = OperationContext()
                 self.assertIs(action(context), result)
                 window.controller.apply_audit_decisions.assert_called_once()
+            finally:
+                self._dispose(window, home_patch)
+
+    def test_apply_submission_rejection_keeps_decisions_and_reason_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window, home_patch = self._window(Path(directory))
+            try:
+                report = _report()
+                window._apply_account_audit_report(report)
+                window._account_audit_decisions = {
+                    1: Disposition.PERMANENTLY_DISABLED,
+                }
+                window._update_account_audit_pending()
+                window.controller.account_audit.preview_decisions = Mock(
+                    return_value=AuditApplyPreview((1,), (), (), 3, 3, 4, 4)
+                )
+
+                def reject(*_args, **_kwargs):
+                    window._append_info(
+                        window.account_audit_output,
+                        "【未启动】synthetic coordinator rejection",
+                    )
+                    return None
+
+                with patch.object(
+                    QMessageBox,
+                    "question",
+                    return_value=QMessageBox.StandardButton.Yes,
+                ), patch.object(window, "_submit_background", side_effect=reject):
+                    window._preview_and_apply_account_audit()
+
+                self.assertEqual(
+                    window.account_audit_progress.text(),
+                    "应用未启动，决定仍待应用。",
+                )
+                output = window.account_audit_output.toPlainText()
+                self.assertIn("【未启动】synthetic coordinator rejection", output)
+                self.assertIn("决定仍待应用", output)
+                self.assertEqual(
+                    window._account_audit_decisions,
+                    {1: Disposition.PERMANENTLY_DISABLED},
+                )
+                self.assertIn("停用 1", window.account_audit_pending.text())
             finally:
                 self._dispose(window, home_patch)
 
