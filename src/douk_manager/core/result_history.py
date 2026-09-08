@@ -5,12 +5,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Mapping
+from typing import Mapping
 
 from douk_manager.core.download_summary import AccountStatus
-
-if TYPE_CHECKING:
-    from douk_manager.operation import OperationContext
+from douk_manager.operation import OperationContext, OperationProgress
 
 
 class ResultHistoryError(RuntimeError):
@@ -119,6 +117,7 @@ class ResultHistoryService:
         *,
         limit: int | None = 500,
         context: OperationContext | None = None,
+        progress_phase: str | None = None,
     ) -> tuple[DownloadTaskHistory, ...]:
         if limit is not None and limit < 1:
             return ()
@@ -135,15 +134,24 @@ class ResultHistoryService:
         ordered_paths = [path for _, path in sorted(paths_with_mtime, reverse=True)]
         paths = ordered_paths if limit is None else ordered_paths[:limit]
         result: list[DownloadTaskHistory] = []
-        for path in paths:
+        for index, path in enumerate(paths, start=1):
             if context is not None:
                 context.raise_if_cancelled()
             try:
                 parsed = self.parse(path)
             except (OSError, UnicodeError, ResultHistoryError):
-                continue
+                parsed = None
             if parsed is not None:
                 result.append(parsed)
+            if context is not None and progress_phase is not None:
+                context.report_progress(
+                    OperationProgress(
+                        progress_phase,
+                        f"已扫描 {index} / {len(paths)} 轮",
+                        index,
+                        len(paths),
+                    )
+                )
         result.sort(key=lambda item: item.ended_at, reverse=True)
         return tuple(result)
 
@@ -186,8 +194,12 @@ class ResultHistoryService:
             {} if requested is None else {number: [] for number in requested}
         )
         excluded_old_rows = 0
-        runs = self.list_runs(limit=None, context=context)
-        for run in runs:
+        runs = self.list_runs(
+            limit=None,
+            context=context,
+            progress_phase="account_audit_scan",
+        )
+        for index, run in enumerate(runs, start=1):
             if context is not None:
                 context.raise_if_cancelled()
             for row in run.account_rows:
@@ -197,6 +209,15 @@ class ResultHistoryService:
                     excluded_old_rows += 1
                     continue
                 grouped.setdefault(row.a_number, []).append(row)
+            if context is not None:
+                context.report_progress(
+                    OperationProgress(
+                        "account_audit_scan",
+                        f"已汇总 {index} / {len(runs)} 轮",
+                        index,
+                        len(runs),
+                    )
+                )
         frozen_rows = {
             number: tuple(
                 sorted(rows, key=lambda row: (row.ended_at, row.task_log.name))
@@ -211,6 +232,28 @@ class ResultHistoryService:
             rows_by_number=MappingProxyType(frozen_rows),
             excluded_old_rows=excluded_old_rows,
         )
+
+    def account_audit_fingerprint(
+        self,
+        *,
+        context: OperationContext | None = None,
+    ) -> tuple[tuple[str, int, int], ...]:
+        """Return a metadata-only cache key for the current task-log snapshot."""
+
+        if context is not None:
+            context.raise_if_cancelled()
+        if not self.log_directory.is_dir():
+            return ()
+        entries: list[tuple[str, int, int]] = []
+        for path in self.log_directory.glob("DownloadTask_*.log"):
+            if context is not None:
+                context.raise_if_cancelled()
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            entries.append((path.name, stat.st_mtime_ns, stat.st_size))
+        return tuple(sorted(entries))
 
     def page_snapshot(
         self,

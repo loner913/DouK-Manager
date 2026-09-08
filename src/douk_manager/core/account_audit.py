@@ -2,7 +2,7 @@
 
 Checkpoint 03-A supplies the read-only evidence model.  Checkpoint 03-B adds
 the explicit preview, backup, master-enable, and audit-sidecar transaction.
-Network, controller, and GUI behavior remain outside this module.
+Checkpoint 03-C reuses those contracts through a metadata-keyed scan cache.
 """
 
 from __future__ import annotations
@@ -186,6 +186,8 @@ class AccountAuditService:
         self.history_service = history_service
         self.paths = paths
         self.backup = backup
+        self._cached_report_key: tuple[object, ...] | None = None
+        self._cached_report: AccountAuditReport | None = None
 
     def build_entries(
         self,
@@ -284,6 +286,7 @@ class AccountAuditService:
         context: OperationContext | None = None,
     ) -> AccountAuditReport:
         paths, _backup = self._persistence_services()
+        state_path = paths.account_audit / "audit-state.json"
         with critical_section(paths.lock_file):
             document, master_sha256 = _read_master_with_sha(paths.master_settings)
             accounts = _accounts(document)
@@ -291,19 +294,41 @@ class AccountAuditService:
                 number: bool(account.get("enable", True))
                 for number, account in enumerate(accounts, start=1)
             }
-            saved = _load_saved_dispositions(paths.account_audit / "audit-state.json")
+            saved = _load_saved_dispositions(state_path)
             if not set(saved).issubset(master_enable):
                 raise AccountAuditError("审计侧档的 A 编号超出当前主档范围。")
-        return self.build_report(
+            state_sha256 = sha256_file(state_path) if state_path.is_file() else ""
+            identity_observations = _master_identity_observations(accounts)
+        history_fingerprint = self.history_service.account_audit_fingerprint(
+            context=context
+        )
+        cache_key = (
+            master_sha256,
+            state_sha256,
+            history_fingerprint,
+            generated_at,
+            evidence_since,
+            error_threshold,
+            minimum_evidence_runs,
+        )
+        if self._cached_report_key == cache_key and self._cached_report is not None:
+            if context is not None:
+                context.raise_if_cancelled()
+            return self._cached_report
+        report = self.build_report(
             master_enable,
             master_sha256=master_sha256,
             generated_at=generated_at,
             evidence_since=evidence_since,
+            identity_observations=identity_observations,
             error_threshold=error_threshold,
             minimum_evidence_runs=minimum_evidence_runs,
             saved_dispositions=saved,
             context=context,
         )
+        self._cached_report_key = cache_key
+        self._cached_report = report
+        return report
 
     @staticmethod
     def preview_decisions(
@@ -390,12 +415,15 @@ class AccountAuditService:
                 if isinstance(exc, AccountAuditError):
                     raise
                 raise AccountAuditError(f"账号审计写入失败：{exc}") from exc
-            return AuditApplyResult(
+            result = AuditApplyResult(
                 preview=preview,
                 backup_path=snapshot,
                 audit_state_path=state_path,
                 master_sha256_after=master_sha256_after,
             )
+            self._cached_report_key = None
+            self._cached_report = None
+            return result
 
     def _persistence_services(self) -> tuple[ManagedPaths, BackupService]:
         if self.paths is None or self.backup is None:
@@ -621,6 +649,19 @@ def preview_audit_decisions(
         array_length_before=report.total_accounts,
         array_length_after=report.total_accounts,
     )
+
+
+def _master_identity_observations(
+    accounts: list[dict],
+) -> tuple[IdentityObservation, ...]:
+    observations: list[IdentityObservation] = []
+    for number, account in enumerate(accounts, start=1):
+        value = account.get("url")
+        if not isinstance(value, str) or not value.strip():
+            continue
+        token = hashlib.sha256(value.strip().casefold().encode("utf-8")).hexdigest()
+        observations.append(IdentityObservation(number, token))
+    return tuple(observations)
 
 
 def _read_master_with_sha(path: Path) -> tuple[dict, str]:

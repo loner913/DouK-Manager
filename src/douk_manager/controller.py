@@ -8,6 +8,12 @@ from typing import TYPE_CHECKING, Any
 
 from douk_manager.config import AppConfig, ManagedPaths, application_root, update_config
 from douk_manager.core.backup import BackupService
+from douk_manager.core.account_audit import (
+    AccountAuditReport,
+    AccountAuditService,
+    AuditApplyResult,
+    AuditDecision,
+)
 from douk_manager.core.download_summary import DownloadSummary
 from douk_manager.core.engine import (
     BATCH_RUN_COMMAND,
@@ -27,7 +33,13 @@ from douk_manager.core.engine_update import (
 )
 from douk_manager.core.json_store import read_json
 from douk_manager.core.locks import critical_section
-from douk_manager.core.settings_tasks import EarliestRule, GeneratedTask, SettingsTaskService
+from douk_manager.core.selector import compact_numbers
+from douk_manager.core.settings_tasks import (
+    ActivatedTask,
+    EarliestRule,
+    GeneratedTask,
+    SettingsTaskService,
+)
 from douk_manager.core.task_order import TaskOrderService
 from douk_manager.core.result_history import RecentPrivateMatch, ResultHistoryService
 from douk_manager.core.result_dashboard import (
@@ -76,6 +88,11 @@ class ManagerController:
         self.tasks = SettingsTaskService(self.paths, self.backup)
         self.task_order = TaskOrderService(self.paths)
         self.results = ResultHistoryService(self.paths.download_task_logs)
+        self.account_audit = AccountAuditService(
+            self.results,
+            paths=self.paths,
+            backup=self.backup,
+        )
         self.result_dashboard = ResultDashboardService(self.paths.download_task_logs)
         self.engine = EngineService(self.paths, self.config, self.backup)
         self.engine_updates = EngineUpdateService(
@@ -542,10 +559,71 @@ class ManagerController:
         self.logger.info("任务队列已恢复按 A 编号排序")
         return result
 
-    def activate_task(self, path: Path) -> Path:
+    def audit_accounts(
+        self,
+        *,
+        error_threshold: int = 5,
+        minimum_evidence_runs: int = 3,
+        context: OperationContext | None = None,
+    ) -> AccountAuditReport:
+        self._require_operational_ready_with_context(
+            "扫描账号健康审计", context=context
+        )
+        return self.account_audit.build_current_report(
+            error_threshold=error_threshold,
+            minimum_evidence_runs=minimum_evidence_runs,
+            context=context,
+        )
+
+    def apply_audit_decisions(
+        self,
+        report: AccountAuditReport,
+        decisions: tuple[AuditDecision, ...],
+        *,
+        context: OperationContext | None = None,
+    ) -> AuditApplyResult:
+        self._require_operational_ready_with_context(
+            "应用账号审计决定", context=context
+        )
+        self.require_download_lifecycle_idle()
+        if self.engine.external_running():
+            raise ControllerError("下载引擎正在运行，禁止应用账号审计决定。")
+        if self.collector.running or self.collector.health():
+            raise ControllerError("账号采集服务运行时不能应用账号审计决定。")
+        if context is not None:
+            context.raise_if_cancelled()
+        result = self.account_audit.apply_decisions(
+            report,
+            decisions,
+            context=context,
+        )
+        self.logger.info(
+            "账号审计决定已应用：停用=%s；恢复=%s；待复核=%s；备份=%s",
+            compact_numbers(result.preview.to_disable),
+            compact_numbers(result.preview.to_enable),
+            compact_numbers(result.preview.to_pending),
+            result.backup_path,
+        )
+        return result
+
+    def _log_activation_result(
+        self,
+        prefix: str,
+        template: Path,
+        result: ActivatedTask,
+    ) -> None:
+        self.logger.info("%s：%s", prefix, template)
+        if result.vetoed_numbers:
+            self.logger.warning(
+                "主档永久停用否决：数量=%s；A编号=%s",
+                len(result.vetoed_numbers),
+                compact_numbers(result.vetoed_numbers),
+            )
+
+    def activate_task(self, path: Path) -> ActivatedTask:
         self.require_safe_write()
         result = self.tasks.activate_existing_task(path)
-        self.logger.info("任务已激活：%s", path)
+        self._log_activation_result("任务已激活", path, result)
         return result
 
     def start_current_download(
@@ -648,7 +726,7 @@ class ManagerController:
     ) -> EngineRun:
         if _queue_continuation and getattr(self, "_download_lifecycle_active", False):
             result = self.tasks.activate_existing_task(task_path)
-            self.logger.info("队列任务已激活：%s", result)
+            self._log_activation_result("队列任务已激活", task_path, result)
             return self.engine.start(
                 pause_after_exit=pause_after_exit,
                 task_template=task_path,

@@ -12,7 +12,7 @@ from PySide6.QtCore import Qt
 
 from douk_manager.background import CancellationToken, TaskFailure, TaskState, TaskWorker
 from douk_manager.core.backup import BackupService
-from douk_manager.core.json_store import read_json
+from douk_manager.core.json_store import read_json, write_json_atomic
 from douk_manager.core.settings_tasks import SettingsTaskService
 from douk_manager.core import task_order as task_order_module
 from douk_manager.core.task_order import (
@@ -22,7 +22,18 @@ from douk_manager.core.task_order import (
     task_start_number,
 )
 from douk_manager.operation import OperationContext
-from tests.helpers import make_test_paths
+from tests.helpers import make_test_paths as _make_test_paths
+
+
+def make_test_paths(base: Path, account_count: int = 8):
+    """Task-order fixtures need selectable accounts, not tombstone coverage."""
+
+    paths = _make_test_paths(base, account_count)
+    master = read_json(paths.master_settings)
+    for account in master["accounts_urls"]:
+        account["enable"] = True
+    write_json_atomic(paths.master_settings, master)
+    return paths
 
 
 class TaskOrderTests(unittest.TestCase):

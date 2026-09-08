@@ -65,6 +65,17 @@ from douk_manager.background import (
     TaskState,
 )
 from douk_manager.core.download_summary import AccountStatus, format_summary_for_ui
+from douk_manager.core.account_audit import (
+    AccountAuditEntry,
+    AccountAuditReport,
+    AuditApplyResult,
+    AuditDecision,
+    Disposition,
+    IdentityState,
+    PrivacyState,
+    ReachabilityState,
+    Suggestion,
+)
 from douk_manager.core.engine import ENGINE_MODE_MONITOR, assess_process_exit
 from douk_manager.core.engine_update import (
     EngineRollbackPoint,
@@ -93,7 +104,8 @@ from douk_manager.core.result_dashboard import (
     DashboardTaskIndexEntry,
     ResultDashboardSnapshot,
 )
-from douk_manager.core.settings_tasks import EarliestRule
+from douk_manager.core.selector import compact_numbers
+from douk_manager.core.settings_tasks import ActivatedTask, EarliestRule
 from douk_manager.core.task_order import move_to_index
 from douk_manager.ui_messages import format_information
 from douk_manager.ui_state import (
@@ -297,6 +309,50 @@ def _dashboard_account_needs_attention(account: DashboardAccountRow) -> bool:
         "pre_start_error",
         "not_started",
     )
+
+
+def _audit_identity_label(value: IdentityState) -> str:
+    return {
+        IdentityState.CONFIRMED: "已确认",
+        IdentityState.CONFLICT: "冲突",
+        IdentityState.DUPLICATE: "重复",
+        IdentityState.UNRESOLVED: "未确认",
+    }[value]
+
+
+def _audit_reachability_label(value: ReachabilityState) -> str:
+    return {
+        ReachabilityState.REACHABLE: "可达",
+        ReachabilityState.UNAVAILABLE: "不可用",
+        ReachabilityState.REQUEST_FAILED: "请求失败，需复核",
+        ReachabilityState.UNKNOWN: "未知",
+    }[value]
+
+
+def _audit_privacy_label(value: PrivacyState) -> str:
+    return {
+        PrivacyState.PUBLIC: "公开",
+        PrivacyState.PRIVATE: "私密",
+        PrivacyState.UNKNOWN: "未知",
+    }[value]
+
+
+def _audit_suggestion_label(value: Suggestion) -> str:
+    return {
+        Suggestion.KEEP: "保持启用",
+        Suggestion.REVIEW: "需复核",
+        Suggestion.SUGGEST_DISABLE: "建议停用",
+        Suggestion.SUGGEST_REENABLE: "建议恢复",
+        Suggestion.NO_EVIDENCE: "证据不足",
+    }[value]
+
+
+def _audit_disposition_label(value: Disposition) -> str:
+    return {
+        Disposition.ENABLED: "继续启用",
+        Disposition.PERMANENTLY_DISABLED: "永久停用",
+        Disposition.PENDING_REVIEW: "待复核",
+    }[value]
 
 
 def _log_stats_section_html(
@@ -610,6 +666,123 @@ class DashboardAccountTableModel(QAbstractTableModel):
         return super().headerData(section, orientation, role)
 
 
+class AccountAuditTableModel(QAbstractTableModel):
+    HEADERS = ("A编号", "身份", "可达", "隐私", "主档", "建议", "我的决定", "理由")
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._entries: tuple[AccountAuditEntry, ...] = ()
+        self._visible_entries: tuple[AccountAuditEntry, ...] = ()
+        self._filter_mode = "all"
+        self._account_number: int | None = None
+        self._decisions: dict[int, Disposition] = {}
+
+    @property
+    def total_count(self) -> int:
+        return len(self._entries)
+
+    @property
+    def visible_count(self) -> int:
+        return len(self._visible_entries)
+
+    def set_report(self, report: AccountAuditReport | None) -> None:
+        self.beginResetModel()
+        self._entries = () if report is None else report.entries
+        self._rebuild_visible_entries()
+        self.endResetModel()
+
+    def set_decisions(self, decisions: dict[int, Disposition]) -> None:
+        self.beginResetModel()
+        self._decisions = dict(decisions)
+        self._rebuild_visible_entries()
+        self.endResetModel()
+
+    def set_filter(self, mode: str, account_text: str) -> None:
+        number = self._parse_account_number(account_text)
+        if mode == self._filter_mode and number == self._account_number:
+            return
+        self.beginResetModel()
+        self._filter_mode = mode
+        self._account_number = number
+        self._rebuild_visible_entries()
+        self.endResetModel()
+
+    @staticmethod
+    def _parse_account_number(text: str) -> int | None:
+        value = text.strip()
+        if value[:1].casefold() == "a":
+            value = value[1:].strip()
+        if not value:
+            return None
+        return int(value) if value.isdecimal() else -1
+
+    def _rebuild_visible_entries(self) -> None:
+        self._visible_entries = tuple(
+            entry for entry in self._entries if self._matches(entry)
+        )
+
+    def _matches(self, entry: AccountAuditEntry) -> bool:
+        if self._account_number is not None and entry.a_number != self._account_number:
+            return False
+        if self._filter_mode == "all":
+            return True
+        if self._filter_mode == "suggest_disable":
+            return entry.suggestion is Suggestion.SUGGEST_DISABLE
+        if self._filter_mode == "suggest_reenable":
+            return entry.suggestion is Suggestion.SUGGEST_REENABLE
+        if self._filter_mode == "review":
+            return entry.suggestion is Suggestion.REVIEW
+        if self._filter_mode == "duplicate":
+            return entry.identity is IdentityState.DUPLICATE
+        if self._filter_mode == "disabled":
+            return not entry.master_enable
+        return False
+
+    def entry_at(self, row: int) -> AccountAuditEntry | None:
+        if row < 0 or row >= len(self._visible_entries):
+            return None
+        return self._visible_entries[row]
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._visible_entries)
+
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self.HEADERS)
+
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> object:
+        if not index.isValid():
+            return None
+        entry = self._visible_entries[index.row()]
+        if role == Qt.ItemDataRole.UserRole:
+            return entry.a_number
+        if role == Qt.ItemDataRole.ToolTipRole:
+            return entry.suggestion_reason
+        if role != Qt.ItemDataRole.DisplayRole:
+            return None
+        decision = self._decisions.get(entry.a_number, entry.disposition)
+        values = (
+            f"A{entry.a_number}",
+            _audit_identity_label(entry.identity),
+            _audit_reachability_label(entry.reachability),
+            _audit_privacy_label(entry.privacy),
+            "启用" if entry.master_enable else "停用",
+            _audit_suggestion_label(entry.suggestion),
+            _audit_disposition_label(decision),
+            entry.suggestion_reason,
+        )
+        return values[index.column()]
+
+    def headerData(
+        self,
+        section: int,
+        orientation: Qt.Orientation,
+        role: int = Qt.ItemDataRole.DisplayRole,
+    ) -> object:
+        if role == Qt.ItemDataRole.DisplayRole and orientation == Qt.Orientation.Horizontal:
+            return self.HEADERS[section]
+        return super().headerData(section, orientation, role)
+
+
 class ActionWorker(QObject):
     done = Signal()
 
@@ -764,6 +937,10 @@ class MainWindow(QMainWindow):
         self._engine_rollback_usage_task_id: str | None = None
         self._engine_rollback_refresh_generation = 0
         self._engine_rollback_usage_pending = False
+        self._account_audit_report: AccountAuditReport | None = None
+        self._account_audit_decisions: dict[int, Disposition] = {}
+        self._account_audit_task_id: str | None = None
+        self._account_audit_refresh_after_apply = False
         self._queue_start_waiting_for_log_stats = False
         self._log_stats_auto_enabled = self._read_log_stats_auto_enabled()
         self._collector_stop_task_id: str | None = None
@@ -919,6 +1096,27 @@ class MainWindow(QMainWindow):
             )
         if hasattr(self, "engine_rollback_table"):
             self._update_engine_rollback_buttons()
+        if hasattr(self, "account_audit_refresh_button"):
+            audit_ready = state is StartupState.READY
+            scan_active = any(
+                binding.generation_key == "account_audit_scan"
+                for binding in self._background_bindings.values()
+            )
+            apply_active = any(
+                binding.generation_key == "account_audit_apply"
+                for binding in self._background_bindings.values()
+            )
+            self.account_audit_refresh_button.setEnabled(
+                audit_ready and not apply_active
+            )
+            self.account_audit_cancel_button.setEnabled(
+                audit_ready and self._account_audit_task_id is not None
+            )
+            decision_ready = audit_ready and not scan_active and not apply_active
+            self.account_audit_apply_button.setEnabled(decision_ready)
+            self.account_audit_clear_button.setEnabled(decision_ready)
+            for button in self.account_audit_decision_buttons:
+                button.setEnabled(decision_ready)
 
     def begin_startup_check(self) -> bool:
         if self.controller.startup_state is StartupState.CLOSING:
@@ -1112,6 +1310,9 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(tabs)
         tabs.addTab(self._overview_tab(), "总览")
         tabs.addTab(self._task_tab(), "账号任务")
+        self.account_audit_page = self._account_audit_tab()
+        tabs.addTab(self.account_audit_page, "账号审计")
+        self.audit_tab_index = tabs.indexOf(self.account_audit_page)
         tabs.addTab(self._batch_tab(), "批次生成")
         tabs.addTab(self._queue_tab(), "下载队列")
         tabs.addTab(self._collector_tab(), "账号采集")
@@ -1317,6 +1518,155 @@ class MainWindow(QMainWindow):
         self.task_output = QTextEdit()
         self.task_output.setReadOnly(True)
         layout.addWidget(self.task_output, 1)
+        return page
+
+    def _account_audit_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        controls = QHBoxLayout()
+        self.account_audit_refresh_button = QPushButton("重新审计")
+        self.account_audit_refresh_button.clicked.connect(
+            self._start_account_audit_scan
+        )
+        controls.addWidget(self.account_audit_refresh_button)
+        controls.addWidget(QLabel("连续错误阈值"))
+        self.account_audit_error_threshold = self._spin(1, 100, 5)
+        controls.addWidget(self.account_audit_error_threshold)
+        controls.addWidget(QLabel("最少证据轮次"))
+        self.account_audit_minimum_runs = self._spin(1, 100, 3)
+        controls.addWidget(self.account_audit_minimum_runs)
+        self.account_audit_native_logs = QCheckBox("含原生日志分析（慢）")
+        self.account_audit_native_logs.setChecked(False)
+        self.account_audit_native_logs.setToolTip(
+            "默认关闭；当前审计仅使用任务汇总，不会自动读取原生日志。"
+        )
+        controls.addWidget(self.account_audit_native_logs)
+        controls.addStretch()
+        self.account_audit_cancel_button = QPushButton("取消当前审计操作")
+        self.account_audit_cancel_button.setEnabled(False)
+        self.account_audit_cancel_button.clicked.connect(
+            self._cancel_account_audit_task
+        )
+        controls.addWidget(self.account_audit_cancel_button)
+        layout.addLayout(controls)
+
+        self.account_audit_notice = QLabel(
+            "这里的建议不会自动生效。永久停用只在你选择并确认应用后才写入主档。"
+        )
+        self.account_audit_notice.setWordWrap(True)
+        self.account_audit_notice.setStyleSheet(
+            "color:#92400e; background:#fffbeb; padding:6px; border:1px solid #fde68a;"
+        )
+        layout.addWidget(self.account_audit_notice)
+        self.account_audit_summary = QLabel("尚未审计。")
+        self.account_audit_summary.setWordWrap(True)
+        layout.addWidget(self.account_audit_summary)
+        self.account_audit_progress = QLabel("")
+        self.account_audit_progress.setWordWrap(True)
+        layout.addWidget(self.account_audit_progress)
+        self.account_audit_warnings = QLabel("")
+        self.account_audit_warnings.setWordWrap(True)
+        self.account_audit_warnings.setStyleSheet("color:#b45309;")
+        layout.addWidget(self.account_audit_warnings)
+
+        filters = QHBoxLayout()
+        filters.addWidget(QLabel("筛选"))
+        self.account_audit_filter = QComboBox()
+        for label, value in (
+            ("全部", "all"),
+            ("建议停用", "suggest_disable"),
+            ("建议恢复", "suggest_reenable"),
+            ("需复核", "review"),
+            ("重复", "duplicate"),
+            ("已停用", "disabled"),
+        ):
+            self.account_audit_filter.addItem(label, value)
+        self.account_audit_filter.currentIndexChanged.connect(
+            self._apply_account_audit_filter
+        )
+        filters.addWidget(self.account_audit_filter)
+        filters.addWidget(QLabel("查找 A 编号"))
+        self.account_audit_search = QLineEdit()
+        self.account_audit_search.setPlaceholderText("例如 A912")
+        self.account_audit_search.textChanged.connect(
+            self._apply_account_audit_filter
+        )
+        filters.addWidget(self.account_audit_search)
+        filters.addStretch()
+        self.account_audit_visible_count = QLabel("显示 0 / 0")
+        filters.addWidget(self.account_audit_visible_count)
+        layout.addLayout(filters)
+
+        self._account_audit_model = AccountAuditTableModel(page)
+        self.account_audit_table = QTableView()
+        self.account_audit_table.setModel(self._account_audit_model)
+        self.account_audit_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.account_audit_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        self.account_audit_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.account_audit_table.setAlternatingRowColors(True)
+        self.account_audit_table.setSortingEnabled(False)
+        header = self.account_audit_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
+        self.account_audit_table.selectionModel().selectionChanged.connect(
+            self._show_account_audit_selection_details
+        )
+        layout.addWidget(self.account_audit_table, 1)
+
+        self.account_audit_details = QTextEdit()
+        self.account_audit_details.setReadOnly(True)
+        self.account_audit_details.setMaximumHeight(105)
+        self.account_audit_details.setPlaceholderText(
+            "选择一行查看建议理由及连续错误轮次。"
+        )
+        layout.addWidget(self.account_audit_details)
+
+        decisions = QHBoxLayout()
+        decisions.addWidget(QLabel("我的决定（对选中行）"))
+        self.account_audit_decision_buttons: list[QPushButton] = []
+        for label, disposition in (
+            ("继续启用", Disposition.ENABLED),
+            ("永久停用", Disposition.PERMANENTLY_DISABLED),
+            ("待复核", Disposition.PENDING_REVIEW),
+        ):
+            button = QPushButton(label)
+            button.clicked.connect(
+                lambda _checked=False, value=disposition: self._set_account_audit_disposition(
+                    value
+                )
+            )
+            self.account_audit_decision_buttons.append(button)
+            decisions.addWidget(button)
+        decisions.addStretch()
+        self.account_audit_pending = QLabel("待应用：停用 0 · 恢复 0 · 待复核 0")
+        decisions.addWidget(self.account_audit_pending)
+        layout.addLayout(decisions)
+
+        actions = QHBoxLayout()
+        self.account_audit_apply_button = QPushButton("预览并应用决定")
+        self.account_audit_apply_button.clicked.connect(
+            self._preview_and_apply_account_audit
+        )
+        actions.addWidget(self.account_audit_apply_button)
+        self.account_audit_clear_button = QPushButton("清空未应用的决定")
+        self.account_audit_clear_button.clicked.connect(
+            self._clear_account_audit_decisions
+        )
+        actions.addWidget(self.account_audit_clear_button)
+        actions.addStretch()
+        layout.addLayout(actions)
+
+        self.account_audit_output = QTextEdit()
+        self.account_audit_output.setReadOnly(True)
+        self.account_audit_output.setMaximumHeight(90)
+        layout.addWidget(self.account_audit_output)
         return page
 
     def _batch_tab(self) -> QWidget:
@@ -3061,6 +3411,290 @@ class MainWindow(QMainWindow):
     def _cancel_background(self, task_id: str) -> bool:
         return self.coordinator.request_cancel(task_id)
 
+    def _start_account_audit_scan(self) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        if self.account_audit_native_logs.isChecked():
+            QMessageBox.information(
+                self,
+                "原生日志分析未启用",
+                "当前账号审计只读取任务汇总；不会自动读取原生日志。请取消勾选后重试。",
+            )
+            return
+        threshold = self.account_audit_error_threshold.value()
+        minimum_runs = self.account_audit_minimum_runs.value()
+        spec = TaskSpec(
+            task_type="account_audit_scan",
+            display_name="扫描账号健康审计",
+            resource_keys=frozenset({"settings", "task_logs"}),
+            deduplicate_key="account_audit_scan",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            refresh_targets=(),
+            dynamic_cancellation=True,
+        )
+        self.account_audit_progress.setText("正在准备账号审计……")
+        task_id = self._submit_coalesced_background(
+            spec,
+            lambda context: self.controller.audit_accounts(
+                error_threshold=threshold,
+                minimum_evidence_runs=minimum_runs,
+                context=context,
+            ),
+            output=self.account_audit_output,
+            buttons=(
+                self.account_audit_apply_button,
+                self.account_audit_clear_button,
+                *self.account_audit_decision_buttons,
+            ),
+            on_success=self._apply_account_audit_report,
+            on_failure=self._account_audit_failed,
+            on_cancelled=lambda _payload: self._account_audit_cancelled(),
+            on_progress=self._account_audit_progressed,
+            on_removed=self._account_audit_task_removed,
+            generation_key="account_audit_scan",
+        )
+        if task_id is not None:
+            self._account_audit_task_id = task_id
+            self.account_audit_cancel_button.setEnabled(True)
+
+    def _account_audit_progressed(self, progress: object) -> None:
+        if self.controller.startup_state is StartupState.CLOSING:
+            return
+        message = str(getattr(progress, "message", progress))
+        current = getattr(progress, "current", None)
+        total = getattr(progress, "total", None)
+        if current is not None and total is not None and f"{current}" not in message:
+            message = f"{message}（{current} / {total}）"
+        self.account_audit_progress.setText(message)
+
+    def _apply_account_audit_report(self, report: AccountAuditReport) -> None:
+        if self.controller.startup_state is StartupState.CLOSING:
+            return
+        self._account_audit_report = report
+        self._account_audit_decisions.clear()
+        self._account_audit_model.set_decisions({})
+        self._account_audit_model.set_report(report)
+        newest = report.newest_run or "无"
+        self.account_audit_summary.setText(
+            f"扫描轮次：{report.runs_scanned}；最近：{newest}；"
+            f"主档：{report.total_accounts} 项；重复组：{report.duplicate_groups}。"
+        )
+        self.account_audit_progress.setText("账号审计完成。")
+        self.account_audit_warnings.setText(
+            "\n".join(f"警告：{warning}" for warning in report.warnings)
+        )
+        self.account_audit_details.clear()
+        self._apply_account_audit_filter()
+        self._update_account_audit_pending()
+
+    def _apply_account_audit_filter(self, _value: object = None) -> None:
+        if not hasattr(self, "_account_audit_model"):
+            return
+        self._account_audit_model.set_filter(
+            str(self.account_audit_filter.currentData()),
+            self.account_audit_search.text(),
+        )
+        self.account_audit_visible_count.setText(
+            f"显示 {self._account_audit_model.visible_count} / "
+            f"{self._account_audit_model.total_count}"
+        )
+
+    def _show_account_audit_selection_details(self, *_args: object) -> None:
+        rows = self.account_audit_table.selectionModel().selectedRows(0)
+        if not rows:
+            self.account_audit_details.clear()
+            return
+        entry = self._account_audit_model.entry_at(rows[0].row())
+        if entry is None:
+            self.account_audit_details.clear()
+            return
+        lines = [
+            f"A{entry.a_number}：{entry.suggestion_reason}",
+            f"当前决定：{_audit_disposition_label(self._account_audit_decisions.get(entry.a_number, entry.disposition))}",
+        ]
+        if entry.evidence.consecutive_error_run_ids:
+            lines.append(
+                "连续 ERROR 轮次："
+                + "、".join(entry.evidence.consecutive_error_run_ids)
+            )
+        self.account_audit_details.setPlainText("\n".join(lines))
+
+    def _selected_account_audit_entries(self) -> tuple[AccountAuditEntry, ...]:
+        entries: dict[int, AccountAuditEntry] = {}
+        for index in self.account_audit_table.selectionModel().selectedRows(0):
+            entry = self._account_audit_model.entry_at(index.row())
+            if entry is not None:
+                entries[entry.a_number] = entry
+        return tuple(entries[number] for number in sorted(entries))
+
+    def _set_account_audit_disposition(self, disposition: Disposition) -> None:
+        entries = self._selected_account_audit_entries()
+        if not entries:
+            self.statusBar().showMessage("请先选择账号审计行")
+            return
+        for entry in entries:
+            if disposition is entry.disposition:
+                self._account_audit_decisions.pop(entry.a_number, None)
+            else:
+                self._account_audit_decisions[entry.a_number] = disposition
+        self._account_audit_model.set_decisions(self._account_audit_decisions)
+        self._apply_account_audit_filter()
+        self._update_account_audit_pending()
+
+    def _update_account_audit_pending(self) -> None:
+        counts = {
+            disposition: sum(
+                value is disposition
+                for value in self._account_audit_decisions.values()
+            )
+            for disposition in Disposition
+        }
+        self.account_audit_pending.setText(
+            "待应用："
+            f"停用 {counts[Disposition.PERMANENTLY_DISABLED]} · "
+            f"恢复 {counts[Disposition.ENABLED]} · "
+            f"待复核 {counts[Disposition.PENDING_REVIEW]}"
+        )
+
+    def _clear_account_audit_decisions(self) -> None:
+        self._account_audit_decisions.clear()
+        self._account_audit_model.set_decisions({})
+        self._apply_account_audit_filter()
+        self._update_account_audit_pending()
+
+    def _account_audit_decision_tuple(self) -> tuple[AuditDecision, ...]:
+        return tuple(
+            AuditDecision(number, disposition)
+            for number, disposition in sorted(self._account_audit_decisions.items())
+        )
+
+    def _preview_and_apply_account_audit(self) -> None:
+        report = self._account_audit_report
+        decisions = self._account_audit_decision_tuple()
+        if report is None:
+            QMessageBox.information(self, "尚未审计", "请先完成一次账号审计。")
+            return
+        if not decisions:
+            QMessageBox.information(self, "没有待应用决定", "请先选择账号并设置决定。")
+            return
+        try:
+            preview = self.controller.account_audit.preview_decisions(report, decisions)
+        except Exception as exc:
+            QMessageBox.critical(self, "无法预览账号审计决定", str(exc))
+            return
+        enabled_before = sum(entry.master_enable for entry in report.entries)
+        warnings = "\n".join(report.warnings)
+        text = (
+            f"将永久停用 {len(preview.to_disable)} 个账号："
+            f"{compact_numbers(preview.to_disable) or '无'}\n"
+            f"将恢复启用 {len(preview.to_enable)} 个账号："
+            f"{compact_numbers(preview.to_enable) or '无'}\n"
+            f"标记待复核 {len(preview.to_pending)} 个账号："
+            f"{compact_numbers(preview.to_pending) or '无'}（不改主档）\n\n"
+            f"应用后启用账号数：{enabled_before} → {preview.enabled_after}\n\n"
+            f"主档数组长度保持 {preview.array_length_after} 项不变。\n"
+            "所有 A 编号保持不变。被停用的条目留在原位，不会被删除。\n\n"
+            "管理器会先做完整备份。"
+        )
+        if warnings:
+            text += f"\n\n{warnings}"
+        text += "\n\n确认写入？"
+        answer = QMessageBox.question(
+            self,
+            "确认写入账号主档",
+            text,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer is not QMessageBox.StandardButton.Yes:
+            return
+        spec = TaskSpec(
+            task_type="account_audit_apply",
+            display_name="应用账号审计决定",
+            resource_keys=frozenset({"settings", "volume", "collector_process"}),
+            deduplicate_key="account_audit_apply",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            refresh_targets=(),
+            dynamic_cancellation=True,
+        )
+        self._account_audit_refresh_after_apply = False
+        task_id = self._submit_background(
+            spec,
+            lambda context: self.controller.apply_audit_decisions(
+                report, decisions, context=context
+            ),
+            output=self.account_audit_output,
+            buttons=(
+                self.account_audit_refresh_button,
+                self.account_audit_apply_button,
+                self.account_audit_clear_button,
+                *self.account_audit_decision_buttons,
+            ),
+            on_success=self._account_audit_applied,
+            on_failure=self._account_audit_failed,
+            on_cancelled=lambda _payload: self._account_audit_cancelled(),
+            on_progress=self._account_audit_progressed,
+            on_removed=self._account_audit_apply_removed,
+            generation_key="account_audit_apply",
+        )
+        if task_id is not None:
+            self._account_audit_task_id = task_id
+            self.account_audit_cancel_button.setEnabled(True)
+
+    def _account_audit_applied(self, result: AuditApplyResult) -> None:
+        if self.controller.startup_state is StartupState.CLOSING:
+            return
+        self._account_audit_refresh_after_apply = True
+        self.account_audit_progress.setText("账号审计决定已安全应用。")
+        self._replace_info(
+            self.account_audit_output,
+            f"完整备份：{result.backup_path}",
+            "主档数组长度与 A 编号保持不变。",
+        )
+
+    def _account_audit_failed(self, payload: object) -> None:
+        if self.controller.startup_state is StartupState.CLOSING:
+            return
+        message = payload.message if isinstance(payload, TaskFailure) else str(payload)
+        self.account_audit_progress.setText("账号审计操作失败。")
+        self._append_info(self.account_audit_output, f"【失败】{message}")
+
+    def _account_audit_cancelled(self) -> None:
+        if self.controller.startup_state is StartupState.CLOSING:
+            return
+        self.account_audit_progress.setText("账号审计操作已取消；未应用迟到结果。")
+
+    def _account_audit_task_removed(self) -> None:
+        active = next(
+            (
+                task_id
+                for task_id, binding in self._background_bindings.items()
+                if binding.generation_key == "account_audit_scan"
+            ),
+            None,
+        )
+        self._account_audit_task_id = active
+        self.account_audit_cancel_button.setEnabled(active is not None)
+
+    def _account_audit_apply_removed(self) -> None:
+        self._account_audit_task_id = None
+        self.account_audit_cancel_button.setEnabled(False)
+        if (
+            self._account_audit_refresh_after_apply
+            and self.controller.startup_state is StartupState.READY
+        ):
+            self._account_audit_refresh_after_apply = False
+            self._start_account_audit_scan()
+
+    def _cancel_account_audit_task(self) -> None:
+        task_id = self._account_audit_task_id
+        if task_id is None:
+            return
+        if self._cancel_background(task_id):
+            self.account_audit_progress.setText("正在取消账号审计操作……")
+
     def _refresh_background_targets(self, targets: tuple[str, ...]) -> None:
         if "task_list" in targets:
             self.refresh_tasks()
@@ -3892,6 +4526,13 @@ class MainWindow(QMainWindow):
                 f"已将模板 {paths[0].name} 复制为正式 settings.json。",
                 "任务模板仍永久保留，以后可以再次勾选复用。",
             )
+            if isinstance(result, ActivatedTask) and result.vetoed_numbers:
+                self._append_info(
+                    self.queue_output,
+                    "主档永久停用已否决 "
+                    f"{len(result.vetoed_numbers)} 个账号："
+                    f"{compact_numbers(result.vetoed_numbers)}。",
+                )
 
     def _apply_queue_options(self) -> bool:
         values = {
@@ -6006,14 +6647,28 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         if self.coordinator.has_active_tasks():
+            startup_ending = (
+                getattr(self.controller, "startup_state", None)
+                is StartupState.SAFETY_CHECKING
+                or any(
+                    binding.spec.task_type == "startup_safety"
+                    for binding in getattr(
+                        self, "_background_bindings", {}
+                    ).values()
+                )
+            )
             self._close_pending = True
             self.coordinator.begin_closing()
             self.controller.begin_closing()
             self._apply_action_gate()
             QMessageBox.information(
                 self,
-                "启动安全检查正在结束",
-                "已请求取消启动安全检查；后台线程安全退出后管理器将自动关闭。",
+                "启动安全检查正在结束" if startup_ending else "后台任务正在结束",
+                (
+                    "已请求取消启动安全检查；后台线程安全退出后管理器将自动关闭。"
+                    if startup_ending
+                    else "已请求取消可取消的后台任务；后台线程安全退出后管理器将自动关闭。"
+                ),
             )
 
             event.ignore()
