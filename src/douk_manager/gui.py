@@ -3621,7 +3621,7 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
-        if answer is not QMessageBox.StandardButton.Yes:
+        if answer != QMessageBox.StandardButton.Yes:
             return
         spec = TaskSpec(
             task_type="account_audit_apply",

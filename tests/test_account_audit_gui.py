@@ -429,7 +429,9 @@ class AccountAuditGuiTests(unittest.TestCase):
             finally:
                 self._dispose(window, home_patch)
 
-    def test_preview_cancel_never_submits_and_confirm_reuses_controller_apply(self) -> None:
+    def test_preview_cancel_never_submits_and_integer_confirm_reuses_controller_apply(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             window, home_patch = self._window(Path(directory))
             try:
@@ -469,11 +471,12 @@ class AccountAuditGuiTests(unittest.TestCase):
                 with patch.object(
                     QMessageBox,
                     "question",
-                    return_value=QMessageBox.StandardButton.Yes,
+                    return_value=int(QMessageBox.StandardButton.Yes),
                 ), patch.object(
                     window, "_submit_background", return_value="apply-task"
                 ) as submit:
                     window._preview_and_apply_account_audit()
+                submit.assert_called_once()
                 spec, action = submit.call_args.args[:2]
                 self.assertEqual(spec.task_type, "account_audit_apply")
                 self.assertEqual(
