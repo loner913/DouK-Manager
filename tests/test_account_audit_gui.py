@@ -15,6 +15,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QCoreApplication, QEvent, QEventLoop, QThread, QTimer, Qt
 from PySide6.QtWidgets import (
     QApplication,
+    QHeaderView,
     QListWidgetItem,
     QMessageBox,
     QTableView,
@@ -311,6 +312,17 @@ class AccountAuditGuiTests(unittest.TestCase):
                 self.assertEqual(window.tabs.tabText(window.audit_tab_index), "账号审计")
                 self.assertIsInstance(window.account_audit_table, QTableView)
                 self.assertIs(window.account_audit_table.model(), window._account_audit_model)
+                header = window.account_audit_table.horizontalHeader()
+                for column in range(7):
+                    self.assertEqual(
+                        header.sectionResizeMode(column),
+                        QHeaderView.ResizeMode.Interactive,
+                    )
+                self.assertEqual(
+                    header.sectionResizeMode(7),
+                    QHeaderView.ResizeMode.Stretch,
+                )
+                self.assertGreaterEqual(window.account_audit_table.columnWidth(2), 80)
                 self.assertFalse(window.account_audit_native_logs.isChecked())
                 self.assertIn("建议不会自动生效", window.account_audit_notice.text())
                 self.assertLess(len(window.account_audit_page.findChildren(QWidget)), 80)

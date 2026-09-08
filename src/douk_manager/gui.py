@@ -1613,8 +1613,11 @@ class MainWindow(QMainWindow):
         self.account_audit_table.setAlternatingRowColors(True)
         self.account_audit_table.setSortingEnabled(False)
         header = self.account_audit_table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setStretchLastSection(False)
+        for column in range(7):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
+        self.account_audit_table.setColumnWidth(2, 80)
         self.account_audit_table.selectionModel().selectionChanged.connect(
             self._show_account_audit_selection_details
         )
