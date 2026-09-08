@@ -954,6 +954,7 @@ class MainWindow(QMainWindow):
         self._startup_task_id: str | None = None
         self._startup_result: StartupSafetyResult | None = None
         self._close_pending = False
+        self._close_notice_active = False
         self._safe_widgets: list[QWidget] = []
         self._path_widgets: list[QWidget] = []
         self._diagnostic_widgets: list[QWidget] = []
@@ -1282,6 +1283,8 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_background_tasks_idle(self) -> None:
         if not self._close_pending:
+            return
+        if self._close_notice_active:
             return
         if not self.coordinator.is_closing:
             return
@@ -6691,17 +6694,25 @@ class MainWindow(QMainWindow):
             self.coordinator.begin_closing()
             self.controller.begin_closing()
             self._apply_action_gate()
-            QMessageBox.information(
-                self,
-                "启动安全检查正在结束" if startup_ending else "后台任务正在结束",
-                (
-                    "已请求取消启动安全检查；后台线程安全退出后管理器将自动关闭。"
-                    if startup_ending
-                    else "已请求取消可取消的后台任务；后台线程安全退出后管理器将自动关闭。"
-                ),
-            )
+            self._close_notice_active = True
+            try:
+                QMessageBox.information(
+                    self,
+                    "启动安全检查正在结束" if startup_ending else "后台任务正在结束",
+                    (
+                        "已请求取消启动安全检查。请阅读并确认本提示；"
+                        "后台线程安全退出后管理器将关闭。"
+                        if startup_ending
+                        else "已请求取消可取消的后台任务。请阅读并确认本提示；"
+                        "后台线程安全退出后管理器将关闭。"
+                    ),
+                )
+            finally:
+                self._close_notice_active = False
 
             event.ignore()
+            if not self.coordinator.has_active_tasks():
+                self._on_background_tasks_idle()
             return
         begin_closing = getattr(self.controller, "begin_closing", None)
         if callable(begin_closing):
