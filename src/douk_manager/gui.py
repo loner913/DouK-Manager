@@ -780,6 +780,12 @@ class AccountAuditTableModel(QAbstractTableModel):
     ) -> object:
         if role == Qt.ItemDataRole.DisplayRole and orientation == Qt.Orientation.Horizontal:
             return self.HEADERS[section]
+        if (
+            role == Qt.ItemDataRole.TextAlignmentRole
+            and orientation == Qt.Orientation.Horizontal
+            and 0 <= section < 7
+        ):
+            return Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
         return super().headerData(section, orientation, role)
 
 
@@ -1617,7 +1623,7 @@ class MainWindow(QMainWindow):
         for column in range(7):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
-        self.account_audit_table.setColumnWidth(2, 80)
+        self.account_audit_table.setColumnWidth(2, 56)
         self.account_audit_table.selectionModel().selectionChanged.connect(
             self._show_account_audit_selection_details
         )

@@ -322,7 +322,23 @@ class AccountAuditGuiTests(unittest.TestCase):
                     header.sectionResizeMode(7),
                     QHeaderView.ResizeMode.Stretch,
                 )
-                self.assertGreaterEqual(window.account_audit_table.columnWidth(2), 80)
+                for column in range(7):
+                    self.assertEqual(
+                        window._account_audit_model.headerData(
+                            column,
+                            Qt.Orientation.Horizontal,
+                            Qt.ItemDataRole.TextAlignmentRole,
+                        ),
+                        Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                    )
+                self.assertIsNone(
+                    window._account_audit_model.headerData(
+                        7,
+                        Qt.Orientation.Horizontal,
+                        Qt.ItemDataRole.TextAlignmentRole,
+                    )
+                )
+                self.assertEqual(window.account_audit_table.columnWidth(2), 56)
                 self.assertFalse(window.account_audit_native_logs.isChecked())
                 self.assertIn("建议不会自动生效", window.account_audit_notice.text())
                 self.assertLess(len(window.account_audit_page.findChildren(QWidget)), 80)
