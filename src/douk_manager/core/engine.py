@@ -750,9 +750,9 @@ class EngineService:
     ) -> LogStats:
         """Analyse one already-located run without scanning the native-log directory."""
 
+        if self.external_running():
+            raise EngineError("下载引擎运行中或状态无法确认，不能分析原生日志。")
         current = self.current
-        if current is not None and current.running:
-            raise EngineError("下载引擎运行中，不能分析原生日志。")
         if segments is None:
             if current is None or _log_stats_scope(current.task_log) != str(run_id):
                 raise EngineError("没有可分析的已完成下载任务。")

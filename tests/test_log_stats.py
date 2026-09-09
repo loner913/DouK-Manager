@@ -27,6 +27,7 @@ from douk_manager.background import (
     TaskState,
 )
 from douk_manager.config import AppConfig, ManagedPaths
+from douk_manager.controller import ControllerError
 from douk_manager.core.backup import BackupService
 from douk_manager.core.download_summary import (
     AccountStatus,
@@ -35,7 +36,12 @@ from douk_manager.core.download_summary import (
     NativeLogSegment,
     format_summary_for_task_log,
 )
-from douk_manager.core.engine import EngineError, EngineService
+from douk_manager.core.engine import (
+    EngineError,
+    EngineService,
+    ProcessProbe,
+    ProcessProbeState,
+)
 from douk_manager.core.log_stats import (
     ENDPOINTS,
     FIELD_PRESENCE,
@@ -619,7 +625,13 @@ class DashboardSegmentSelectionTests(unittest.TestCase):
 class EngineLogStatsTests(unittest.TestCase):
     def _service(self, root: Path) -> EngineService:
         paths = _paths(root)
-        return EngineService(paths, AppConfig(engine_exe=str(paths.engine_exe)), BackupService(paths))
+        service = EngineService(
+            paths,
+            AppConfig(engine_exe=str(paths.engine_exe)),
+            BackupService(paths),
+        )
+        service.external_running = Mock(return_value=False)
+        return service
 
     def test_analyse_current_run_then_export_without_rereading_native_log(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -680,6 +692,26 @@ class EngineLogStatsTests(unittest.TestCase):
             service.current = SimpleNamespace(task_log=Path("synthetic"), running=True)
             with self.assertRaises(EngineError):
                 service.analyse_run_logs("synthetic")
+
+    def test_external_or_unknown_engine_is_rejected_before_log_access(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = self._service(Path(directory))
+            segment = NativeLogSegment(Path("Z:/FAKE-PATH/missing.log"), 0, 1)
+            del service.external_running
+            for unsafe_state in (
+                ProcessProbeState.RUNNING,
+                ProcessProbeState.UNKNOWN,
+            ):
+                with self.subTest(unsafe_state=unsafe_state), patch.object(
+                    service,
+                    "probe_external_running",
+                    return_value=ProcessProbe(unsafe_state, "synthetic probe"),
+                ) as probe:
+                    with self.assertRaisesRegex(
+                        EngineError, "运行中|状态无法确认"
+                    ):
+                        service.analyse_run_logs("synthetic", segments=(segment,))
+                    probe.assert_called_once_with()
 
     def test_bad_render_is_blocked_before_any_final_or_partial_file_exists(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -795,6 +827,7 @@ class LogStatsGuiTests(unittest.TestCase):
         window = MainWindow(window_state_store=store)
         window.poll_timer.stop()
         window.controller.startup_state = StartupState.READY
+        window.controller.engine.external_running = Mock(return_value=False)
         window._apply_action_gate()
         return window, home_patch
 
@@ -985,6 +1018,109 @@ class LogStatsGuiTests(unittest.TestCase):
                 self.assertEqual(export_spec.resource_keys, frozenset({"diagnostics_dir"}))
                 self.assertIs(analyse_spec.close_policy, ClosePolicy.CANCEL)
                 self.assertIs(export_spec.close_policy, ClosePolicy.CANCEL)
+            finally:
+                self._dispose(window, home_patch)
+
+    def test_controller_rechecks_external_engine_before_log_analysis(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            window, home_patch = self._window(root)
+            native = _segment(root / "native.log", "synthetic\n")
+            try:
+                window.controller.engine.external_running.return_value = True
+                with patch.object(
+                    window.controller.engine, "analyse_run_logs"
+                ) as engine_analysis:
+                    with self.assertRaisesRegex(
+                        ControllerError, "运行中|状态无法确认"
+                    ):
+                        window.controller.analyse_run_logs(
+                            "synthetic", segments=(native,)
+                        )
+                engine_analysis.assert_not_called()
+            finally:
+                self._dispose(window, home_patch)
+
+    def test_external_or_unknown_engine_blocks_both_gui_paths_before_submission(
+        self,
+    ) -> None:
+        for unsafe_state in ("RUNNING", "UNKNOWN"):
+            with self.subTest(
+                unsafe_state=unsafe_state
+            ), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                window, home_patch = self._window(root)
+                native = _segment(root / "native.log", "synthetic\n")
+                try:
+                    window._latest_log_stats_run = SimpleNamespace(
+                        task_log=root / "DownloadTask_current.log",
+                        running=False,
+                        _summary_result=_summary((native,)),
+                    )
+                    window._dashboard_snapshot = SimpleNamespace(
+                        task_log=root / "DownloadTask_history.log",
+                        native_log_segments=(
+                            DashboardNativeLogSegment(
+                                native.path, native.offset, native.length
+                            ),
+                        ),
+                    )
+                    window.controller.engine.external_running.return_value = True
+                    window.controller._last_engine_running = True
+                    window._update_log_stats_current_availability()
+                    window._update_log_stats_history_availability()
+                    self.assertFalse(window.log_stats_current_button.isEnabled())
+                    self.assertFalse(window.log_stats_history_button.isEnabled())
+                    with patch.object(window, "_submit_background") as submit:
+                        window._start_current_log_stats()
+                        window._start_historical_log_stats()
+                    submit.assert_not_called()
+                    self.assertRegex(
+                        window.log_stats_output.toPlainText(),
+                        "运行中|状态无法确认",
+                    )
+                finally:
+                    self._dispose(window, home_patch)
+
+    def test_current_and_history_actions_use_controller_log_analysis_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            window, home_patch = self._window(root)
+            native = _segment(root / "native.log", "synthetic\n")
+            captured = []
+            try:
+                window._latest_log_stats_run = SimpleNamespace(
+                    task_log=root / "DownloadTask_current.log",
+                    running=False,
+                    _summary_result=_summary((native,)),
+                )
+                window._dashboard_snapshot = SimpleNamespace(
+                    task_log=root / "DownloadTask_history.log",
+                    native_log_segments=(
+                        DashboardNativeLogSegment(
+                            native.path, native.offset, native.length
+                        ),
+                    ),
+                )
+
+                def capture(spec, action, **kwargs):
+                    captured.append(action)
+                    return None
+
+                with patch.object(
+                    window.controller,
+                    "analyse_run_logs",
+                    create=True,
+                    return_value=analyse_segments((native,)),
+                ) as controller_analysis, patch.object(
+                    window, "_submit_background", side_effect=capture
+                ):
+                    window._start_current_log_stats()
+                    window._start_historical_log_stats()
+                    self.assertEqual(len(captured), 2)
+                    for action in captured:
+                        action(None)
+                self.assertEqual(controller_analysis.call_count, 2)
             finally:
                 self._dispose(window, home_patch)
 

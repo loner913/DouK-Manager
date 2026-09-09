@@ -528,6 +528,34 @@ class ManagerController:
             context=context,
         )
 
+    def require_log_analysis_ready(
+        self,
+        *,
+        context: OperationContext | None = None,
+    ) -> None:
+        self._require_operational_ready_with_context(
+            "分析引擎原生日志",
+            context=context,
+        )
+        if self.engine.external_running():
+            raise ControllerError("下载引擎运行中或状态无法确认，不能分析原生日志。")
+
+    def analyse_run_logs(
+        self,
+        run_id: str,
+        *,
+        context: OperationContext | None = None,
+        segments=None,
+        located_reason: str = "",
+    ) -> Any:
+        self.require_log_analysis_ready(context=context)
+        return self.engine.analyse_run_logs(
+            run_id,
+            context=context,
+            segments=segments,
+            located_reason=located_reason,
+        )
+
     def generate_batches(
         self, start: int, end: int, size: int, rule: EarliestRule
     ) -> tuple[GeneratedTask, ...]:

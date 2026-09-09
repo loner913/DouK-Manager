@@ -55,7 +55,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from douk_manager.controller import ManagerController
+from douk_manager.controller import ControllerError, ManagerController
 from douk_manager.background import (
     BackgroundTaskCoordinator,
     ClosePolicy,
@@ -2892,6 +2892,7 @@ class MainWindow(QMainWindow):
         self.log_stats_history_reason.setText(messages[status])
         self.log_stats_history_button.setEnabled(
             self.controller.startup_state is StartupState.READY
+            and not self.controller._last_engine_running
             and status in {SegmentSelectionStatus.READY, SegmentSelectionStatus.PARTIAL}
         )
 
@@ -2901,6 +2902,7 @@ class MainWindow(QMainWindow):
         run = getattr(self, "_latest_log_stats_run", None)
         self.log_stats_current_button.setEnabled(
             self.controller.startup_state is StartupState.READY
+            and not self.controller._last_engine_running
             and run is not None
             and not getattr(run, "running", False)
             and getattr(run, "_summary_result", None) is not None
@@ -2921,7 +2923,7 @@ class MainWindow(QMainWindow):
         scope = MainWindow._canonical_task_log(run.task_log)
         self._submit_log_stats_analysis(
             scope,
-            lambda context: self.controller.engine.analyse_run_logs(
+            lambda context: self.controller.analyse_run_logs(
                 scope,
                 context=context,
                 segments=summary.located.segments,
@@ -2951,7 +2953,7 @@ class MainWindow(QMainWindow):
         )
         self._submit_log_stats_analysis(
             scope,
-            lambda context: self.controller.engine.analyse_run_logs(
+            lambda context: self.controller.analyse_run_logs(
                 scope,
                 context=context,
                 segments=segments,
@@ -2972,6 +2974,11 @@ class MainWindow(QMainWindow):
         located_reason: str = "",
     ) -> None:
         if self.controller.startup_state is not StartupState.READY:
+            return
+        try:
+            self.controller.require_log_analysis_ready()
+        except ControllerError as exc:
+            self.log_stats_output.setPlainText(str(exc))
             return
         current = getattr(self.controller.engine, "current", None)
         if current is not None and getattr(current, "running", False):
