@@ -17,8 +17,9 @@
 ## 版本历史
 
 仓库使用 `v0.1.0` 表示首个正式稳定版；后续 `v0.1.1` 至 `v0.1.5` 在
-`develop` 上持续验收。v0.1.5 的最终身份来自永久冻结的稳定化历史，本阶段不移动或覆盖既有
-`v0.1.0` Tag/Release，也不另建 v0.1.5 Tag 或 GitHub Release。
+`develop` 上持续验收。当前 `v0.1.6` 已完成阶段 D，正在
+`feature/v0.1.6-final` 进行版本元数据和构建流程准备，尚未创建 Tag 或 GitHub Release。
+既有 `v0.1.0` Tag/Release 和 v0.1.5 历史保持不变。
 
 | 版本 | 定位 | 主要新增与修复 |
 | --- | --- | --- |
@@ -28,6 +29,7 @@
 | [v0.1.3](RELEASE-NOTES-v0.1.3.md) | 下载结果汇总 | 区分进程退出与账号结果，汇总下载、跳过、无作品、私密、异常、中断和未开始状态并追加到任务日志 |
 | [v0.1.4](RELEASE-NOTES-v0.1.4.md) | 队列控制、监听与结果追溯 | 模板批量选择/删除、暂停与取消队列、后台剪贴板监听、下载结果页、私密账号智能跳过、动态结果查看、完成后安全关机和全局运行状态 |
 | [v0.1.5](RELEASE-NOTES-v0.1.5.md) | 后台安全、结果看板与稳定化 | 三阶段后台生命周期与只读结果看板；大账号智能跳过预览可滚动；主窗口安全记忆尺寸、位置和最大化状态 |
+| [v0.1.6](RELEASE-NOTES-v0.1.6.md) | 账号、日志与引擎安全 | mark 归类修复、日志安全统计与脱敏、下载引擎回退、账号健康审计与生命周期管理 |
 
 完整的逐版本新增、修复、安全边界和升级说明见 [CHANGELOG.md](CHANGELOG.md)。
 
@@ -46,6 +48,18 @@ DouK-Manager 当前只配套下载引擎已经验收并冻结的两个定制提�
 下载引擎提速研发在第二阶段批量 Info 完成后正式结束。第三、第四阶段及随机等待均值配置
 不属于当前产品或候选包；阶段细节和验收边界见
 [引擎提速阶段收尾记录](https://github.com/loner913/TikTokDownloader/blob/docs/performance-stage-closeout/docs/performance-stages.md)。
+
+## v0.1.6 账号、日志与引擎安全
+
+v0.1.6 在已验收的 v0.1.5 基础上整合四项功能：
+
+- 35 项 `mark` 归类修复，保留原始值并拒绝歧义别名；
+- 下载引擎回退的安全预检、备份点和失败恢复；
+- 日志安全统计、全量脱敏和诊断导出边界；
+- 账号健康审计、重复/冲突复核、永久停用和生命周期管理。
+
+阶段 D 的最终候选已完成 Windows 前台人工验收。完整回归记录为 608 项测试，606 项通过、2 项条件跳过、0 失败、0 错误。
+当前仅进行版本元数据与构建流程准备，不代表已经推送或发布。
 
 ## v0.1.5 后台安全、结果看板与稳定化
 
@@ -193,17 +207,15 @@ python -m unittest discover -s tests -v
 
 ## Windows 便携版构建
 
-仓库包含 `.github/workflows/build-windows.yml`。推送 `develop` 后会自动运行 `Develop CI`：
+仓库包含 `.github/workflows/build-windows.yml`。V0.1.6 发布准备分支为
+`feature/v0.1.6-final`。该分支推送后，在仓库 `Actions` 中手动选择同一工作流和该分支运行：
 
 1. `Test` 作业先在 Windows + Python 3.12 上运行全量 unittest；
 2. 测试通过后运行 `Windows portable package`；
-3. 打开仓库 `Actions` 中对应的 `Develop CI` run；
-4. 下载 `DouK-Manager_Windows_X64-v0.1.5-develop-run-<run>-<sha>` Artifact；
-5. 解压到 `F:\DouK-Manager`；
-6. 双击 `DouKManager.exe`。
+3. 下载同时包含 ZIP 和 SHA-256 校验文件的 Artifact；
+4. 核验 ZIP 后解压到隔离目录，再双击 `DouKManager.exe`。
 
-也可以从 Actions 手动触发同一工作流；Artifact 名称会记录版本、分支、run number 和提交短 SHA。
-
+Artifact 名称格式为 `DouK-Manager_Windows_X64-v0.1.6-<ref>-run-<run>-<sha>`。
 编译产物、运行数据和正式账号资料都不会写入源码仓库。
 
 ## v0.1.0 稳定版

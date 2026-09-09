@@ -87,7 +87,7 @@ jobs:
         run: |
           $text = @(
             "DouK 全流程一体化管理器"
-            "Version: 0.1.5"
+            "Version: 0.1.6"
             "Commit: ${{ steps.identity.outputs.sha }}"
             "Built: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss K')"
           )
@@ -97,10 +97,18 @@ jobs:
         shell: pwsh
         run: Compress-Archive -Path "dist\DouK-Manager\*" -DestinationPath "DouK-Manager_Windows_X64.zip" -Force
 
+      - name: 生成 SHA-256 校验文件
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath "DouK-Manager_Windows_X64.zip").Hash.ToLowerInvariant()
+          "$hash  DouK-Manager_Windows_X64.zip" | Set-Content -LiteralPath "DouK-Manager_Windows_X64.zip.sha256" -Encoding ascii
+
       - name: 上传构建结果
         uses: actions/upload-artifact@v7
         with:
-          name: DouK-Manager_Windows_X64-v0.1.5-${{ steps.identity.outputs.ref }}-run-${{ github.run_number }}-${{ steps.identity.outputs.sha }}
-          path: DouK-Manager_Windows_X64.zip
+          name: DouK-Manager_Windows_X64-v0.1.6-${{ steps.identity.outputs.ref }}-run-${{ github.run_number }}-${{ steps.identity.outputs.sha }}
+          path: |
+            DouK-Manager_Windows_X64.zip
+            DouK-Manager_Windows_X64.zip.sha256
           if-no-files-found: error
           retention-days: 30
