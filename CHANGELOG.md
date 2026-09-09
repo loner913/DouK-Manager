@@ -4,7 +4,7 @@
 
 ## v0.1.6 — 账号、日志与引擎安全（2026-09-09）
 
-状态：阶段 D 最终候选已完成验收；当前在 `feature/v0.1.6-final` 进行 E-0 版本元数据与构建流程准备，尚未 push、创建 Tag 或发布 Release。
+状态：阶段 D 验收完成；E-0 已在 `feature/v0.1.6-final` 完成。实际发布状态以仓库的 `v0.1.6` Tag 和 GitHub Release 为准。
 
 ### 功能范围
 
@@ -17,7 +17,7 @@
 
 - 阶段 D：D-0 至 D-25 最终候选记录为 PASS；
 - 完整回归：608 total / 606 passed / 2 skipped / 0 failed / 0 errors；
-- 构建工作流将写入 `Version: 0.1.6`，生成带 `v0.1.6` 的 Artifact，并同时提供 ZIP 与 SHA-256 校验文件；
+- 构建工作流写入 `Version: 0.1.6`，生成带 `v0.1.6` 的 Artifact，并同时提供 ZIP 与 SHA-256 校验文件；
 - 既有 v0.1.5 历史记录、Tag、Release 和功能提交不改写。
 
 详细说明：[RELEASE-NOTES-v0.1.6.md](RELEASE-NOTES-v0.1.6.md)

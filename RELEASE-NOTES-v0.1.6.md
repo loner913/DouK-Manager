@@ -3,8 +3,8 @@
 ## 版本定位
 
 v0.1.6 在已验收的 v0.1.5 基础上整合 mark 归类、日志安全统计、下载引擎回退和账号健康审计四项功能。
-阶段 D 最终候选已完成 Windows 前台人工验收；本文记录的是 E-0 发布准备，不代表已经创建 Tag、GitHub Release
-或完成远程推送。
+阶段 D 最终候选已完成 Windows 前台人工验收；本文记录发布候选内容。
+实际发布身份以 `v0.1.6` Tag 和 GitHub Release 指向的提交为准。
 
 最终发布准备分支：`feature/v0.1.6-final`
 
@@ -59,9 +59,9 @@ v0.1.6 在已验收的 v0.1.5 基础上整合 mark 归类、日志安全统计�
 ## 构建流程
 
 `.github/workflows/build-windows.yml` 保留现有 `actions/*@v7`，使用 Windows runner 和 Python 3.12，先运行全量
-unittest，再执行 Windows 便携版打包。V0.1.6 远程推送和 Actions 运行需要后续单独授权；本阶段不执行构建。
+unittest，再执行 Windows 便携版打包。远程推送、Actions 构建、Tag 和 Release 是独立人工发布步骤。
 
-workflow 不自动 push、自动创建 Tag 或自动发布 Release。
+workflow 本身不自动 push、创建 Tag 或发布 Release。
 
 ## 安全边界与升级
 
