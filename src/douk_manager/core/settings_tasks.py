@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -375,25 +376,56 @@ class SettingsTaskService:
         *,
         task_earliest: EarliestRule | None = None,
     ) -> tuple[GeneratedTask, ...]:
-        master = self.load_master()
-        total = len(self._accounts(master, "settings_master.json"))
-        if end > total:
-            raise SettingsTaskError(f"结束编号 A{end} 超过当前最大编号 A{total}。")
-        generated: list[GeneratedTask] = []
-        for ordinal, (batch_start, batch_end) in enumerate(
-            split_batches(start, end, batch_size), start=1
-        ):
-            expression = f"A{batch_start}-A{batch_end}"
-            name = f"Batch_{ordinal:03d}_A{batch_start}-A{batch_end}"
-            generated.append(
-                self.create_task(
-                    expression,
-                    task_earliest=task_earliest or EarliestRule.keep(),
-                    task_name=name,
-                    activate=False,
-                )
+        task_earliest = task_earliest or EarliestRule.keep()
+        with critical_section(self.paths.lock_file):
+            master = self.load_master()
+            accounts = self._accounts(master, "settings_master.json")
+            total = len(accounts)
+            if end > total:
+                raise SettingsTaskError(f"结束编号 A{end} 超过当前最大编号 A{total}。")
+
+            batches = tuple(split_batches(start, end, batch_size))
+            # Validate every document before writing, but retain only lightweight plans.
+            prepared: list[tuple[Selection, SelectionPreview, str]] = []
+            for ordinal, (batch_start, batch_end) in enumerate(batches, start=1):
+                expression = f"A{batch_start}-A{batch_end}"
+                requested = parse_selection(expression, total)
+                selection = self._master_enabled_selection(accounts, requested)
+                if not selection.numbers:
+                    raise SettingsTaskError(
+                        f"批次 A{batch_start}-A{batch_end} 内账号均被主档永久停用；"
+                        "未生成任何批次任务。"
+                    )
+                preview = self._preview_selection(accounts, selection)
+                task = self.build_task_document(master, selection, task_earliest)
+                try:
+                    json.dumps(task, ensure_ascii=False, indent=2)
+                except (TypeError, ValueError) as exc:
+                    raise SettingsTaskError(
+                        f"批次 A{batch_start}-A{batch_end} 无法生成有效 JSON。"
+                    ) from exc
+                name = f"Batch_{ordinal:03d}_A{batch_start}-A{batch_end}"
+                prepared.append((selection, preview, _safe_task_name(name)))
+
+            planned = tuple(
+                GeneratedTask(_unique_task_path(self.paths.tasks, name), preview)
+                for _, preview, name in prepared
             )
-        return tuple(generated)
+            attempted_paths: list[Path] = []
+            try:
+                for (selection, _, _), generated in zip(prepared, planned):
+                    task = self.build_task_document(master, selection, task_earliest)
+                    attempted_paths.append(generated.task_path)
+                    write_json_atomic(generated.task_path, task)
+            except Exception as exc:
+                residual = _remove_new_task_paths(attempted_paths)
+                if residual:
+                    raise SettingsTaskError(
+                        "批次任务生成失败，且回滚后仍残留本次新建模板："
+                        + "、".join(residual)
+                    ) from exc
+                raise
+            return planned
 
 
 def _safe_task_name(name: str) -> str:
@@ -428,3 +460,14 @@ def _unique_task_path(directory: Path, stem: str) -> Path:
         candidate = directory / f"{stem}_{suffix}.json"
         suffix += 1
     return candidate
+
+
+def _remove_new_task_paths(paths: list[Path]) -> tuple[str, ...]:
+    residual: list[str] = []
+    for path in reversed(paths):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            residual.append(path.name)
+    residual.reverse()
+    return tuple(residual)

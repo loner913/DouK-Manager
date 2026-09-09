@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from douk_manager.core.backup import BackupService
 from douk_manager.core.json_store import read_json, write_json_atomic
@@ -53,13 +54,100 @@ class SettingsTaskTests(unittest.TestCase):
             for account in master["accounts_urls"]:
                 account["enable"] = True
             write_json_atomic(paths.master_settings, master)
-            result = service.generate_batches(1, 501, 250)
+            with patch.object(service, "load_master", wraps=service.load_master) as load:
+                result = service.generate_batches(1, 501, 250)
+            load.assert_called_once_with()
             self.assertEqual(len(result), 3)
             self.assertEqual(result[0].preview.compact, "A1-A250")
             self.assertEqual(result[2].preview.compact, "A501")
             third = read_json(result[2].task_path)
             self.assertTrue(third["accounts_urls"][500]["enable"])
             self.assertFalse(third["accounts_urls"][499]["enable"])
+
+    def test_batch_preflight_rejects_later_all_tombstone_batch_without_writes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_test_paths(Path(directory), 4)
+            service = SettingsTaskService(paths, BackupService(paths))
+            master = read_json(paths.master_settings)
+            for number, account in enumerate(master["accounts_urls"], start=1):
+                account["enable"] = number <= 2
+            write_json_atomic(paths.master_settings, master)
+            before = tuple(paths.tasks.iterdir())
+
+            with self.assertRaisesRegex(
+                SettingsTaskError, "批次 A3-A4.*未生成任何批次任务"
+            ):
+                service.generate_batches(1, 4, 2)
+
+            self.assertEqual(tuple(paths.tasks.iterdir()), before)
+
+    def test_batch_write_failure_removes_every_template_from_this_operation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_test_paths(Path(directory), 4)
+            service = SettingsTaskService(paths, BackupService(paths))
+            preserved = paths.tasks / "Batch_001_A1-A2.json"
+            write_json_atomic(preserved, {"synthetic": "preserve"})
+            before = {
+                path.name: path.read_bytes()
+                for path in paths.tasks.iterdir()
+                if path.is_file()
+            }
+            real_write = write_json_atomic
+            write_count = 0
+
+            def fail_after_second_write(path, value):
+                nonlocal write_count
+                write_count += 1
+                real_write(path, value)
+                if write_count == 2:
+                    raise OSError("synthetic second batch write failure")
+
+            with patch(
+                "douk_manager.core.settings_tasks.write_json_atomic",
+                side_effect=fail_after_second_write,
+            ):
+                with self.assertRaisesRegex(
+                    OSError, "synthetic second batch write failure"
+                ):
+                    service.generate_batches(1, 4, 2)
+
+            after = {
+                path.name: path.read_bytes()
+                for path in paths.tasks.iterdir()
+                if path.is_file()
+            }
+            self.assertEqual(write_count, 2)
+            self.assertEqual(after, before)
+
+    def test_batch_rollback_failure_reports_residual_template(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_test_paths(Path(directory), 4)
+            service = SettingsTaskService(paths, BackupService(paths))
+            real_write = write_json_atomic
+            real_unlink = Path.unlink
+
+            def fail_after_write(path, value):
+                real_write(path, value)
+                raise OSError("synthetic write failure after replace")
+
+            def reject_batch_cleanup(path, *args, **kwargs):
+                if path.name.startswith("Batch_"):
+                    raise OSError("synthetic cleanup failure")
+                return real_unlink(path, *args, **kwargs)
+
+            with patch(
+                "douk_manager.core.settings_tasks.write_json_atomic",
+                side_effect=fail_after_write,
+            ), patch.object(Path, "unlink", new=reject_batch_cleanup):
+                with self.assertRaisesRegex(
+                    SettingsTaskError,
+                    "回滚后仍残留本次新建模板：Batch_001_A1-A2.json",
+                ):
+                    service.generate_batches(1, 4, 2)
 
     def test_same_task_name_never_overwrites_old_template(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
