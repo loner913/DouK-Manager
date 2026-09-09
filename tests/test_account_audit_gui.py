@@ -180,6 +180,31 @@ class AccountAuditControllerIntegrationTests(unittest.TestCase):
         with self.assertRaisesRegex(ControllerError, "关闭"):
             controller.audit_accounts(context=context)
 
+    def test_native_log_audit_rechecks_engine_guard_but_summary_only_does_not(
+        self,
+    ) -> None:
+        controller = self._controller()
+        report = _report()
+        controller.account_audit.build_current_report.return_value = report
+        controller.engine.external_running.return_value = True
+
+        with patch.object(
+            controller,
+            "require_log_analysis_ready",
+            wraps=controller.require_log_analysis_ready,
+        ) as ready:
+            self.assertIs(controller.audit_accounts(native_log_analysis=False), report)
+            ready.assert_not_called()
+            controller.engine.external_running.assert_not_called()
+            controller.account_audit.build_current_report.reset_mock()
+
+            with self.assertRaisesRegex(ControllerError, "运行中|状态无法确认"):
+                controller.audit_accounts(native_log_analysis=True)
+
+        ready.assert_called_once_with(context=None)
+        controller.engine.external_running.assert_called_once_with()
+        controller.account_audit.build_current_report.assert_not_called()
+
     def test_evidence_since_config_defaults_empty_and_round_trips(self) -> None:
         self.assertEqual(AppConfig().evidence_since, "")
         with tempfile.TemporaryDirectory() as directory:
@@ -225,7 +250,10 @@ class AccountAuditScanIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             paths = make_test_paths(Path(directory), 1392)
             master = read_json(paths.master_settings)
-            master["accounts_urls"][1]["url"] = master["accounts_urls"][0]["url"]
+            duplicate_identity = "D" * 55
+            duplicate_url = f"https://www.douyin.com/user/{duplicate_identity}"
+            master["accounts_urls"][0]["url"] = duplicate_url
+            master["accounts_urls"][1]["url"] = duplicate_url
             write_json_atomic(paths.master_settings, master)
             history = ResultHistoryService(paths.download_task_logs)
             base = datetime(2026, 7, 1, 12, 0, 0)
@@ -453,10 +481,13 @@ class AccountAuditGuiTests(unittest.TestCase):
                 window.account_audit_native_logs.setChecked(True)
                 with patch.object(
                     window, "_submit_coalesced_background", return_value="audit-task"
-                ) as submit, patch.object(QMessageBox, "information") as information:
+                ) as submit, patch.object(
+                    window.controller, "require_log_analysis_ready"
+                ) as ready, patch.object(QMessageBox, "information") as information:
                     window._start_account_audit_scan()
 
                 information.assert_not_called()
+                ready.assert_called_once_with()
                 action = submit.call_args.args[1]
                 context = OperationContext()
                 self.assertIs(action(context), report)
@@ -466,6 +497,40 @@ class AccountAuditGuiTests(unittest.TestCase):
                     native_log_analysis=True,
                     context=context,
                 )
+            finally:
+                self._dispose(window, home_patch)
+
+    def test_native_log_guard_blocks_submission_without_affecting_summary_scan(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window, home_patch = self._window(Path(directory))
+            try:
+                window.account_audit_native_logs.setChecked(True)
+                with patch.object(
+                    window.controller,
+                    "require_log_analysis_ready",
+                    side_effect=ControllerError(
+                        "下载引擎运行中或状态无法确认，不能分析原生日志。"
+                    ),
+                ) as ready, patch.object(
+                    window, "_submit_coalesced_background", return_value="audit-task"
+                ) as submit:
+                    window._start_account_audit_scan()
+                    submit.assert_not_called()
+                    self.assertEqual(
+                        window.account_audit_progress.text(), "账号审计未启动。"
+                    )
+                    self.assertRegex(
+                        window.account_audit_output.toPlainText(),
+                        "运行中|状态无法确认",
+                    )
+
+                    window.account_audit_native_logs.setChecked(False)
+                    window._start_account_audit_scan()
+
+                ready.assert_called_once_with()
+                submit.assert_called_once()
             finally:
                 self._dispose(window, home_patch)
 

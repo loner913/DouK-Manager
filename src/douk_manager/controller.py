@@ -598,6 +598,8 @@ class ManagerController:
         self._require_operational_ready_with_context(
             "扫描账号健康审计", context=context
         )
+        if native_log_analysis:
+            self.require_log_analysis_ready(context=context)
         evidence_since = self._account_audit_evidence_since()
         return self.account_audit.build_current_report(
             evidence_since=evidence_since,

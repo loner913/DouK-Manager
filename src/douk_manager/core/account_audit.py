@@ -21,6 +21,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, AbstractSet, Iterable, Mapping
 
 from douk_manager.config import ManagedPaths
+from douk_manager.core.account_identity import profile_identity_token
 from douk_manager.core.backup import BackupService, sha256_file
 from douk_manager.core.download_summary import (
     AccountStatus,
@@ -256,6 +257,7 @@ class AccountAuditService:
             context=context,
         )
         rows_by_number = snapshot.rows_by_number
+        identity_observation_tuple = tuple(identity_observations)
         native_runs_scanned = 0
         native_segments_scanned = 0
         native_unusable_runs = 0
@@ -271,6 +273,7 @@ class AccountAuditService:
                 native_runs_scanned,
                 native_segments_scanned,
                 native_unusable_runs,
+                native_identity_observations,
             ) = _merge_native_log_history(
                 eligible_runs,
                 rows_by_number,
@@ -278,10 +281,11 @@ class AccountAuditService:
                 native_root=native_root,
                 context=context,
             )
+            identity_observation_tuple += native_identity_observations
         entries = build_audit_entries(
             master_enable_by_number,
             rows_by_number,
-            identity_observations=identity_observations,
+            identity_observations=identity_observation_tuple,
             explicitly_unavailable=explicitly_unavailable,
             error_threshold=error_threshold,
             minimum_evidence_runs=minimum_evidence_runs,
@@ -566,8 +570,15 @@ def _merge_native_log_history(
     *,
     native_root: Path | None,
     context: OperationContext | None,
-) -> tuple[dict[int, tuple[AccountHistoryRow, ...]], int, int, int]:
+) -> tuple[
+    dict[int, tuple[AccountHistoryRow, ...]],
+    int,
+    int,
+    int,
+    tuple[IdentityObservation, ...],
+]:
     replacements: dict[tuple[Path, int], AccountStatus] = {}
+    identity_observations: list[IdentityObservation] = []
     runs_scanned = 0
     segments_scanned = 0
     unusable_runs = 0
@@ -613,6 +624,10 @@ def _merge_native_log_history(
                     task_log = Path(getattr(run, "task_log"))
                     for outcome in deep.started_outcomes:
                         replacements[(task_log, outcome.a_number)] = outcome.status
+                        identity_observations.extend(
+                            IdentityObservation(outcome.a_number, token)
+                            for token in outcome.identity_tokens
+                        )
                     runs_scanned += 1
                     segments_scanned += len(validated)
                 else:
@@ -637,7 +652,13 @@ def _merge_native_log_history(
             replace(row, status=replacements.get((row.task_log, number), row.status))
             for row in rows
         )
-    return merged, runs_scanned, segments_scanned, unusable_runs
+    return (
+        merged,
+        runs_scanned,
+        segments_scanned,
+        unusable_runs,
+        tuple(identity_observations),
+    )
 
 
 def classify_identities(
@@ -855,8 +876,9 @@ def _master_identity_observations(
         value = account.get("url")
         if not isinstance(value, str) or not value.strip():
             continue
-        token = hashlib.sha256(value.strip().casefold().encode("utf-8")).hexdigest()
-        observations.append(IdentityObservation(number, token))
+        token = profile_identity_token(value)
+        if token is not None:
+            observations.append(IdentityObservation(number, token))
     return tuple(observations)
 
 
@@ -1095,6 +1117,13 @@ def _derive_suggestion(
     error_threshold: int,
     minimum_evidence_runs: int,
 ) -> tuple[Suggestion, str]:
+    if identity.state is IdentityState.DUPLICATE:
+        return (
+            Suggestion.REVIEW,
+            f"A{number} 属于重复组 {identity.duplicate_group}，需人工选择保留位置。",
+        )
+    if identity.state is IdentityState.CONFLICT:
+        return Suggestion.REVIEW, f"A{number} 的历史身份不一致，需人工复核。"
     if (
         disposition is Disposition.PERMANENTLY_DISABLED
         and evidence.last_classified_status is AccountStatus.DOWNLOADED
@@ -1109,13 +1138,6 @@ def _derive_suggestion(
             f"A{number} 连续 {evidence.consecutive_error_runs} 个 ERROR：{run_ids}；"
             "请求层失败不代表账号已注销，此项仅为停用建议。",
         )
-    if identity.state is IdentityState.DUPLICATE:
-        return (
-            Suggestion.REVIEW,
-            f"A{number} 属于重复组 {identity.duplicate_group}，需人工选择保留位置。",
-        )
-    if identity.state is IdentityState.CONFLICT:
-        return Suggestion.REVIEW, f"A{number} 的历史身份不一致，需人工复核。"
     if reachability is ReachabilityState.REQUEST_FAILED:
         return (
             Suggestion.REVIEW,

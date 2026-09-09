@@ -349,6 +349,29 @@ class AccountAuditPureLogicTests(unittest.TestCase):
         self.assertEqual(assessments[3].state, IdentityState.CONFLICT)
         self.assertEqual(assessments[4].state, IdentityState.UNRESOLVED)
 
+    def test_identity_risk_overrides_consecutive_error_disable_suggestion(self) -> None:
+        rows = tuple(_row(number, AccountStatus.ERROR) for number in range(1, 6))
+        observations = (
+            IdentityObservation(1, "duplicate-token"),
+            IdentityObservation(2, "duplicate-token"),
+            IdentityObservation(3, "historical-token"),
+            IdentityObservation(3, "current-token"),
+        )
+
+        entries = build_audit_entries(
+            {1: True, 2: True, 3: True},
+            {1: rows, 2: rows, 3: rows},
+            identity_observations=observations,
+        )
+
+        self.assertEqual(entries[0].identity, IdentityState.DUPLICATE)
+        self.assertEqual(entries[1].identity, IdentityState.DUPLICATE)
+        self.assertEqual(entries[2].identity, IdentityState.CONFLICT)
+        self.assertEqual(
+            [entry.suggestion for entry in entries],
+            [Suggestion.REVIEW, Suggestion.REVIEW, Suggestion.REVIEW],
+        )
+
     def test_build_is_pure_and_does_not_mutate_inputs(self) -> None:
         master = {1: True}
         history = {1: [_row(number, AccountStatus.ERROR) for number in range(1, 6)]}
@@ -380,6 +403,102 @@ class AccountAuditPersistenceTests(unittest.TestCase):
 
             self.assertEqual(paths.account_audit, paths.data / "AccountAudit")
             self.assertTrue(paths.account_audit.is_dir())
+
+    def test_profile_url_variants_duplicate_but_case_and_unresolved_urls_do_not(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_test_paths(Path(directory), 5)
+            master = read_json(paths.master_settings)
+            accounts = master["accounts_urls"]
+            stable_identity = "Ab_" + ("X" * 52)
+            accounts[0]["url"] = (
+                f"https://www.douyin.com/user/{stable_identity}?from=search#profile"
+            )
+            accounts[1]["url"] = (
+                f"HTTPS://DOUYIN.COM/user/{stable_identity}/"
+            )
+            accounts[2]["url"] = (
+                f"https://www.douyin.com/user/{stable_identity.lower()}"
+            )
+            accounts[3]["url"] = "https://v.douyin.com/synthetic-short-link/"
+            accounts[4]["url"] = f"https://synthetic.invalid/user/{stable_identity}"
+            write_json_atomic(paths.master_settings, master)
+            service = AccountAuditService(
+                ResultHistoryService(paths.download_task_logs),
+                paths=paths,
+                backup=BackupService(paths),
+            )
+
+            report = service.build_current_report()
+
+            self.assertEqual(report.entries[0].identity, IdentityState.DUPLICATE)
+            self.assertEqual(report.entries[1].identity, IdentityState.DUPLICATE)
+            self.assertEqual(
+                report.entries[0].duplicate_group,
+                report.entries[1].duplicate_group,
+            )
+            self.assertEqual(report.entries[2].identity, IdentityState.CONFIRMED)
+            self.assertEqual(report.entries[3].identity, IdentityState.UNRESOLVED)
+            self.assertEqual(report.entries[4].identity, IdentityState.UNRESOLVED)
+            self.assertEqual(report.duplicate_groups, 1)
+
+    def test_native_identity_conflict_never_leaks_raw_id_to_report_or_sidecar(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_test_paths(Path(directory), 1)
+            current_identity = "C" * 55
+            historical_identity = "H" * 55
+            master = read_json(paths.master_settings)
+            master["accounts_urls"][0]["url"] = (
+                f"https://www.douyin.com/user/{current_identity}"
+            )
+            write_json_atomic(paths.master_settings, master)
+            native_root = paths.volume / "Log"
+            native_root.mkdir()
+            native_log = native_root / "synthetic-native.log"
+            native_log.write_text(
+                "共有 1 个账号的作品等待下载\n"
+                "开始处理第 1 个账号\n"
+                "标识：A1account1\n"
+                f"{historical_identity} 获取账号信息失败，请检查 Cookie 登录状态！\n"
+                "筛选处理后作品数量: 0\n",
+                encoding="utf-8",
+            )
+            task_log = (
+                paths.download_task_logs / "DownloadTask_2026-09-08_12-00-00.log"
+            )
+            task_log.write_text(
+                "【下载账号汇总】\n"
+                "进程结束时间：2026-09-08 12:00:00\n"
+                "退出码：0\n"
+                "账号汇总：完整\n"
+                "账号明细版本：1\n"
+                "无符合条件作品（1）：A1\n"
+                f"日志区间：{native_log.resolve()}；偏移=0；长度={native_log.stat().st_size}\n",
+                encoding="utf-8",
+            )
+            service = AccountAuditService(
+                ResultHistoryService(paths.download_task_logs),
+                paths=paths,
+                backup=BackupService(paths),
+            )
+
+            report = service.build_current_report(native_log_analysis=True)
+            self.assertEqual(report.entries[0].identity, IdentityState.CONFLICT)
+            self.assertEqual(report.entries[0].suggestion, Suggestion.REVIEW)
+            rendered_report = repr(report)
+            self.assertNotIn(current_identity, rendered_report)
+            self.assertNotIn(historical_identity, rendered_report)
+
+            result = service.apply_decisions(
+                report,
+                (AuditDecision(1, Disposition.PENDING_REVIEW, "synthetic review"),),
+            )
+            rendered_sidecar = result.audit_state_path.read_text(encoding="utf-8")
+            self.assertNotIn(current_identity, rendered_sidecar)
+            self.assertNotIn(historical_identity, rendered_sidecar)
 
     def test_native_log_analysis_rechecks_exact_historical_segments(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

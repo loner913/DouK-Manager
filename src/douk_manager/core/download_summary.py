@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import re
 from codecs import getincrementaldecoder
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Iterator
 
+from douk_manager.core.account_identity import log_identity_tokens
 from douk_manager.core.selector import compact_numbers
 
 
@@ -67,6 +68,7 @@ class AccountOutcome:
     a_number: int
     status: AccountStatus
     completed_with_anomaly: bool = False
+    identity_tokens: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -309,6 +311,7 @@ class _AccountBlock:
     anomaly_signal: bool = False
     unrecovered_error: bool = False
     statistics_conflict: bool = False
+    identity_tokens: set[str] = field(default_factory=set)
 
     def set_total(self, category: str, downloaded: bool, value: int) -> None:
         field = ("downloaded_" if downloaded else "skipped_") + category
@@ -714,6 +717,7 @@ def parse_download_summary(
                 mapped.a_number,
                 status,
                 completed_with_anomaly,
+                tuple(sorted(block.identity_tokens)),
             )
         )
 
@@ -885,6 +889,7 @@ def _consume_account_line(
     block: _AccountBlock,
     line: str,
 ) -> None:
+    block.identity_tokens.update(log_identity_tokens(line))
     mark_match = _LOGGED_MARK_RE.search(line)
     if mark_match:
         logged_mark = mark_match.group(1).strip()

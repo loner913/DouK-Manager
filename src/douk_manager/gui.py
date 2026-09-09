@@ -3439,6 +3439,13 @@ class MainWindow(QMainWindow):
         native_log_analysis = self.account_audit_native_logs.isChecked()
         threshold = self.account_audit_error_threshold.value()
         minimum_runs = self.account_audit_minimum_runs.value()
+        if native_log_analysis:
+            try:
+                self.controller.require_log_analysis_ready()
+            except ControllerError as exc:
+                self.account_audit_progress.setText("账号审计未启动。")
+                self.account_audit_output.setPlainText(str(exc))
+                return
         spec = TaskSpec(
             task_type="account_audit_scan",
             display_name="扫描账号健康审计",
