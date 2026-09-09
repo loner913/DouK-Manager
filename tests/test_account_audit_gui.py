@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from douk_manager.background import ClosePolicy, TaskSpec
+from douk_manager.config import AppConfig
 from douk_manager.controller import ControllerError, ManagerController
 from douk_manager.core.account_audit import (
     AccountAuditEntry,
@@ -128,6 +129,7 @@ class AccountAuditControllerIntegrationTests(unittest.TestCase):
         controller.startup_state = StartupState.READY
         controller._download_lifecycle_active = False
         controller.account_audit = Mock()
+        controller.config = AppConfig()
         controller.engine = SimpleNamespace(external_running=Mock(return_value=False))
         controller.collector = SimpleNamespace(running=False, health=Mock(return_value=False))
         controller.logger = Mock()
@@ -157,6 +159,7 @@ class AccountAuditControllerIntegrationTests(unittest.TestCase):
             report,
         )
         controller.account_audit.build_current_report.assert_called_once_with(
+            evidence_since=None,
             error_threshold=6,
             minimum_evidence_runs=4,
             native_log_analysis=True,
@@ -176,6 +179,43 @@ class AccountAuditControllerIntegrationTests(unittest.TestCase):
         controller.startup_state = StartupState.CLOSING
         with self.assertRaisesRegex(ControllerError, "关闭"):
             controller.audit_accounts(context=context)
+
+    def test_evidence_since_config_defaults_empty_and_round_trips(self) -> None:
+        self.assertEqual(AppConfig().evidence_since, "")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "app_config.json"
+            AppConfig(evidence_since="2026-09-01 08:30:00").save(path)
+
+            loaded = AppConfig.load(path)
+
+        self.assertEqual(loaded.evidence_since, "2026-09-01 08:30:00")
+
+    def test_controller_passes_configured_evidence_since_to_audit(self) -> None:
+        controller = self._controller()
+        controller.config = AppConfig(evidence_since="2026-09-01 08:30:00")
+
+        controller.audit_accounts()
+
+        controller.account_audit.build_current_report.assert_called_once_with(
+            evidence_since=datetime(2026, 9, 1, 8, 30),
+            error_threshold=5,
+            minimum_evidence_runs=3,
+            native_log_analysis=False,
+            context=None,
+        )
+
+    def test_controller_rejects_invalid_or_zoned_evidence_since(self) -> None:
+        for value in (None, "not-a-time", "2026-09-01T08:30:00+08:00"):
+            with self.subTest(value=value):
+                controller = self._controller()
+                controller.config = AppConfig(evidence_since=value)
+
+                with self.assertRaisesRegex(
+                    ControllerError,
+                    "账号审计证据起始时间点配置无效",
+                ):
+                    controller.audit_accounts()
+                controller.account_audit.build_current_report.assert_not_called()
 
 
 class AccountAuditScanIntegrationTests(unittest.TestCase):

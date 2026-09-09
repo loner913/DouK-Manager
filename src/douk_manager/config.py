@@ -51,6 +51,7 @@ class AppConfig:
     screenshot_post_mode: str = "queue"
     index_post_mode: str = "queue"
     cleanup_after_index: bool = True
+    evidence_since: str = ""
 
     @classmethod
     def load(cls, path: Path) -> "AppConfig":
