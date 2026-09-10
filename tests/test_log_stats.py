@@ -587,6 +587,8 @@ class DashboardSegmentSelectionTests(unittest.TestCase):
             first = root / "first.log"
             second = root / "second.log"
             task = root / "DownloadTask_synthetic.log"
+            first.write_text("first\n", encoding="utf-8")
+            second.write_text("second\n", encoding="utf-8")
             summary = replace(
                 _summary(
                     (
@@ -610,16 +612,14 @@ class DashboardSegmentSelectionTests(unittest.TestCase):
             before = task.read_bytes()
             snapshot = ResultDashboardService(root).selected_task(task)
             self.assertEqual(task.read_bytes(), before)
-        self.assertEqual(
-            snapshot.native_log_segments,
-            (
-                DashboardNativeLogSegment(first, 10, 20),
-                DashboardNativeLogSegment(second, 30, 40),
-                DashboardNativeLogSegment(
-                    Path("Z:\\FAKE-PATH\\legacy.log"), None, None
-                ),
-            ),
-        )
+            self.assertEqual(len(snapshot.native_log_segments), 3)
+            first_segment, second_segment, legacy_segment = snapshot.native_log_segments
+            self.assertTrue(first_segment.path.samefile(first))
+            self.assertEqual((first_segment.offset, first_segment.length), (10, 20))
+            self.assertTrue(second_segment.path.samefile(second))
+            self.assertEqual((second_segment.offset, second_segment.length), (30, 40))
+            self.assertEqual(legacy_segment.path, Path(r"Z:\FAKE-PATH\legacy.log"))
+            self.assertEqual((legacy_segment.offset, legacy_segment.length), (None, None))
 
 
 class EngineLogStatsTests(unittest.TestCase):
