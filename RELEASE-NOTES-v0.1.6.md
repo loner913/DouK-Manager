@@ -3,12 +3,19 @@
 ## 版本定位
 
 v0.1.6 在已验收的 v0.1.5 基础上整合 mark 归类、日志安全统计、下载引擎回退和账号健康审计四项功能。
-阶段 D 最终候选已完成 Windows 前台人工验收；本文记录发布候选内容。
-实际发布身份以 `v0.1.6` Tag 和 GitHub Release 指向的提交为准。
+阶段 D 最终候选已完成 Windows 前台人工验收；本文记录已完成实现和集成边界。
+V0.1.6 已通过 `feature/v0.1.6-final` 和 PR #9 进入 `develop` 集成流程。
+本流程不创建或移动 Tag、不创建 GitHub Release，`main` 保持不变。
 
 最终发布准备分支：`feature/v0.1.6-final`
 
-最终候选基点：`c7b90721c3c171193545d80fb9dc6aa4b7305f4d`
+功能冻结基点：`c7b90721c3c171193545d80fb9dc6aa4b7305f4d`（历史功能冻结记录，不是当前分支 HEAD）。
+
+设计记录：[总索引](docs/designs/v0.1.6/README.md) ·
+[mark 归类](docs/designs/v0.1.6/01-mark-classification.md) ·
+[引擎回退](docs/designs/v0.1.6/02-engine-rollback.md) ·
+[账号健康审计](docs/designs/v0.1.6/03-account-health-audit.md) ·
+[日志统计与诊断](docs/designs/v0.1.6/04-log-statistics-and-diagnostics.md)
 
 ## 功能范围
 
@@ -44,8 +51,10 @@ v0.1.6 在已验收的 v0.1.5 基础上整合 mark 归类、日志安全统计�
 
 - 阶段 D：D-0 至 D-25 的最终候选记录为 PASS；
 - 完整回归：`608 total / 606 passed / 2 skipped / 0 failed / 0 errors`；
-- 候选 HEAD：`c7b90721c3c171193545d80fb9dc6aa4b7305f4d`；
-- 候选 Tree：`881554c7cdbf7734f4a6f6dd1a540088cb5d1fb8`；
+- E-0 最小版本测试：PASS；
+- `compileall`：PASS；
+- `git diff --check`：PASS；
+- 敏感数据边界检查：PASS；
 - 未使用正式账号、Cookie、Token、数据库、原生日志或正式下载引擎数据。
 
 ## 版本身份与 Artifact
@@ -58,14 +67,17 @@ v0.1.6 在已验收的 v0.1.5 基础上整合 mark 归类、日志安全统计�
 
 ## 构建流程
 
-`.github/workflows/build-windows.yml` 保留现有 `actions/*@v7`，使用 Windows runner 和 Python 3.12，先运行全量
-unittest，再执行 Windows 便携版打包。远程推送、Actions 构建、Tag 和 Release 是独立人工发布步骤。
+`.github/workflows/build-windows.yml` 保留现有 `actions/*@v7`，使用 Windows runner 和 Python 3.12。
+本次 PR 阶段只运行适用于 pull request 的 `Test` 作业；PR 合并后的 `develop` push 才运行正式 Windows
+便携版打包，并生成 ZIP 和 SHA-256 校验文件。
 
+本流程不手动触发 portable package，不创建或移动 Tag，不创建 GitHub Release；`main` 保持不变。
 workflow 本身不自动 push、创建 Tag 或发布 Release。
 
 ## 安全边界与升级
 
 - 不迁移、不覆盖正式 `_internal\Volume`、数据库、settings、Cookie、账号日志或原始下载器日志；
 - 既有 v0.1.5 历史记录和发布对象保持不变；
+- V0.1.4 和 V0.1.5 缺少的正式设计文档本次不追溯编造，作为后续独立文档债处理；
 - 便携版验收应使用隔离目录，不替换正式运行目录；
 - 如需回滚，只恢复管理器程序文件，不回滚或迁移 Volume、数据库和正式业务配置。

@@ -17,8 +17,9 @@
 ## 版本历史
 
 仓库使用 `v0.1.0` 表示首个正式稳定版；后续 `v0.1.1` 至 `v0.1.5` 在
-`develop` 上持续验收。当前 `v0.1.6` 已完成阶段 D 验收，以及 E-0 版本元数据和构建流程准备；
-发布候选由 `feature/v0.1.6-final` 承载。实际发布状态以仓库的 `v0.1.6` Tag 和 GitHub Release 为准。
+`develop` 上持续验收。当前 `v0.1.6` 已完成阶段 D 验收，并通过
+`feature/v0.1.6-final` 和 PR #9 进入 `develop` 集成流程；E-0/E-0.1 发布准备也已完成。
+本流程不创建或移动 Tag、不创建 GitHub Release，`main` 保持不变。
 既有 `v0.1.0` Tag/Release 和 v0.1.5 历史保持不变。
 
 | 版本 | 定位 | 主要新增与修复 |
@@ -59,8 +60,18 @@ v0.1.6 在已验收的 v0.1.5 基础上整合四项功能：
 - 账号健康审计、重复/冲突复核、永久停用和生命周期管理。
 
 阶段 D 的最终候选已完成 Windows 前台人工验收。完整回归记录为 608 项测试，606 项通过、2 项条件跳过、0 失败、0 错误。
-E-0 版本元数据和构建流程准备已完成；发布候选由 `feature/v0.1.6-final` 承载。实际发布状态以仓库的
-`v0.1.6` Tag 和 GitHub Release 为准。
+E-0/E-0.1 版本元数据和构建流程准备已完成；V0.1.6 已通过
+`feature/v0.1.6-final` 和 PR #9 进入 `develop` 集成流程。PR 阶段只运行适用于 pull request 的测试；
+合并后的 `develop` push 才运行正式 Windows 便携版构建。本流程不创建或移动 Tag、不创建 GitHub Release，
+`main` 保持不变。
+
+V0.1.6 设计记录：[总索引](docs/designs/v0.1.6/README.md) ·
+[mark 归类](docs/designs/v0.1.6/01-mark-classification.md) ·
+[引擎回退](docs/designs/v0.1.6/02-engine-rollback.md) ·
+[账号健康审计](docs/designs/v0.1.6/03-account-health-audit.md) ·
+[日志统计与诊断](docs/designs/v0.1.6/04-log-statistics-and-diagnostics.md)。
+
+V0.1.4 和 V0.1.5 尚无本目录形式的正式设计文档，本次不追溯编造，作为后续独立文档债处理。
 
 ## v0.1.5 后台安全、结果看板与稳定化
 
@@ -208,15 +219,16 @@ python -m unittest discover -s tests -v
 
 ## Windows 便携版构建
 
-仓库包含 `.github/workflows/build-windows.yml`。V0.1.6 发布准备分支为
-`feature/v0.1.6-final`。该分支推送后，在仓库 `Actions` 中手动选择同一工作流和该分支运行：
+仓库包含 `.github/workflows/build-windows.yml`。V0.1.6 发布集成使用
+`feature/v0.1.6-final` 向 `develop` 发起的 PR 流程：
 
-1. `Test` 作业先在 Windows + Python 3.12 上运行全量 unittest；
-2. 测试通过后运行 `Windows portable package`；
-3. 下载同时包含 ZIP 和 SHA-256 校验文件的 Artifact；
+1. PR 事件只运行 `Test` 作业，在 Windows + Python 3.12 上运行全量 unittest；
+2. PR 合并后的 `develop` push 才运行 `Windows portable package` 正式打包；
+3. 正式打包同时生成 ZIP 和 SHA-256 校验文件的 Artifact；
 4. 核验 ZIP 后解压到隔离目录，再双击 `DouKManager.exe`。
 
 Artifact 名称格式为 `DouK-Manager_Windows_X64-v0.1.6-<ref>-run-<run>-<sha>`。
+本次发布流程不手动触发 portable package，不创建 Tag 或 GitHub Release，`main` 和 `develop` 的发布边界按上述流程保持不变。
 编译产物、运行数据和正式账号资料都不会写入源码仓库。
 
 ## v0.1.0 稳定版
