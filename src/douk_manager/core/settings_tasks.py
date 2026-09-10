@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,6 +65,19 @@ class GeneratedTask:
 
 
 @dataclass(frozen=True)
+class ActivatedTask:
+    active_path: Path
+    vetoed_numbers: tuple[int, ...]
+    backup_path: Path
+
+    def __fspath__(self) -> str:
+        return str(self.active_path)
+
+    def __str__(self) -> str:
+        return str(self.active_path)
+
+
+@dataclass(frozen=True)
 class SmartSelectionPreview:
     requested: SelectionPreview
     effective: SelectionPreview | None
@@ -106,8 +120,21 @@ class SettingsTaskService:
     def preview(self, expression: str) -> SelectionPreview:
         master = self.load_master()
         accounts = self._accounts(master, "settings_master.json")
-        selection = parse_selection(expression, len(accounts))
+        selection = self._master_enabled_selection(
+            accounts, parse_selection(expression, len(accounts))
+        )
         return self._preview_selection(accounts, selection)
+
+    @staticmethod
+    def _master_enabled_selection(
+        accounts: list[dict[str, Any]], selection: Selection
+    ) -> Selection:
+        numbers = tuple(
+            number
+            for number in selection.numbers
+            if bool(accounts[number - 1].get("enable", True))
+        )
+        return Selection(numbers, selection.duplicate_numbers, compact_numbers(numbers))
 
     @staticmethod
     def _preview_selection(
@@ -137,7 +164,9 @@ class SettingsTaskService:
     ) -> SmartSelectionPreview:
         master = self.load_master()
         accounts = self._accounts(master, "settings_master.json")
-        requested_selection = parse_selection(expression, len(accounts))
+        requested_selection = self._master_enabled_selection(
+            accounts, parse_selection(expression, len(accounts))
+        )
         requested = self._preview_selection(accounts, requested_selection)
         excluded = {match.a_number for match in private_matches}
         effective_numbers = tuple(
@@ -169,7 +198,7 @@ class SettingsTaskService:
         accounts = self._accounts(task, "任务配置")
         selected = set(selection.numbers)
         for position, account in enumerate(accounts, start=1):
-            account["enable"] = position in selected
+            account["enable"] = bool(account.get("enable", True)) and position in selected
             if position in selected and task_earliest.change:
                 account["earliest"] = task_earliest.value
         task["run_command"] = "5 1 1 Q"
@@ -198,10 +227,17 @@ class SettingsTaskService:
                 raise SettingsTaskError(
                     "智能跳过后没有剩余账号；可以选择强制包含全部账号，或取消创建。"
                 )
+            master_enabled_numbers = tuple(
+                number
+                for number in effective_numbers
+                if bool(accounts[number - 1].get("enable", True))
+            )
+            if not master_enabled_numbers:
+                raise SettingsTaskError("所选账号均被主档永久停用。")
             selection = Selection(
-                effective_numbers,
+                master_enabled_numbers,
                 requested_selection.duplicate_numbers,
-                compact_numbers(effective_numbers),
+                compact_numbers(master_enabled_numbers),
             )
             preview = self._preview_selection(accounts, selection)
 
@@ -269,7 +305,7 @@ class SettingsTaskService:
                 path.unlink()
         return tuple(validated)
 
-    def activate_existing_task(self, task_path: Path) -> Path:
+    def activate_existing_task(self, task_path: Path) -> ActivatedTask:
         with critical_section(self.paths.lock_file):
             stored_task = read_json(task_path)
             stored_accounts = self._accounts(stored_task, task_path.name)
@@ -282,12 +318,20 @@ class SettingsTaskService:
             # cannot be reverted by an old task JSON.
             task = copy.deepcopy(latest_master)
             active_accounts = self._accounts(task, "待激活 settings.json")
+            vetoed_numbers: list[int] = []
+            template_enabled_numbers: list[int] = []
             for position, active_account in enumerate(active_accounts):
                 if position >= len(stored_accounts):
                     active_account["enable"] = False
                     continue
                 stored_account = stored_accounts[position]
-                active_account["enable"] = bool(stored_account.get("enable", True))
+                template_enabled = bool(stored_account.get("enable", True))
+                master_enabled = bool(latest_accounts[position].get("enable", True))
+                if template_enabled:
+                    template_enabled_numbers.append(position + 1)
+                if template_enabled and not master_enabled:
+                    vetoed_numbers.append(position + 1)
+                active_account["enable"] = master_enabled and template_enabled
                 if "earliest" in stored_account:
                     active_account["earliest"] = copy.deepcopy(
                         stored_account["earliest"]
@@ -296,6 +340,10 @@ class SettingsTaskService:
             task["run_command"] = "5 1 1 Q"
             enabled = sum(bool(account.get("enable", True)) for account in active_accounts)
             if enabled < 1:
+                if template_enabled_numbers and len(vetoed_numbers) == len(
+                    template_enabled_numbers
+                ):
+                    raise SettingsTaskError("模板内账号均被主档永久停用。")
                 raise SettingsTaskError("任务没有启用任何账号。")
             snapshot = self.backup.create_critical_snapshot(
                 "BeforeChange",
@@ -305,6 +353,7 @@ class SettingsTaskService:
                     "stored_accounts": len(stored_accounts),
                     "latest_master_accounts": len(latest_accounts),
                     "account_identity_source": "latest_settings_master",
+                    "vetoed_numbers": vetoed_numbers,
                 },
                 keep_latest=20,
             )
@@ -313,7 +362,11 @@ class SettingsTaskService:
             except Exception:
                 self.backup.restore_named_files(snapshot, ("settings.json",))
                 raise
-            return self.paths.active_settings
+            return ActivatedTask(
+                self.paths.active_settings,
+                tuple(vetoed_numbers),
+                snapshot,
+            )
 
     def generate_batches(
         self,
@@ -323,25 +376,56 @@ class SettingsTaskService:
         *,
         task_earliest: EarliestRule | None = None,
     ) -> tuple[GeneratedTask, ...]:
-        master = self.load_master()
-        total = len(self._accounts(master, "settings_master.json"))
-        if end > total:
-            raise SettingsTaskError(f"结束编号 A{end} 超过当前最大编号 A{total}。")
-        generated: list[GeneratedTask] = []
-        for ordinal, (batch_start, batch_end) in enumerate(
-            split_batches(start, end, batch_size), start=1
-        ):
-            expression = f"A{batch_start}-A{batch_end}"
-            name = f"Batch_{ordinal:03d}_A{batch_start}-A{batch_end}"
-            generated.append(
-                self.create_task(
-                    expression,
-                    task_earliest=task_earliest or EarliestRule.keep(),
-                    task_name=name,
-                    activate=False,
-                )
+        task_earliest = task_earliest or EarliestRule.keep()
+        with critical_section(self.paths.lock_file):
+            master = self.load_master()
+            accounts = self._accounts(master, "settings_master.json")
+            total = len(accounts)
+            if end > total:
+                raise SettingsTaskError(f"结束编号 A{end} 超过当前最大编号 A{total}。")
+
+            batches = tuple(split_batches(start, end, batch_size))
+            # Validate every document before writing, but retain only lightweight plans.
+            prepared: list[tuple[Selection, SelectionPreview, str]] = []
+            for ordinal, (batch_start, batch_end) in enumerate(batches, start=1):
+                expression = f"A{batch_start}-A{batch_end}"
+                requested = parse_selection(expression, total)
+                selection = self._master_enabled_selection(accounts, requested)
+                if not selection.numbers:
+                    raise SettingsTaskError(
+                        f"批次 A{batch_start}-A{batch_end} 内账号均被主档永久停用；"
+                        "未生成任何批次任务。"
+                    )
+                preview = self._preview_selection(accounts, selection)
+                task = self.build_task_document(master, selection, task_earliest)
+                try:
+                    json.dumps(task, ensure_ascii=False, indent=2)
+                except (TypeError, ValueError) as exc:
+                    raise SettingsTaskError(
+                        f"批次 A{batch_start}-A{batch_end} 无法生成有效 JSON。"
+                    ) from exc
+                name = f"Batch_{ordinal:03d}_A{batch_start}-A{batch_end}"
+                prepared.append((selection, preview, _safe_task_name(name)))
+
+            planned = tuple(
+                GeneratedTask(_unique_task_path(self.paths.tasks, name), preview)
+                for _, preview, name in prepared
             )
-        return tuple(generated)
+            attempted_paths: list[Path] = []
+            try:
+                for (selection, _, _), generated in zip(prepared, planned):
+                    task = self.build_task_document(master, selection, task_earliest)
+                    attempted_paths.append(generated.task_path)
+                    write_json_atomic(generated.task_path, task)
+            except Exception as exc:
+                residual = _remove_new_task_paths(attempted_paths)
+                if residual:
+                    raise SettingsTaskError(
+                        "批次任务生成失败，且回滚后仍残留本次新建模板："
+                        + "、".join(residual)
+                    ) from exc
+                raise
+            return planned
 
 
 def _safe_task_name(name: str) -> str:
@@ -376,3 +460,14 @@ def _unique_task_path(directory: Path, stem: str) -> Path:
         candidate = directory / f"{stem}_{suffix}.json"
         suffix += 1
     return candidate
+
+
+def _remove_new_task_paths(paths: list[Path]) -> tuple[str, ...]:
+    residual: list[str] = []
+    for path in reversed(paths):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            residual.append(path.name)
+    residual.reverse()
+    return tuple(residual)

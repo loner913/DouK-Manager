@@ -3,10 +3,16 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from douk_manager.core.backup import BackupService
 from douk_manager.core.json_store import read_json, write_json_atomic
-from douk_manager.core.settings_tasks import EarliestRule, SettingsTaskService
+from douk_manager.core.settings_tasks import (
+    ActivatedTask,
+    EarliestRule,
+    SettingsTaskError,
+    SettingsTaskService,
+)
 from tests.helpers import make_test_paths
 
 
@@ -31,9 +37,9 @@ class SettingsTaskTests(unittest.TestCase):
             )
             self.assertEqual(
                 [item["enable"] for item in active["accounts_urls"]],
-                [True, False, True, True, False, False, False, True],
+                [True, False, True, False, False, False, False, False],
             )
-            for number in (1, 3, 4, 8):
+            for number in (1, 3):
                 self.assertEqual(master["accounts_urls"][number - 1]["earliest"], 7)
                 self.assertEqual(active["accounts_urls"][number - 1]["earliest"], 7)
             self.assertEqual(active["run_command"], "5 1 1 Q")
@@ -44,7 +50,13 @@ class SettingsTaskTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             paths = make_test_paths(Path(directory), 501)
             service = SettingsTaskService(paths, BackupService(paths))
-            result = service.generate_batches(1, 501, 250)
+            master = read_json(paths.master_settings)
+            for account in master["accounts_urls"]:
+                account["enable"] = True
+            write_json_atomic(paths.master_settings, master)
+            with patch.object(service, "load_master", wraps=service.load_master) as load:
+                result = service.generate_batches(1, 501, 250)
+            load.assert_called_once_with()
             self.assertEqual(len(result), 3)
             self.assertEqual(result[0].preview.compact, "A1-A250")
             self.assertEqual(result[2].preview.compact, "A501")
@@ -52,12 +64,97 @@ class SettingsTaskTests(unittest.TestCase):
             self.assertTrue(third["accounts_urls"][500]["enable"])
             self.assertFalse(third["accounts_urls"][499]["enable"])
 
+    def test_batch_preflight_rejects_later_all_tombstone_batch_without_writes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_test_paths(Path(directory), 4)
+            service = SettingsTaskService(paths, BackupService(paths))
+            master = read_json(paths.master_settings)
+            for number, account in enumerate(master["accounts_urls"], start=1):
+                account["enable"] = number <= 2
+            write_json_atomic(paths.master_settings, master)
+            before = tuple(paths.tasks.iterdir())
+
+            with self.assertRaisesRegex(
+                SettingsTaskError, "批次 A3-A4.*未生成任何批次任务"
+            ):
+                service.generate_batches(1, 4, 2)
+
+            self.assertEqual(tuple(paths.tasks.iterdir()), before)
+
+    def test_batch_write_failure_removes_every_template_from_this_operation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_test_paths(Path(directory), 4)
+            service = SettingsTaskService(paths, BackupService(paths))
+            preserved = paths.tasks / "Batch_001_A1-A2.json"
+            write_json_atomic(preserved, {"synthetic": "preserve"})
+            before = {
+                path.name: path.read_bytes()
+                for path in paths.tasks.iterdir()
+                if path.is_file()
+            }
+            real_write = write_json_atomic
+            write_count = 0
+
+            def fail_after_second_write(path, value):
+                nonlocal write_count
+                write_count += 1
+                real_write(path, value)
+                if write_count == 2:
+                    raise OSError("synthetic second batch write failure")
+
+            with patch(
+                "douk_manager.core.settings_tasks.write_json_atomic",
+                side_effect=fail_after_second_write,
+            ):
+                with self.assertRaisesRegex(
+                    OSError, "synthetic second batch write failure"
+                ):
+                    service.generate_batches(1, 4, 2)
+
+            after = {
+                path.name: path.read_bytes()
+                for path in paths.tasks.iterdir()
+                if path.is_file()
+            }
+            self.assertEqual(write_count, 2)
+            self.assertEqual(after, before)
+
+    def test_batch_rollback_failure_reports_residual_template(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_test_paths(Path(directory), 4)
+            service = SettingsTaskService(paths, BackupService(paths))
+            real_write = write_json_atomic
+            real_unlink = Path.unlink
+
+            def fail_after_write(path, value):
+                real_write(path, value)
+                raise OSError("synthetic write failure after replace")
+
+            def reject_batch_cleanup(path, *args, **kwargs):
+                if path.name.startswith("Batch_"):
+                    raise OSError("synthetic cleanup failure")
+                return real_unlink(path, *args, **kwargs)
+
+            with patch(
+                "douk_manager.core.settings_tasks.write_json_atomic",
+                side_effect=fail_after_write,
+            ), patch.object(Path, "unlink", new=reject_batch_cleanup):
+                with self.assertRaisesRegex(
+                    SettingsTaskError,
+                    "回滚后仍残留本次新建模板：Batch_001_A1-A2.json",
+                ):
+                    service.generate_batches(1, 4, 2)
+
     def test_same_task_name_never_overwrites_old_template(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             paths = make_test_paths(Path(directory), 8)
             service = SettingsTaskService(paths, BackupService(paths))
             first = service.create_task("A1", task_name="keep-me")
-            second = service.create_task("A2", task_name="keep-me")
+            second = service.create_task("A3", task_name="keep-me")
             self.assertEqual(first.task_path.name, "keep-me.json")
             self.assertEqual(second.task_path.name, "keep-me_2.json")
             self.assertTrue(read_json(first.task_path)["accounts_urls"][0]["enable"])
@@ -68,8 +165,8 @@ class SettingsTaskTests(unittest.TestCase):
             paths = make_test_paths(Path(directory), 8)
             service = SettingsTaskService(paths, BackupService(paths))
             readable = service.create_task("A1", task_name="A1331_全流程测试")
-            invalid = service.create_task("A2", task_name='测试<>:"/\\|?*名称')
-            reserved = service.create_task("A3", task_name="CON")
+            invalid = service.create_task("A3", task_name='测试<>:"/\\|?*名称')
+            reserved = service.create_task("A5", task_name="CON")
             self.assertEqual(readable.task_path.name, "A1331_全流程测试.json")
             self.assertEqual(invalid.task_path.name, "测试_名称.json")
             self.assertEqual(reserved.task_path.name, "Task_CON.json")
@@ -118,6 +215,99 @@ class SettingsTaskTests(unittest.TestCase):
             self.assertEqual(accounts[2]["earliest"], 30)
             self.assertEqual(accounts[3]["earliest"], "latest-master-value")
             self.assertEqual(active["run_command"], "5 1 1 Q")
+
+    def test_old_template_cannot_reenable_master_tombstone(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_test_paths(Path(directory), 5)
+            service = SettingsTaskService(paths, BackupService(paths))
+            generated = service.create_task("A1,A5", task_name="before-tombstone")
+            master_before = read_json(paths.master_settings)
+            master_after = read_json(paths.master_settings)
+            master_after["accounts_urls"][4]["enable"] = False
+            write_json_atomic(paths.master_settings, master_after)
+
+            result = service.activate_existing_task(generated.task_path)
+
+            self.assertIsInstance(result, ActivatedTask)
+            self.assertEqual(result.vetoed_numbers, (5,))
+            self.assertEqual(
+                [item["enable"] for item in read_json(paths.active_settings)["accounts_urls"]],
+                [True, False, False, False, False],
+            )
+            persisted_master = read_json(paths.master_settings)
+            self.assertEqual(persisted_master, master_after)
+            self.assertEqual(
+                [
+                    {key: value for key, value in current.items() if key != "enable"}
+                    for current in persisted_master["accounts_urls"]
+                ],
+                [
+                    {key: value for key, value in current.items() if key != "enable"}
+                    for current in master_before["accounts_urls"]
+                ],
+            )
+
+    def test_all_template_accounts_vetoed_has_specific_error_and_no_write(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_test_paths(Path(directory), 3)
+            service = SettingsTaskService(paths, BackupService(paths))
+            generated = service.create_task("A1", task_name="all-vetoed")
+            master = read_json(paths.master_settings)
+            master["accounts_urls"][0]["enable"] = False
+            write_json_atomic(paths.master_settings, master)
+            active_before = paths.active_settings.read_bytes()
+
+            with self.assertRaisesRegex(
+                SettingsTaskError, "模板内账号均被主档永久停用"
+            ):
+                service.activate_existing_task(generated.task_path)
+
+            self.assertEqual(paths.active_settings.read_bytes(), active_before)
+            self.assertFalse((paths.backups / "BeforeChange").exists())
+
+    def test_activation_veto_result_contains_only_a_numbers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_test_paths(Path(directory), 5)
+            service = SettingsTaskService(paths, BackupService(paths))
+            generated = service.create_task("A1,A3,A5", task_name="veto-list")
+            master = read_json(paths.master_settings)
+            master["accounts_urls"][2]["enable"] = False
+            master["accounts_urls"][4]["enable"] = False
+            write_json_atomic(paths.master_settings, master)
+
+            result = service.activate_existing_task(generated.task_path)
+
+            self.assertEqual(result.vetoed_numbers, (3, 5))
+            self.assertTrue(all(isinstance(number, int) for number in result.vetoed_numbers))
+
+    def test_new_task_filters_master_tombstones_before_template_and_activation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_test_paths(Path(directory), 3)
+            service = SettingsTaskService(paths, BackupService(paths))
+
+            result = service.create_task("A1,A2", task_name="and-rule", activate=True)
+
+            self.assertEqual(result.preview.selection.numbers, (1,))
+            template = read_json(result.task_path)
+            active = read_json(paths.active_settings)
+            self.assertEqual(
+                [item["enable"] for item in template["accounts_urls"]],
+                [True, False, False],
+            )
+            self.assertEqual(
+                [item["enable"] for item in active["accounts_urls"]],
+                [True, False, False],
+            )
+
+    def test_new_task_rejects_selection_containing_only_master_tombstones(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_test_paths(Path(directory), 3)
+            service = SettingsTaskService(paths, BackupService(paths))
+
+            with self.assertRaisesRegex(SettingsTaskError, "所选账号均被主档永久停用"):
+                service.create_task("A2", task_name="blocked")
+
+            self.assertFalse((paths.tasks / "blocked.json").exists())
 
 
 if __name__ == "__main__":

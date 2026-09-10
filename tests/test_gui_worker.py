@@ -20,6 +20,7 @@ else:
     from douk_manager.background import (
         BackgroundTaskCoordinator,
         CancellationToken,
+        ClosePolicy,
         TaskRecord,
         TaskSpec,
         TaskState,
@@ -333,6 +334,7 @@ class ActionWorkerTests(unittest.TestCase):
         window._diagnostic_widgets = []
         window.coordinator = BackgroundTaskCoordinator(window)
         window._close_pending = False
+        window._close_notice_active = False
         window._append_info = Mock()
         window._start_next_queue_item = Mock()
         window._run = lambda action, _output=None: action()
@@ -1028,6 +1030,91 @@ class ActionWorkerTests(unittest.TestCase):
 
         self.assertEqual(close_attempts, ["close"])
         self.assertFalse(window._close_pending)
+        window.deleteLater()
+
+    def test_coordinator_idle_waits_for_shutdown_notice_acknowledgement(self) -> None:
+        window = self._window_harness()
+        controller = ManagerController.__new__(ManagerController)
+        controller.startup_state = StartupState.CLOSING
+        window.controller = controller
+        window.coordinator = BackgroundTaskCoordinator(window)
+        self.assertTrue(window.coordinator.begin_closing())
+        window._close_pending = True
+        window._close_notice_active = True
+        close_attempts: list[str] = []
+        window.close = lambda: close_attempts.append("close")
+
+        window._on_background_tasks_idle()
+        self.app.processEvents()
+
+        self.assertEqual(close_attempts, [])
+        self.assertTrue(window._close_pending)
+        window.deleteLater()
+
+    def test_close_acknowledgement_retries_after_task_settles_during_notice(self) -> None:
+        window = self._window_harness()
+        window.queue_current = None
+        window._download_summary_binding = None
+        window.background_thread = None
+        controller = ManagerController.__new__(ManagerController)
+        controller.startup_state = StartupState.READY
+        controller.engine = SimpleNamespace(current=None)
+        controller.collector = SimpleNamespace(process=None)
+        controller.stop_collector = Mock()
+        window.controller = controller
+        window._apply_action_gate = Mock()
+        coordinator = BackgroundTaskCoordinator(window)
+        token = CancellationToken()
+        record = TaskRecord(
+            task_id="account-audit-task",
+            spec=TaskSpec(
+                task_type="account_audit_scan",
+                display_name="扫描账号健康审计",
+                cancellable=True,
+                close_policy=ClosePolicy.CANCEL,
+            ),
+            generation=1,
+            token=token,
+            thread=None,
+            worker=None,
+            state=TaskState.RUNNING,
+        )
+        coordinator._records[record.task_id] = record
+        coordinator._idle_emitted = False
+        window.coordinator = coordinator
+        close_attempts: list[str] = []
+        window.close = lambda: close_attempts.append("close")
+        event = SimpleNamespace(ignore=Mock(), accept=Mock())
+
+        def settle_during_notice(*_args: object) -> None:
+            self.assertTrue(window._close_notice_active)
+            coordinator._records.clear()
+            window._on_background_tasks_idle()
+            self.assertEqual(close_attempts, [])
+
+        with (
+            patch.object(
+                gui_module.QMessageBox,
+                "information",
+                side_effect=settle_during_notice,
+            ) as information,
+            patch.object(
+                gui_module.QTimer,
+                "singleShot",
+                side_effect=lambda _delay, callback: callback(),
+            ),
+        ):
+            MainWindow.closeEvent(window, event)
+
+        self.assertTrue(token.is_cancelled())
+        self.assertFalse(window._close_notice_active)
+        self.assertEqual(close_attempts, ["close"])
+        information.assert_called_once()
+        message = " ".join(str(value) for value in information.call_args.args[1:])
+        self.assertIn("请阅读并确认本提示", message)
+        event.ignore.assert_called_once_with()
+        event.accept.assert_not_called()
+        controller.stop_collector.assert_not_called()
         window.deleteLater()
 
     def test_late_startup_result_after_closing_cannot_mutate_gui(self) -> None:

@@ -4,12 +4,11 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
+from types import MappingProxyType
+from typing import Mapping
 
-from douk_manager.core.download_summary import AccountStatus
-
-if TYPE_CHECKING:
-    from douk_manager.operation import OperationContext
+from douk_manager.core.download_summary import AccountStatus, NativeLogSegment
+from douk_manager.operation import OperationContext, OperationProgress
 
 
 class ResultHistoryError(RuntimeError):
@@ -36,6 +35,7 @@ class DownloadTaskHistory:
     reliable: bool
     account_rows: tuple[AccountHistoryRow, ...]
     details_complete: bool
+    native_log_segments: tuple[NativeLogSegment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -43,6 +43,16 @@ class ResultPageSnapshot:
     runs: tuple[DownloadTaskHistory, ...]
     rows: tuple[AccountHistoryRow, ...]
     incomplete_old_runs: int
+
+
+@dataclass(frozen=True)
+class AccountAuditHistorySnapshot:
+    runs_scanned: int
+    oldest_run: datetime | None
+    newest_run: datetime | None
+    rows_by_number: Mapping[int, tuple[AccountHistoryRow, ...]]
+    excluded_old_rows: int
+    runs: tuple[DownloadTaskHistory, ...]
 
 
 @dataclass(frozen=True)
@@ -80,6 +90,9 @@ _DATE_IN_FILENAME = re.compile(
     re.IGNORECASE,
 )
 _A_TOKEN = re.compile(r"A(\d+)(?:-A(\d+))?", re.IGNORECASE)
+_NATIVE_SEGMENT_LINE = re.compile(
+    r"^日志区间：(.*)；偏移=(\d+)；长度=(\d+)$"
+)
 _STATUS_LINES: tuple[tuple[str, AccountStatus | str], ...] = (
     ("有新作品下载", AccountStatus.DOWNLOADED),
     ("作品均被引擎跳过", AccountStatus.ALL_SKIPPED),
@@ -109,12 +122,14 @@ class ResultHistoryService:
         *,
         limit: int | None = 500,
         context: OperationContext | None = None,
+        progress_phase: str | None = None,
     ) -> tuple[DownloadTaskHistory, ...]:
         if limit is not None and limit < 1:
             return ()
         if context is not None:
             context.raise_if_cancelled()
-        self.log_directory.mkdir(parents=True, exist_ok=True)
+        if not self.log_directory.is_dir():
+            return ()
         paths_with_mtime: list[tuple[int, Path]] = []
         for path in self.log_directory.glob("DownloadTask_*.log"):
             try:
@@ -124,17 +139,127 @@ class ResultHistoryService:
         ordered_paths = [path for _, path in sorted(paths_with_mtime, reverse=True)]
         paths = ordered_paths if limit is None else ordered_paths[:limit]
         result: list[DownloadTaskHistory] = []
-        for path in paths:
+        for index, path in enumerate(paths, start=1):
             if context is not None:
                 context.raise_if_cancelled()
             try:
                 parsed = self.parse(path)
             except (OSError, UnicodeError, ResultHistoryError):
-                continue
+                parsed = None
             if parsed is not None:
                 result.append(parsed)
+            if context is not None and progress_phase is not None:
+                context.report_progress(
+                    OperationProgress(
+                        progress_phase,
+                        f"已扫描 {index} / {len(paths)} 轮",
+                        index,
+                        len(paths),
+                    )
+                )
         result.sort(key=lambda item: item.ended_at, reverse=True)
         return tuple(result)
+
+    def account_rows_by_number(
+        self,
+        *,
+        numbers: tuple[int, ...] | None = None,
+        evidence_since: datetime | None = None,
+        context: OperationContext | None = None,
+    ) -> dict[int, tuple[AccountHistoryRow, ...]]:
+        """Return audit evidence grouped by stable array position.
+
+        Rows are chronological within each account.  Missing task rows are not
+        invented: an account absent from a run is unselected or unknown and
+        therefore neither increments nor clears any status streak.  A caller-
+        supplied evidence boundary conservatively excludes older rows without
+        trying to infer historical array-position changes.
+        """
+
+        return dict(
+            self.account_audit_snapshot(
+                numbers=numbers,
+                evidence_since=evidence_since,
+                context=context,
+            ).rows_by_number
+        )
+
+    def account_audit_snapshot(
+        self,
+        *,
+        numbers: tuple[int, ...] | None = None,
+        evidence_since: datetime | None = None,
+        context: OperationContext | None = None,
+    ) -> AccountAuditHistorySnapshot:
+        """Scan history once and return immutable audit-oriented metadata."""
+
+        requested = None if numbers is None else tuple(sorted(set(numbers)))
+        requested_set = None if requested is None else set(requested)
+        grouped: dict[int, list[AccountHistoryRow]] = (
+            {} if requested is None else {number: [] for number in requested}
+        )
+        excluded_old_rows = 0
+        runs = self.list_runs(
+            limit=None,
+            context=context,
+            progress_phase="account_audit_scan",
+        )
+        for index, run in enumerate(runs, start=1):
+            if context is not None:
+                context.raise_if_cancelled()
+            for row in run.account_rows:
+                if requested_set is not None and row.a_number not in requested_set:
+                    continue
+                if evidence_since is not None and row.ended_at < evidence_since:
+                    excluded_old_rows += 1
+                    continue
+                grouped.setdefault(row.a_number, []).append(row)
+            if context is not None:
+                context.report_progress(
+                    OperationProgress(
+                        "account_audit_scan",
+                        f"已汇总 {index} / {len(runs)} 轮",
+                        index,
+                        len(runs),
+                    )
+                )
+        frozen_rows = {
+            number: tuple(
+                sorted(rows, key=lambda row: (row.ended_at, row.task_log.name))
+            )
+            for number, rows in sorted(grouped.items())
+        }
+        ended_times = tuple(run.ended_at for run in runs)
+        return AccountAuditHistorySnapshot(
+            runs_scanned=len(runs),
+            oldest_run=min(ended_times, default=None),
+            newest_run=max(ended_times, default=None),
+            rows_by_number=MappingProxyType(frozen_rows),
+            excluded_old_rows=excluded_old_rows,
+            runs=runs,
+        )
+
+    def account_audit_fingerprint(
+        self,
+        *,
+        context: OperationContext | None = None,
+    ) -> tuple[tuple[str, int, int], ...]:
+        """Return a metadata-only cache key for the current task-log snapshot."""
+
+        if context is not None:
+            context.raise_if_cancelled()
+        if not self.log_directory.is_dir():
+            return ()
+        entries: list[tuple[str, int, int]] = []
+        for path in self.log_directory.glob("DownloadTask_*.log"):
+            if context is not None:
+                context.raise_if_cancelled()
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            entries.append((path.name, stat.st_mtime_ns, stat.st_size))
+        return tuple(sorted(entries))
 
     def page_snapshot(
         self,
@@ -273,6 +398,7 @@ class ResultHistoryService:
         details_complete_marker = False
         number_map: dict[int, AccountStatus | str] = {}
         anomaly_numbers: set[int] = set()
+        native_log_segments: list[NativeLogSegment] = []
         in_summary = False
 
         with path.open("r", encoding="utf-8-sig", errors="strict") as handle:
@@ -286,6 +412,7 @@ class ResultHistoryService:
                     in_summary = True
                     number_map.clear()
                     anomaly_numbers.clear()
+                    native_log_segments.clear()
                     reliable = False
                     explicit_unreliable_marker = False
                     complete = None
@@ -312,6 +439,16 @@ class ResultHistoryService:
                 elif line.startswith("附加状态：异常后完成（"):
                     anomaly_numbers.update(_numbers_from_line(line))
                 else:
+                    segment_match = _NATIVE_SEGMENT_LINE.match(line)
+                    if segment_match:
+                        native_log_segments.append(
+                            NativeLogSegment(
+                                Path(segment_match.group(1)),
+                                int(segment_match.group(2)),
+                                int(segment_match.group(3)),
+                            )
+                        )
+                        continue
                     for label, status in _STATUS_LINES:
                         if line.startswith(f"{label}（"):
                             for number in _numbers_from_line(line):
@@ -342,6 +479,7 @@ class ResultHistoryService:
             reliable=reliable,
             account_rows=rows,
             details_complete=details_complete_marker,
+            native_log_segments=tuple(native_log_segments),
         )
 
 

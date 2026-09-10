@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
+import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -27,6 +30,7 @@ class EnginePauseTests(unittest.TestCase):
             content = wrapper.read_text(encoding="ascii")
             self.assertIn(f'call "{paths.engine_exe}"', content)
             self.assertIn('set "DOUK_ENGINE_EXIT=%ERRORLEVEL%"', content)
+            self.assertIn(f'>"{marker}" echo %DOUK_ENGINE_EXIT%', content)
             self.assertIn('set "DOUK_RESULT_REVIEW=0"', content)
             self.assertIn(
                 'if exist "{}" set /p DOUK_RESULT_REVIEW=<"{}"'.format(
@@ -37,6 +41,43 @@ class EnginePauseTests(unittest.TestCase):
             self.assertIn('if "%DOUK_RESULT_REVIEW%"=="1" (', content)
             self.assertIn("pause >nul", content)
             self.assertIn("exit /b %DOUK_ENGINE_EXIT%", content)
+
+    @unittest.skipUnless(os.name == "nt", "Windows command wrapper regression")
+    def test_pause_wrapper_writes_numeric_marker_and_preserves_exit_code(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_test_paths(Path(directory), 2)
+            for exit_code in (0, 1):
+                with self.subTest(exit_code=exit_code):
+                    engine = paths.engine_root / f"exit-{exit_code}.cmd"
+                    engine.write_text(
+                        f"@echo off\r\nexit /b {exit_code}\r\n",
+                        encoding="ascii",
+                        newline="",
+                    )
+                    test_paths = replace(paths, engine_exe=engine)
+                    service = EngineService(
+                        test_paths,
+                        AppConfig(engine_exe=str(engine)),
+                        BackupService(test_paths),
+                    )
+                    marker = paths.data / "RunWrappers" / f"download-{exit_code}.exit"
+                    control = paths.data / "RunWrappers" / f"download-{exit_code}.review"
+                    service._write_result_review_control(control, False)
+                    wrapper = service._write_pause_wrapper(marker, control)
+
+                    completed = subprocess.run(
+                        ["cmd.exe", "/d", "/c", str(wrapper)],
+                        cwd=paths.engine_root,
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                        check=False,
+                    )
+
+                    self.assertEqual(completed.returncode, exit_code)
+                    self.assertEqual(
+                        marker.read_text(encoding="ascii").strip(), str(exit_code)
+                    )
 
     def test_result_review_control_updates_run_and_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

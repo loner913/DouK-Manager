@@ -2,6 +2,38 @@
 
 本文记录每个开发版本新增了什么、修复了什么，以及版本之间的继承关系。详细验收和安全边界请继续查看各版本的 `RELEASE-NOTES`。
 
+## v0.1.6 — 账号、日志与引擎安全（2026-09-09）
+
+状态：阶段 D 验收完成；E-0/E-0.1 发布准备完成。V0.1.6 已通过
+`feature/v0.1.6-final` 和 PR #9 进入 `develop` 集成流程。本流程不创建或移动 Tag、
+不创建 GitHub Release，`main` 保持不变。
+
+功能冻结基点：`c7b90721c3c171193545d80fb9dc6aa4b7305f4d`（历史功能冻结记录，不是当前分支 HEAD）。
+
+### 功能范围
+
+- 完成 35 项 `mark` 归类修复，保留原始值并拒绝歧义别名；
+- 增加下载引擎安全回退、备份点预检和失败恢复；
+- 增加日志安全统计、全量脱敏和诊断导出边界；
+- 增加账号健康审计、重复/冲突复核、永久停用和生命周期管理。
+
+### 验收与构建准备
+
+- 阶段 D：D-0 至 D-25 最终候选记录为 PASS；
+- 完整回归：608 total / 606 passed / 2 skipped / 0 failed / 0 errors；
+- 构建工作流写入 `Version: 0.1.6`，生成带 `v0.1.6` 的 Artifact，并同时提供 ZIP 与 SHA-256 校验文件；
+- PR 阶段只运行适用于 pull request 的 `Test`；合并后的 `develop` push 才运行正式 Windows 便携版构建；
+- 既有 v0.1.5 历史记录、Tag、Release 和功能提交不改写。
+
+设计记录：[V0.1.6 总索引](docs/designs/v0.1.6/README.md) ·
+[mark 归类](docs/designs/v0.1.6/01-mark-classification.md) ·
+[引擎回退](docs/designs/v0.1.6/02-engine-rollback.md) ·
+[账号健康审计](docs/designs/v0.1.6/03-account-health-audit.md) ·
+[日志统计与诊断](docs/designs/v0.1.6/04-log-statistics-and-diagnostics.md)。
+
+详细发布说明：[RELEASE-NOTES-v0.1.6.md](RELEASE-NOTES-v0.1.6.md)。V0.1.4 和 V0.1.5
+缺少的正式设计文档本次不追溯编造，作为后续独立文档债处理。
+
 ## v0.1.5 — 后台安全、结果看板与稳定化（2026-08-21）
 
 状态：最终身份基于永久冻结的稳定化 HEAD；本阶段更新最终分支和 `develop` 构建，不创建 Tag 或 GitHub Release，`main` 保持不变。

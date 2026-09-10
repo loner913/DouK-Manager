@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import re
 from codecs import getincrementaldecoder
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Iterator
 
+from douk_manager.core.account_identity import log_identity_tokens
 from douk_manager.core.selector import compact_numbers
 
 
@@ -67,6 +68,7 @@ class AccountOutcome:
     a_number: int
     status: AccountStatus
     completed_with_anomaly: bool = False
+    identity_tokens: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -295,6 +297,7 @@ def _safe_failure_reason(summary: DownloadSummary) -> str:
 class _AccountBlock:
     task_index: int
     mapped: PlannedAccount | None
+    expected_cleaned_mark: str | None = None
     logged_a_number: int | None = None
     logged_mark_mismatch: bool = False
     filtered_count: int | None = None
@@ -308,6 +311,7 @@ class _AccountBlock:
     anomaly_signal: bool = False
     unrecovered_error: bool = False
     statistics_conflict: bool = False
+    identity_tokens: set[str] = field(default_factory=set)
 
     def set_total(self, category: str, downloaded: bool, value: int) -> None:
         field = ("downloaded_" if downloaded else "skipped_") + category
@@ -395,6 +399,39 @@ _CATEGORY_NAMES = {"视频": "video", "图集": "gallery", "实况": "live"}
 _READ_CHUNK_SIZE = 64 * 1024
 _MAX_BUFFERED_LINE_SIZE = 1024 * 1024
 _UTF8_BOM = b"\xef\xbb\xbf"
+
+
+def _cleaned_mark_alias(mark: str) -> str:
+    """Mirror only the engine transformations observed in account logs.
+
+    The engine removes control characters and presentation selectors, collapses
+    whitespace, and strips outer ASCII full stops before displaying a mark.
+    Other changes (such as an unexpected nickname) remain untrusted.
+    This alias is for comparison only; the frozen mark is never rewritten.
+    """
+
+    text = re.sub(r"[\x00-\x1f\x7f]", "", mark)
+    text = text.replace("\ufe0e", "").replace("\ufe0f", "")
+    return " ".join(text.split()).strip(".")
+
+
+def _unique_cleaned_mark_aliases(
+    planned_accounts: tuple[PlannedAccount, ...],
+) -> dict[int, str]:
+    candidates = [
+        (account, _cleaned_mark_alias(account.mark)) for account in planned_accounts
+    ]
+    owners: dict[str, set[int]] = {}
+    for account, alias in candidates:
+        for value in {account.mark, alias}:
+            owners.setdefault(value, set()).add(account.task_index)
+    return {
+        account.task_index: alias
+        for account, alias in candidates
+        if alias
+        and alias != account.mark
+        and owners[alias] == {account.task_index}
+    }
 
 
 def freeze_planned_accounts(document: dict) -> tuple[PlannedAccount, ...]:
@@ -593,8 +630,11 @@ def parse_download_summary(
     planned_accounts: tuple[PlannedAccount, ...],
     located: LocatedNativeLogs,
     exit_code: int | None,
+    *,
+    context=None,
 ) -> DownloadSummary:
     plan_by_index = {account.task_index: account for account in planned_accounts}
+    cleaned_mark_aliases = _unique_cleaned_mark_aliases(planned_accounts)
     reasons: list[str] = []
     started_outcomes: list[AccountOutcome] = []
     started_indices: set[int] = set()
@@ -677,11 +717,19 @@ def parse_download_summary(
                 mapped.a_number,
                 status,
                 completed_with_anomaly,
+                tuple(sorted(block.identity_tokens)),
             )
         )
 
     try:
-        for line in _iter_located_lines(located.segments):
+        lines = (
+            _iter_located_lines(located.segments)
+            if context is None
+            else _iter_located_lines(located.segments, context=context)
+        )
+        for line in lines:
+            if context is not None:
+                context.raise_if_cancelled()
             start_match = _START_RE.search(line)
             if start_match:
                 if current is not None:
@@ -700,7 +748,11 @@ def parse_download_summary(
                     _add_reason(reasons, f"日志任务序号 {task_index} 顺序异常。")
                 last_event_index = max(last_event_index, task_index)
                 observed_started_indices.add(task_index)
-                current = _AccountBlock(task_index, plan_by_index.get(task_index))
+                current = _AccountBlock(
+                    task_index,
+                    plan_by_index.get(task_index),
+                    expected_cleaned_mark=cleaned_mark_aliases.get(task_index),
+                )
                 continue
 
             if "提取 sec_user_id 失败，错误配置：" in line:
@@ -837,10 +889,14 @@ def _consume_account_line(
     block: _AccountBlock,
     line: str,
 ) -> None:
+    block.identity_tokens.update(log_identity_tokens(line))
     mark_match = _LOGGED_MARK_RE.search(line)
     if mark_match:
         logged_mark = mark_match.group(1).strip()
-        if block.mapped is not None and logged_mark == block.mapped.mark:
+        if block.mapped is not None and (
+            logged_mark == block.mapped.mark
+            or logged_mark == block.expected_cleaned_mark
+        ):
             block.logged_a_number = block.mapped.a_number
         else:
             block.logged_mark_mismatch = True
@@ -900,12 +956,19 @@ def _match_pre_start_mark(
     return exact[0] if len(exact) == 1 else None
 
 
-def _iter_located_lines(segments: tuple[NativeLogSegment, ...]) -> Iterator[str]:
+def _iter_located_lines(
+    segments: tuple[NativeLogSegment, ...], *, context=None
+) -> Iterator[str]:
     for segment in segments:
-        yield from _iter_segment_lines(segment)
+        if context is not None:
+            context.raise_if_cancelled()
+        if context is None:
+            yield from _iter_segment_lines(segment)
+        else:
+            yield from _iter_segment_lines(segment, context=context)
 
 
-def _iter_segment_lines(segment: NativeLogSegment) -> Iterator[str]:
+def _iter_segment_lines(segment: NativeLogSegment, *, context=None) -> Iterator[str]:
     with segment.path.open("rb") as handle:
         start = max(segment.offset, 0)
         remaining = max(segment.length, 0)
@@ -925,6 +988,8 @@ def _iter_segment_lines(segment: NativeLogSegment) -> Iterator[str]:
         handle.seek(start)
         if discard_partial:
             while remaining > 0:
+                if context is not None:
+                    context.raise_if_cancelled()
                 chunk = handle.read(min(_READ_CHUNK_SIZE, remaining))
                 if not chunk:
                     raise _LogReadError("原生日志在声明片段结束前提前结束。")
@@ -939,6 +1004,8 @@ def _iter_segment_lines(segment: NativeLogSegment) -> Iterator[str]:
         decoder = getincrementaldecoder("utf-8-sig")(errors="replace")
         buffer = ""
         while remaining > 0:
+            if context is not None:
+                context.raise_if_cancelled()
             chunk = handle.read(min(_READ_CHUNK_SIZE, remaining))
             if not chunk:
                 raise _LogReadError("原生日志在声明片段结束前提前结束。")

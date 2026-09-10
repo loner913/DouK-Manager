@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
+from html import escape
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
@@ -20,7 +21,7 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut
+from PySide6.QtGui import QColor, QDesktopServices, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -33,14 +34,17 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QGroupBox,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QLayout,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QTableView,
     QTableWidget,
@@ -51,7 +55,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from douk_manager.controller import ManagerController
+from douk_manager.controller import ControllerError, ManagerController
 from douk_manager.background import (
     BackgroundTaskCoordinator,
     ClosePolicy,
@@ -61,7 +65,36 @@ from douk_manager.background import (
     TaskState,
 )
 from douk_manager.core.download_summary import AccountStatus, format_summary_for_ui
+from douk_manager.core.account_audit import (
+    AccountAuditEntry,
+    AccountAuditReport,
+    AuditApplyResult,
+    AuditDecision,
+    Disposition,
+    IdentityState,
+    PrivacyState,
+    ReachabilityState,
+    Suggestion,
+)
 from douk_manager.core.engine import ENGINE_MODE_MONITOR, assess_process_exit
+from douk_manager.core.engine_update import (
+    EngineRollbackPoint,
+    RollbackApplyGate,
+    RollbackIntegrity,
+    rollback_can_apply,
+)
+from douk_manager.core.log_stats import (
+    ENDPOINTS,
+    FIELD_PRESENCE,
+    KEYWORDS,
+    LogStats,
+    SegmentSelectionStatus,
+    located_reason_zh,
+    log_stats_label_zh,
+    normalise_located_reason,
+    select_dashboard_segments,
+    truncate_reason_zh,
+)
 from douk_manager.core.power import request_normal_shutdown
 from douk_manager.core.result_history import ResultPageSnapshot
 from douk_manager.core.result_dashboard import (
@@ -71,7 +104,8 @@ from douk_manager.core.result_dashboard import (
     DashboardTaskIndexEntry,
     ResultDashboardSnapshot,
 )
-from douk_manager.core.settings_tasks import EarliestRule
+from douk_manager.core.selector import compact_numbers
+from douk_manager.core.settings_tasks import ActivatedTask, EarliestRule
 from douk_manager.core.task_order import move_to_index
 from douk_manager.ui_messages import format_information
 from douk_manager.ui_state import (
@@ -277,6 +311,259 @@ def _dashboard_account_needs_attention(account: DashboardAccountRow) -> bool:
     )
 
 
+def _audit_identity_label(value: IdentityState) -> str:
+    return {
+        IdentityState.CONFIRMED: "已确认",
+        IdentityState.CONFLICT: "冲突",
+        IdentityState.DUPLICATE: "重复",
+        IdentityState.UNRESOLVED: "未确认",
+    }[value]
+
+
+def _audit_reachability_label(value: ReachabilityState) -> str:
+    return {
+        ReachabilityState.REACHABLE: "可达",
+        ReachabilityState.UNAVAILABLE: "不可用",
+        ReachabilityState.REQUEST_FAILED: "请求失败，需复核",
+        ReachabilityState.UNKNOWN: "未知",
+    }[value]
+
+
+def _audit_privacy_label(value: PrivacyState) -> str:
+    return {
+        PrivacyState.PUBLIC: "公开",
+        PrivacyState.PRIVATE: "私密",
+        PrivacyState.UNKNOWN: "未知",
+    }[value]
+
+
+def _audit_suggestion_label(value: Suggestion) -> str:
+    return {
+        Suggestion.KEEP: "保持启用",
+        Suggestion.REVIEW: "需复核",
+        Suggestion.SUGGEST_DISABLE: "建议停用",
+        Suggestion.SUGGEST_REENABLE: "建议恢复",
+        Suggestion.NO_EVIDENCE: "证据不足",
+    }[value]
+
+
+def _audit_disposition_label(value: Disposition) -> str:
+    return {
+        Disposition.ENABLED: "继续启用",
+        Disposition.PERMANENTLY_DISABLED: "永久停用",
+        Disposition.PENDING_REVIEW: "待复核",
+    }[value]
+
+
+def _log_stats_section_html(
+    title: str,
+    rows: tuple[tuple[str, object], ...],
+    note: str,
+    *,
+    width_percent: int,
+) -> str:
+    row_html = "".join(
+        (
+            "<tr>"
+            '<td style="font-size:15px; font-weight:600; color:#374151; '
+            f'padding:4px 12px 4px 0;">{escape(label)}</td>'
+            '<td align="right" style="font-size:16px; font-weight:600; '
+            f'color:#111827; padding:4px 0;">{escape(str(value))}</td>'
+            "</tr>"
+        )
+        for label, value in rows
+    )
+    note_html = (
+        '<div style="font-size:12px; color:#64748b; margin-top:8px;">'
+        f"{escape(note)}</div>"
+        if note
+        else ""
+    )
+    return (
+        f'<td data-log-stats-section="true" width="{width_percent}%" '
+        'valign="top" style="padding:8px 14px; border-right:1px solid #d1d5db;">'
+        '<div style="font-size:18px; font-weight:700; color:#1f2937; '
+        f'margin-bottom:8px;">{escape(title)}</div>'
+        f'<table width="100%" cellspacing="0" cellpadding="0">{row_html}</table>'
+        f"{note_html}</td>"
+    )
+
+
+def _render_log_stats_html(
+    stats: LogStats, *, located_reason: str, columns: int
+) -> str:
+    reason = located_reason_zh(located_reason)
+    truncate_reason = truncate_reason_zh(stats.truncate_reason)
+    http_rows = tuple(
+        (f"HTTP {code}", count) for code, count in sorted(stats.http.counts.items())
+    )
+    abnormal_rows = tuple(
+        (f"异常 {code}", count)
+        for code, count in sorted(stats.abnormal.counts.items())
+    ) or (("无异常状态码", 0),)
+    sections = (
+        (
+            "运行概览",
+            (
+                (log_stats_label_zh("schema"), stats.schema),
+                (log_stats_label_zh("lines"), stats.lines),
+                (log_stats_label_zh("bytes_analysed"), stats.bytes_analysed),
+                (
+                    log_stats_label_zh("window"),
+                    f"{stats.window_start or '无'} -> {stats.window_end or '无'}",
+                ),
+                (log_stats_label_zh("active_minutes"), stats.active_minutes),
+                (log_stats_label_zh("log_location_reason"), reason),
+                (log_stats_label_zh("truncated"), "是" if stats.truncated else "否"),
+                (log_stats_label_zh("truncate_reason"), truncate_reason),
+            ),
+            "",
+        ),
+        (
+            "日志与响应",
+            tuple(
+                (log_stats_label_zh(level), stats.levels.get(level, 0))
+                for level in ("INFO", "WARNING", "ERROR", "DEBUG", "CRITICAL")
+            )
+            + http_rows
+            + (
+                ("HTTP 响应总数", stats.http.total),
+                ("HTTP 403 比例", f"{stats.http_403_rate:.4%}"),
+            )
+            + abnormal_rows,
+            "异常路径状态码（不在上面那张响应码表里）",
+        ),
+        (
+            "请求端点与失败",
+            tuple(
+                (endpoint, stats.endpoints.get(endpoint, 0)) for endpoint in ENDPOINTS
+            )
+            + (
+                (log_stats_label_zh("request_failed"), stats.request_failed),
+                (
+                    log_stats_label_zh("private_account"),
+                    stats.failures.private_account,
+                ),
+                (
+                    log_stats_label_zh("resp_code_abnormal"),
+                    stats.failures.resp_code_abnormal,
+                ),
+                (
+                    log_stats_label_zh("download_interrupted"),
+                    stats.failures.download_interrupted,
+                ),
+                (
+                    log_stats_label_zh("url_parse_failed"),
+                    stats.failures.url_parse_failed,
+                ),
+                (log_stats_label_zh("unavailable"), 0),
+                (log_stats_label_zh("unknown"), 0),
+            ),
+            "本版本不从日志推断账号是否已注销或被封。",
+        ),
+        (
+            "签名与参数",
+            tuple(
+                (field, stats.signatures.presence.get(field, 0))
+                for field in FIELD_PRESENCE
+            )
+            + (
+                (
+                    log_stats_label_zh("request_lines"),
+                    stats.signatures.request_lines,
+                ),
+                (
+                    log_stats_label_zh("signature_coverage"),
+                    f"{stats.signature_coverage:.4%}",
+                ),
+            ),
+            "仅显示字段出现次数，不显示参数值。",
+        ),
+        (
+            "业务事件",
+            tuple(
+                (log_stats_label_zh(name), stats.keywords.get(name, 0))
+                for name in KEYWORDS
+            ),
+            "只显示固定业务关键词的聚合次数。",
+        ),
+    )
+    column_count = max(1, min(int(columns), len(sections)))
+    width_percent = 100 // column_count
+    table_rows: list[str] = []
+    for offset in range(0, len(sections), column_count):
+        row_sections = sections[offset : offset + column_count]
+        cells = [
+            _log_stats_section_html(
+                title, rows, note, width_percent=width_percent
+            )
+            for title, rows, note in row_sections
+        ]
+        cells.extend(
+            f'<td width="{width_percent}%"></td>'
+            for _unused in range(column_count - len(row_sections))
+        )
+        table_rows.append(f'<tr>{"".join(cells)}</tr>')
+    return (
+        '<html><body style="margin:0; color:#111827;">'
+        '<table width="100%" cellspacing="0" cellpadding="0">'
+        f'{"".join(table_rows)}</table></body></html>'
+    )
+
+
+class LogStatsOutput(QTextEdit):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._stats: LogStats | None = None
+        self._located_reason = ""
+        self._rendered_columns = 0
+
+    @staticmethod
+    def _column_count_for_width(width: int) -> int:
+        if width >= 1700:
+            return 5
+        if width >= 1320:
+            return 4
+        if width >= 920:
+            return 3
+        if width >= 620:
+            return 2
+        return 1
+
+    def setPlainText(self, text: str) -> None:  # noqa: N802
+        self._stats = None
+        self._rendered_columns = 0
+        super().setPlainText(text)
+
+    def show_stats(self, stats: LogStats, *, located_reason: str = "") -> None:
+        self._stats = stats
+        self._located_reason = normalise_located_reason(located_reason)
+        self._render_stats(force=True, reset_scroll=True)
+
+    def _render_stats(self, *, force: bool = False, reset_scroll: bool = False) -> None:
+        if self._stats is None:
+            return
+        columns = self._column_count_for_width(self.viewport().width())
+        if not force and columns == self._rendered_columns:
+            return
+        scroll_value = 0 if reset_scroll else self.verticalScrollBar().value()
+        self._rendered_columns = columns
+        super().setHtml(
+            _render_log_stats_html(
+                self._stats,
+                located_reason=self._located_reason,
+                columns=columns,
+            )
+        )
+        self.verticalScrollBar().setValue(
+            min(scroll_value, self.verticalScrollBar().maximum())
+        )
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._render_stats()
+
+
 class DashboardAccountTableModel(QAbstractTableModel):
     HEADERS = ("账号", "主状态", "异常附加", "证据来源")
 
@@ -379,6 +666,129 @@ class DashboardAccountTableModel(QAbstractTableModel):
         return super().headerData(section, orientation, role)
 
 
+class AccountAuditTableModel(QAbstractTableModel):
+    HEADERS = ("A编号", "身份", "可达", "隐私", "主档", "建议", "我的决定", "理由")
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._entries: tuple[AccountAuditEntry, ...] = ()
+        self._visible_entries: tuple[AccountAuditEntry, ...] = ()
+        self._filter_mode = "all"
+        self._account_number: int | None = None
+        self._decisions: dict[int, Disposition] = {}
+
+    @property
+    def total_count(self) -> int:
+        return len(self._entries)
+
+    @property
+    def visible_count(self) -> int:
+        return len(self._visible_entries)
+
+    def set_report(self, report: AccountAuditReport | None) -> None:
+        self.beginResetModel()
+        self._entries = () if report is None else report.entries
+        self._rebuild_visible_entries()
+        self.endResetModel()
+
+    def set_decisions(self, decisions: dict[int, Disposition]) -> None:
+        self.beginResetModel()
+        self._decisions = dict(decisions)
+        self._rebuild_visible_entries()
+        self.endResetModel()
+
+    def set_filter(self, mode: str, account_text: str) -> None:
+        number = self._parse_account_number(account_text)
+        if mode == self._filter_mode and number == self._account_number:
+            return
+        self.beginResetModel()
+        self._filter_mode = mode
+        self._account_number = number
+        self._rebuild_visible_entries()
+        self.endResetModel()
+
+    @staticmethod
+    def _parse_account_number(text: str) -> int | None:
+        value = text.strip()
+        if value[:1].casefold() == "a":
+            value = value[1:].strip()
+        if not value:
+            return None
+        return int(value) if value.isdecimal() else -1
+
+    def _rebuild_visible_entries(self) -> None:
+        self._visible_entries = tuple(
+            entry for entry in self._entries if self._matches(entry)
+        )
+
+    def _matches(self, entry: AccountAuditEntry) -> bool:
+        if self._account_number is not None and entry.a_number != self._account_number:
+            return False
+        if self._filter_mode == "all":
+            return True
+        if self._filter_mode == "suggest_disable":
+            return entry.suggestion is Suggestion.SUGGEST_DISABLE
+        if self._filter_mode == "suggest_reenable":
+            return entry.suggestion is Suggestion.SUGGEST_REENABLE
+        if self._filter_mode == "review":
+            return entry.suggestion is Suggestion.REVIEW
+        if self._filter_mode == "duplicate":
+            return entry.identity is IdentityState.DUPLICATE
+        if self._filter_mode == "disabled":
+            return not entry.master_enable
+        return False
+
+    def entry_at(self, row: int) -> AccountAuditEntry | None:
+        if row < 0 or row >= len(self._visible_entries):
+            return None
+        return self._visible_entries[row]
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._visible_entries)
+
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self.HEADERS)
+
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> object:
+        if not index.isValid():
+            return None
+        entry = self._visible_entries[index.row()]
+        if role == Qt.ItemDataRole.UserRole:
+            return entry.a_number
+        if role == Qt.ItemDataRole.ToolTipRole:
+            return entry.suggestion_reason
+        if role != Qt.ItemDataRole.DisplayRole:
+            return None
+        decision = self._decisions.get(entry.a_number, entry.disposition)
+        values = (
+            f"A{entry.a_number}",
+            _audit_identity_label(entry.identity),
+            _audit_reachability_label(entry.reachability),
+            _audit_privacy_label(entry.privacy),
+            "启用" if entry.master_enable else "停用",
+            _audit_suggestion_label(entry.suggestion),
+            _audit_disposition_label(decision),
+            entry.suggestion_reason,
+        )
+        return values[index.column()]
+
+    def headerData(
+        self,
+        section: int,
+        orientation: Qt.Orientation,
+        role: int = Qt.ItemDataRole.DisplayRole,
+    ) -> object:
+        if role == Qt.ItemDataRole.DisplayRole and orientation == Qt.Orientation.Horizontal:
+            return self.HEADERS[section]
+        if (
+            role == Qt.ItemDataRole.TextAlignmentRole
+            and orientation == Qt.Orientation.Horizontal
+            and 0 <= section < 7
+        ):
+            return Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        return super().headerData(section, orientation, role)
+
+
 class ActionWorker(QObject):
     done = Signal()
 
@@ -474,7 +884,30 @@ class TaskTemplateList(QListWidget):
             )
 
 
+class EngineRollbackTable(QTableWidget):
+    """Clear the rollback target once keyboard focus leaves the table."""
+
+    def focusOutEvent(self, event) -> None:  # noqa: N802
+        super().focusOutEvent(event)
+        QTimer.singleShot(0, self._clear_selection_if_unfocused)
+
+    def _clear_selection_if_unfocused(self) -> None:
+        focus_widget = QApplication.focusWidget()
+        if focus_widget is self or (
+            focus_widget is not None and self.isAncestorOf(focus_widget)
+        ):
+            return
+        if QApplication.mouseButtons() != Qt.MouseButton.NoButton:
+            # Let a click on an action button consume the selected row first.
+            QTimer.singleShot(50, self._clear_selection_if_unfocused)
+            return
+        self.clearSelection()
+        self.setCurrentCell(-1, -1)
+
+
 class MainWindow(QMainWindow):
+    _RESULT_RENDER_BATCH_SIZE = 100
+
     def __init__(self, *, window_state_store: WindowStateStore | None = None) -> None:
         super().__init__()
         self.controller = ManagerController()
@@ -496,11 +929,32 @@ class MainWindow(QMainWindow):
         self._dashboard_user_selected = False
         self._dashboard_syncing_selector = False
         self._dashboard_index_load_pending: bool | None = None
+        self._result_render_rows: tuple[object, ...] = ()
+        self._result_render_cursor = 0
+        self._result_render_runs = 0
+        self._result_render_incomplete_old_runs = 0
+        self._latest_log_stats_run: Any | None = None
+        self._pending_auto_log_stats_run: Any | None = None
+        self._log_stats_result: LogStats | None = None
+        self._log_stats_scope: str | None = None
+        self._log_stats_task_id: str | None = None
+        self._log_stats_export_task_id: str | None = None
+        self._engine_rollback_points: tuple[EngineRollbackPoint, ...] = ()
+        self._engine_rollback_usage_task_id: str | None = None
+        self._engine_rollback_refresh_generation = 0
+        self._engine_rollback_usage_pending = False
+        self._account_audit_report: AccountAuditReport | None = None
+        self._account_audit_decisions: dict[int, Disposition] = {}
+        self._account_audit_task_id: str | None = None
+        self._account_audit_refresh_after_apply = False
+        self._queue_start_waiting_for_log_stats = False
+        self._log_stats_auto_enabled = self._read_log_stats_auto_enabled()
         self._collector_stop_task_id: str | None = None
         self.startup_generation = 0
         self._startup_task_id: str | None = None
         self._startup_result: StartupSafetyResult | None = None
         self._close_pending = False
+        self._close_notice_active = False
         self._safe_widgets: list[QWidget] = []
         self._path_widgets: list[QWidget] = []
         self._diagnostic_widgets: list[QWidget] = []
@@ -530,6 +984,9 @@ class MainWindow(QMainWindow):
         self.result_refresh_timer = QTimer(self)
         self.result_refresh_timer.setSingleShot(True)
         self.result_refresh_timer.timeout.connect(self._refresh_results_if_startup_applied)
+        self.result_render_timer = QTimer(self)
+        self.result_render_timer.setSingleShot(True)
+        self.result_render_timer.timeout.connect(self._render_result_rows_chunk)
         self.startup_recheck_timer = QTimer(self)
         self.startup_recheck_timer.setSingleShot(True)
         self.startup_recheck_timer.timeout.connect(self._run_startup_recheck)
@@ -541,6 +998,29 @@ class MainWindow(QMainWindow):
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self._poll_processes)
         self.poll_timer.start(500)
+
+    def _read_log_stats_auto_enabled(self) -> bool:
+        settings = getattr(self._window_state_store, "_settings", None)
+        if settings is None:
+            return False
+        try:
+            value = settings.value("log_stats/auto_analyse", False)
+        except Exception:
+            return False
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().casefold() in {"1", "true"}
+
+    def _save_log_stats_auto_enabled(self, enabled: bool) -> None:
+        self._log_stats_auto_enabled = bool(enabled)
+        settings = getattr(self._window_state_store, "_settings", None)
+        if settings is None:
+            return
+        try:
+            settings.setValue("log_stats/auto_analyse", self._log_stats_auto_enabled)
+            settings.sync()
+        except Exception as exc:
+            self.controller.logger.warning("日志统计自动分析开关保存失败：%s", exc)
 
     def _mark_safe_widget(self, widget: QWidget) -> QWidget:
         if widget not in self._safe_widgets:
@@ -606,6 +1086,44 @@ class MainWindow(QMainWindow):
             self.dashboard_open_native_button.setEnabled(
                 dashboard_enabled and self.dashboard_native_selector.count() > 0
             )
+        if hasattr(self, "log_stats_group"):
+            self._update_log_stats_current_availability()
+            self._update_log_stats_history_availability()
+            self.log_stats_export_button.setEnabled(
+                dashboard_enabled
+                and self._log_stats_result is not None
+                and self._log_stats_export_task_id is None
+            )
+            self.log_stats_cancel_button.setEnabled(
+                dashboard_enabled
+                and (
+                    self._log_stats_task_id is not None
+                    or self._log_stats_export_task_id is not None
+                )
+            )
+        if hasattr(self, "engine_rollback_table"):
+            self._update_engine_rollback_buttons()
+        if hasattr(self, "account_audit_refresh_button"):
+            audit_ready = state is StartupState.READY
+            scan_active = any(
+                binding.generation_key == "account_audit_scan"
+                for binding in self._background_bindings.values()
+            )
+            apply_active = any(
+                binding.generation_key == "account_audit_apply"
+                for binding in self._background_bindings.values()
+            )
+            self.account_audit_refresh_button.setEnabled(
+                audit_ready and not apply_active
+            )
+            self.account_audit_cancel_button.setEnabled(
+                audit_ready and self._account_audit_task_id is not None
+            )
+            decision_ready = audit_ready and not scan_active and not apply_active
+            self.account_audit_apply_button.setEnabled(decision_ready)
+            self.account_audit_clear_button.setEnabled(decision_ready)
+            for button in self.account_audit_decision_buttons:
+                button.setEnabled(decision_ready)
 
     def begin_startup_check(self) -> bool:
         if self.controller.startup_state is StartupState.CLOSING:
@@ -766,6 +1284,8 @@ class MainWindow(QMainWindow):
     def _on_background_tasks_idle(self) -> None:
         if not self._close_pending:
             return
+        if self._close_notice_active:
+            return
         if not self.coordinator.is_closing:
             return
         if self.controller.startup_state is not StartupState.CLOSING:
@@ -799,6 +1319,9 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(tabs)
         tabs.addTab(self._overview_tab(), "总览")
         tabs.addTab(self._task_tab(), "账号任务")
+        self.account_audit_page = self._account_audit_tab()
+        tabs.addTab(self.account_audit_page, "账号审计")
+        self.audit_tab_index = tabs.indexOf(self.account_audit_page)
         tabs.addTab(self._batch_tab(), "批次生成")
         tabs.addTab(self._queue_tab(), "下载队列")
         tabs.addTab(self._collector_tab(), "账号采集")
@@ -1004,6 +1527,161 @@ class MainWindow(QMainWindow):
         self.task_output = QTextEdit()
         self.task_output.setReadOnly(True)
         layout.addWidget(self.task_output, 1)
+        return page
+
+    def _account_audit_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        controls = QHBoxLayout()
+        self.account_audit_refresh_button = QPushButton("重新审计")
+        self.account_audit_refresh_button.clicked.connect(
+            self._start_account_audit_scan
+        )
+        controls.addWidget(self.account_audit_refresh_button)
+        controls.addWidget(QLabel("连续错误阈值"))
+        self.account_audit_error_threshold = self._spin(1, 100, 5)
+        controls.addWidget(self.account_audit_error_threshold)
+        controls.addWidget(QLabel("最少证据轮次"))
+        self.account_audit_minimum_runs = self._spin(1, 100, 3)
+        controls.addWidget(self.account_audit_minimum_runs)
+        self.account_audit_native_logs = QCheckBox("含原生日志分析（慢）")
+        self.account_audit_native_logs.setChecked(False)
+        self.account_audit_native_logs.setToolTip(
+            "默认关闭。日常查看、筛选和查重时只读取任务汇总，速度更快。\n"
+            "准备永久停用账号，或需要核查 403、私密和异常原因时再勾选；"
+            "开启后会读取历史任务记录的精确原生日志区间，耗时更长。\n"
+            "这不是实时联网检测；分析结果仍只是建议，不会自动修改账号状态。"
+        )
+        controls.addWidget(self.account_audit_native_logs)
+        controls.addStretch()
+        self.account_audit_cancel_button = QPushButton("取消当前审计操作")
+        self.account_audit_cancel_button.setEnabled(False)
+        self.account_audit_cancel_button.clicked.connect(
+            self._cancel_account_audit_task
+        )
+        controls.addWidget(self.account_audit_cancel_button)
+        layout.addLayout(controls)
+
+        self.account_audit_notice = QLabel(
+            "这里的建议不会自动生效。永久停用只在你选择并确认应用后才写入主档。"
+        )
+        self.account_audit_notice.setWordWrap(True)
+        self.account_audit_notice.setStyleSheet(
+            "color:#92400e; background:#fffbeb; padding:6px; border:1px solid #fde68a;"
+        )
+        layout.addWidget(self.account_audit_notice)
+        self.account_audit_summary = QLabel("尚未审计。")
+        self.account_audit_summary.setWordWrap(True)
+        layout.addWidget(self.account_audit_summary)
+        self.account_audit_progress = QLabel("")
+        self.account_audit_progress.setWordWrap(True)
+        layout.addWidget(self.account_audit_progress)
+        self.account_audit_warnings = QLabel("")
+        self.account_audit_warnings.setWordWrap(True)
+        self.account_audit_warnings.setStyleSheet("color:#b45309;")
+        layout.addWidget(self.account_audit_warnings)
+
+        filters = QHBoxLayout()
+        filters.addWidget(QLabel("筛选"))
+        self.account_audit_filter = QComboBox()
+        for label, value in (
+            ("全部", "all"),
+            ("建议停用", "suggest_disable"),
+            ("建议恢复", "suggest_reenable"),
+            ("需复核", "review"),
+            ("重复", "duplicate"),
+            ("已停用", "disabled"),
+        ):
+            self.account_audit_filter.addItem(label, value)
+        self.account_audit_filter.currentIndexChanged.connect(
+            self._apply_account_audit_filter
+        )
+        filters.addWidget(self.account_audit_filter)
+        filters.addWidget(QLabel("查找 A 编号"))
+        self.account_audit_search = QLineEdit()
+        self.account_audit_search.setPlaceholderText("例如 A912")
+        self.account_audit_search.textChanged.connect(
+            self._apply_account_audit_filter
+        )
+        filters.addWidget(self.account_audit_search)
+        filters.addStretch()
+        self.account_audit_visible_count = QLabel("显示 0 / 0")
+        filters.addWidget(self.account_audit_visible_count)
+        layout.addLayout(filters)
+
+        self._account_audit_model = AccountAuditTableModel(page)
+        self.account_audit_table = QTableView()
+        self.account_audit_table.setModel(self._account_audit_model)
+        self.account_audit_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.account_audit_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        self.account_audit_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.account_audit_table.setAlternatingRowColors(True)
+        self.account_audit_table.setSortingEnabled(False)
+        header = self.account_audit_table.horizontalHeader()
+        header.setStretchLastSection(False)
+        for column in range(7):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
+        self.account_audit_table.setColumnWidth(2, 48)
+        self.account_audit_table.selectionModel().selectionChanged.connect(
+            self._show_account_audit_selection_details
+        )
+        layout.addWidget(self.account_audit_table, 1)
+
+        self.account_audit_details = QTextEdit()
+        self.account_audit_details.setReadOnly(True)
+        self.account_audit_details.setMaximumHeight(105)
+        self.account_audit_details.setPlaceholderText(
+            "选择一行查看建议理由及连续错误轮次。"
+        )
+        layout.addWidget(self.account_audit_details)
+
+        decisions = QHBoxLayout()
+        decisions.addWidget(QLabel("我的决定（对选中行）"))
+        self.account_audit_decision_buttons: list[QPushButton] = []
+        for label, disposition in (
+            ("继续启用", Disposition.ENABLED),
+            ("永久停用", Disposition.PERMANENTLY_DISABLED),
+            ("待复核", Disposition.PENDING_REVIEW),
+        ):
+            button = QPushButton(label)
+            button.clicked.connect(
+                lambda _checked=False, value=disposition: self._set_account_audit_disposition(
+                    value
+                )
+            )
+            self.account_audit_decision_buttons.append(button)
+            decisions.addWidget(button)
+        decisions.addStretch()
+        self.account_audit_pending = QLabel("待应用：停用 0 · 恢复 0 · 待复核 0")
+        decisions.addWidget(self.account_audit_pending)
+        layout.addLayout(decisions)
+
+        actions = QHBoxLayout()
+        self.account_audit_apply_button = QPushButton("预览并应用决定")
+        self.account_audit_apply_button.clicked.connect(
+            self._preview_and_apply_account_audit
+        )
+        actions.addWidget(self.account_audit_apply_button)
+        self.account_audit_clear_button = QPushButton("清空未应用的决定")
+        self.account_audit_clear_button.clicked.connect(
+            self._clear_account_audit_decisions
+        )
+        actions.addWidget(self.account_audit_clear_button)
+        actions.addStretch()
+        layout.addLayout(actions)
+
+        self.account_audit_output = QTextEdit()
+        self.account_audit_output.setReadOnly(True)
+        self.account_audit_output.setMaximumHeight(90)
+        layout.addWidget(self.account_audit_output)
         return page
 
     def _batch_tab(self) -> QWidget:
@@ -1411,6 +2089,71 @@ class MainWindow(QMainWindow):
         update_grid.addWidget(preview_update, 1, 1)
         update_grid.addWidget(apply_update, 1, 2)
         layout.addWidget(update_box)
+
+        rollback_box = QGroupBox("回退到历史引擎")
+        rollback_layout = QVBoxLayout(rollback_box)
+        rollback_controls = QHBoxLayout()
+        self.engine_rollback_refresh_button = QPushButton("刷新列表")
+        self.engine_rollback_refresh_button.clicked.connect(self._refresh_engine_rollbacks)
+        rollback_controls.addWidget(self.engine_rollback_refresh_button)
+        self.engine_rollback_usage_cancel_button = QPushButton("取消统计")
+        self.engine_rollback_usage_cancel_button.clicked.connect(
+            self._cancel_engine_rollback_usage
+        )
+        self.engine_rollback_usage_cancel_button.setEnabled(False)
+        rollback_controls.addWidget(self.engine_rollback_usage_cancel_button)
+        self.engine_rollback_preview_button = QPushButton("预检回退点")
+        self.engine_rollback_preview_button.clicked.connect(self._preview_engine_rollback)
+        rollback_controls.addWidget(self.engine_rollback_preview_button)
+        self.engine_rollback_apply_button = QPushButton("执行回退")
+        self.engine_rollback_apply_button.clicked.connect(self._apply_engine_rollback)
+        rollback_controls.addWidget(self.engine_rollback_apply_button)
+        rollback_controls.addStretch()
+        rollback_layout.addLayout(rollback_controls)
+        self.engine_rollback_usage_label = QLabel("尚未统计磁盘占用")
+        self.engine_rollback_usage_label.setWordWrap(True)
+        rollback_layout.addWidget(self.engine_rollback_usage_label)
+        self.engine_rollback_table = EngineRollbackTable(0, 7, self)
+        self.engine_rollback_table.setObjectName("engineRollbackTable")
+        self.engine_rollback_table.setHorizontalHeaderLabels(
+            (
+                "换下时间",
+                "来源",
+                "来源包名",
+                "main.exe 大小",
+                "main.exe SHA-256",
+                "备注",
+                "状态",
+            )
+        )
+        self.engine_rollback_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked
+            | QAbstractItemView.EditTrigger.EditKeyPressed
+        )
+        self.engine_rollback_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.engine_rollback_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        rollback_header = self.engine_rollback_table.horizontalHeader()
+        rollback_header.setStretchLastSection(False)
+        rollback_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        rollback_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        rollback_header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self.engine_rollback_table.setColumnWidth(0, 190)
+        self.engine_rollback_table.setColumnWidth(1, 90)
+        self.engine_rollback_table.setColumnWidth(3, 120)
+        self.engine_rollback_table.setColumnWidth(4, 220)
+        self.engine_rollback_table.setColumnWidth(6, 180)
+        self.engine_rollback_table.itemSelectionChanged.connect(
+            self._update_engine_rollback_buttons
+        )
+        self.engine_rollback_table.itemChanged.connect(
+            self._save_engine_rollback_note
+        )
+        rollback_layout.addWidget(self.engine_rollback_table)
+        layout.addWidget(rollback_box)
         self.settings_output = QTextEdit()
         self.settings_output.setReadOnly(True)
         layout.addWidget(self.settings_output, 1)
@@ -1470,8 +2213,13 @@ class MainWindow(QMainWindow):
         return page
 
     def _result_dashboard_tab(self) -> QWidget:
+        scroll_area = QScrollArea()
+        scroll_area.setObjectName("resultDashboardScrollArea")
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.Shape.NoFrame)
         page = QWidget()
         layout = QVBoxLayout(page)
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         header = QHBoxLayout()
         header.addWidget(QLabel("任务"))
         self.dashboard_task_selector = QComboBox()
@@ -1640,11 +2388,118 @@ class MainWindow(QMainWindow):
         )
         account_layout.addWidget(self.dashboard_account_table)
         layout.addWidget(account_box)
-        return page
+
+        self.log_stats_group = QGroupBox("本次运行日志统计（只含统计量）")
+        log_stats_layout = QVBoxLayout(self.log_stats_group)
+        self.log_stats_expand_button = QPushButton("展开日志统计")
+        self.log_stats_expand_button.setCheckable(True)
+        log_stats_layout.addWidget(self.log_stats_expand_button)
+        self.log_stats_content = QWidget()
+        log_stats_content_layout = QVBoxLayout(self.log_stats_content)
+        log_stats_content_layout.setContentsMargins(0, 0, 0, 0)
+        log_stats_note = QLabel(
+            "以下数字来自本次分析所选任务新增的引擎原生日志片段。\n"
+            "a_bogus 与 x-secsdk-web-signature 次数相同属于正常，不代表签名降级；"
+            "判断外挂签名是否生效只看后者。\n"
+            "本报告不含 Cookie、Token、账号标识、作品标识、昵称、本地路径或 URL 查询串。"
+        )
+        log_stats_note.setWordWrap(True)
+        log_stats_content_layout.addWidget(log_stats_note)
+        self.log_stats_auto_checkbox = QCheckBox(
+            "任务完成后自动分析本次日志（默认关闭；大批量运行时会多占一会儿后台）"
+        )
+        self.log_stats_auto_checkbox.setChecked(self._log_stats_auto_enabled)
+        self.log_stats_auto_checkbox.toggled.connect(self._save_log_stats_auto_enabled)
+        log_stats_content_layout.addWidget(self.log_stats_auto_checkbox)
+        buttons = QHBoxLayout()
+        self.log_stats_current_button = QPushButton("分析本次日志")
+        self.log_stats_current_button.clicked.connect(self._start_current_log_stats)
+        self.log_stats_current_button.setEnabled(False)
+        buttons.addWidget(self.log_stats_current_button)
+        self.log_stats_history_button = QPushButton("分析该任务日志")
+        self.log_stats_history_button.clicked.connect(self._start_historical_log_stats)
+        self.log_stats_history_button.setEnabled(False)
+        buttons.addWidget(self.log_stats_history_button)
+        self.log_stats_cancel_button = QPushButton("取消")
+        self.log_stats_cancel_button.clicked.connect(self._cancel_log_stats_task)
+        self.log_stats_cancel_button.setEnabled(False)
+        buttons.addWidget(self.log_stats_cancel_button)
+        self.log_stats_export_button = QPushButton("导出中英文安全诊断报告")
+        self.log_stats_export_button.clicked.connect(self._start_log_stats_export)
+        self.log_stats_export_button.setEnabled(False)
+        buttons.addWidget(self.log_stats_export_button)
+        log_stats_content_layout.addLayout(buttons)
+        self.log_stats_history_reason = QLabel("尚未选择可分析的历史任务。")
+        self.log_stats_history_reason.setWordWrap(True)
+        log_stats_content_layout.addWidget(self.log_stats_history_reason)
+        self.log_stats_result_context = QLabel("当前尚未显示日志统计结果。")
+        self.log_stats_result_context.setObjectName("logStatsResultContext")
+        self.log_stats_result_context.setProperty("stale", False)
+        self.log_stats_result_context.setWordWrap(True)
+        log_stats_content_layout.addWidget(self.log_stats_result_context)
+        self.log_stats_output = LogStatsOutput()
+        self.log_stats_output.setObjectName("logStatsOutput")
+        self.log_stats_output.setReadOnly(True)
+        self.log_stats_output.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.log_stats_output.setMinimumHeight(300)
+        log_stats_content_layout.addWidget(self.log_stats_output)
+        self.log_stats_self_check = QLabel("最近一次导出：尚未执行产物自检。")
+        self.log_stats_self_check.setWordWrap(True)
+        log_stats_content_layout.addWidget(self.log_stats_self_check)
+        self.log_stats_export_path = QLabel("")
+        self.log_stats_export_path.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.log_stats_export_path.setWordWrap(True)
+        log_stats_content_layout.addWidget(self.log_stats_export_path)
+        self.log_stats_content.setVisible(False)
+        self.log_stats_expand_button.toggled.connect(self.log_stats_content.setVisible)
+        self.log_stats_expand_button.toggled.connect(
+            lambda checked: self.log_stats_expand_button.setText(
+                "收起日志统计" if checked else "展开日志统计"
+            )
+        )
+        log_stats_layout.addWidget(self.log_stats_content)
+        layout.addWidget(self.log_stats_group)
+        scroll_area.setWidget(page)
+        return scroll_area
 
     @staticmethod
     def _dashboard_key(path: Path | str) -> str:
         return os.path.normcase(str(Path(path).resolve()))
+
+    def _set_log_stats_result_context(self, text: str, *, stale: bool) -> None:
+        if not hasattr(self, "log_stats_result_context"):
+            return
+        self.log_stats_result_context.setText(text)
+        self.log_stats_result_context.setProperty("stale", stale)
+        style = self.log_stats_result_context.style()
+        style.unpolish(self.log_stats_result_context)
+        style.polish(self.log_stats_result_context)
+
+    def _update_log_stats_result_context(self) -> None:
+        if self._log_stats_result is None or not self._log_stats_scope:
+            self._set_log_stats_result_context(
+                "当前尚未显示日志统计结果。", stale=False
+            )
+            return
+        entry = self._dashboard_current_entry()
+        if entry is None:
+            self._set_log_stats_result_context(
+                "当前显示的是最近一次分析结果；尚未选中用于对照的任务。",
+                stale=False,
+            )
+            return
+        analysed_name = Path(self._log_stats_scope).name.casefold()
+        selected_name = entry.task_log.name.casefold()
+        if analysed_name == selected_name:
+            self._set_log_stats_result_context(
+                "当前显示的是结果看板所选任务的日志统计结果。", stale=False
+            )
+            return
+        self._set_log_stats_result_context(
+            "注意：下方仍是上一次分析结果，不是当前所选任务；"
+            "请点击“分析该任务日志”后再据此判断。",
+            stale=True,
+        )
 
     def _dashboard_current_entry(self) -> DashboardTaskIndexEntry | None:
         if not hasattr(self, "dashboard_task_selector"):
@@ -1751,6 +2606,7 @@ class MainWindow(QMainWindow):
             self.dashboard_task_selector.blockSignals(False)
             self._dashboard_syncing_selector = False
 
+        self._update_log_stats_result_context()
         self.dashboard_open_task_button.setEnabled(
             self._dashboard_current_entry() is not None
         )
@@ -1783,6 +2639,7 @@ class MainWindow(QMainWindow):
         self.dashboard_open_task_button.setEnabled(
             self._dashboard_current_entry() is not None
         )
+        self._update_log_stats_result_context()
         self._load_dashboard_selection(force_refresh=False)
 
     def _load_dashboard_selection(self, *, force_refresh: bool) -> None:
@@ -1856,6 +2713,7 @@ class MainWindow(QMainWindow):
             return False
         self._dashboard_snapshot = snapshot
         self._render_dashboard_snapshot(snapshot)
+        self._update_log_stats_result_context()
         return True
 
     def _render_dashboard_snapshot(self, snapshot: ResultDashboardSnapshot) -> None:
@@ -1949,6 +2807,7 @@ class MainWindow(QMainWindow):
         self.dashboard_open_native_button.setEnabled(
             self.dashboard_native_selector.count() > 0
         )
+        self._update_log_stats_history_availability()
 
     def _apply_dashboard_account_filter(self, _value: object = None) -> None:
         if not hasattr(self, "_dashboard_account_model"):
@@ -1980,6 +2839,7 @@ class MainWindow(QMainWindow):
         self.dashboard_integrity.setText("尚无稳定结果")
         self.dashboard_native_selector.clear()
         self.dashboard_open_native_button.setEnabled(False)
+        self._update_log_stats_history_availability()
 
     def _dashboard_load_failed(self, payload: object, prefix: str) -> None:
         if self.controller.startup_state is StartupState.CLOSING:
@@ -2013,6 +2873,265 @@ class MainWindow(QMainWindow):
             return
         if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
             QMessageBox.information(self, f"无法打开{label}", f"无法打开{label}：\n{path}")
+
+    def _update_log_stats_history_availability(self) -> None:
+        if not hasattr(self, "log_stats_history_button"):
+            return
+        snapshot = getattr(self, "_dashboard_snapshot", None)
+        if snapshot is None:
+            self.log_stats_history_button.setEnabled(False)
+            self.log_stats_history_reason.setText("尚未选择可分析的历史任务。")
+            return
+        _segments, status = select_dashboard_segments(snapshot.native_log_segments)
+        messages = {
+            SegmentSelectionStatus.READY: "所选任务的日志区间可用。",
+            SegmentSelectionStatus.PARTIAL: "部分原生日志文件不可用，只分析可用片段。",
+            SegmentSelectionStatus.MISSING_RANGE: "该任务日志未记录日志区间，无法定位分析范围。",
+            SegmentSelectionStatus.MISSING_FILE: "原生日志文件已不存在。",
+        }
+        self.log_stats_history_reason.setText(messages[status])
+        self.log_stats_history_button.setEnabled(
+            self.controller.startup_state is StartupState.READY
+            and not self.controller._last_engine_running
+            and status in {SegmentSelectionStatus.READY, SegmentSelectionStatus.PARTIAL}
+        )
+
+    def _update_log_stats_current_availability(self) -> None:
+        if not hasattr(self, "log_stats_current_button"):
+            return
+        run = getattr(self, "_latest_log_stats_run", None)
+        self.log_stats_current_button.setEnabled(
+            self.controller.startup_state is StartupState.READY
+            and not self.controller._last_engine_running
+            and run is not None
+            and not getattr(run, "running", False)
+            and getattr(run, "_summary_result", None) is not None
+        )
+
+    def _start_current_log_stats(self, _checked: bool = False, *, automatic: bool = False) -> None:
+        if self.controller.startup_state is StartupState.CLOSING:
+            return
+        run = getattr(self, "_latest_log_stats_run", None)
+        if run is None or getattr(run, "_summary_result", None) is None:
+            if hasattr(self, "log_stats_output"):
+                self.log_stats_output.setPlainText("没有可分析的已完成下载任务。")
+            return
+        if getattr(run, "running", False):
+            self.log_stats_output.setPlainText("下载引擎运行中，不能分析原生日志。")
+            return
+        summary = run._summary_result
+        scope = MainWindow._canonical_task_log(run.task_log)
+        self._submit_log_stats_analysis(
+            scope,
+            lambda context: self.controller.analyse_run_logs(
+                scope,
+                context=context,
+                segments=summary.located.segments,
+                located_reason=summary.located.reason,
+            ),
+            automatic=automatic,
+            refresh_targets=("run_result",),
+            located_reason=summary.located.reason,
+        )
+
+    def _start_historical_log_stats(self, _checked: bool = False) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        snapshot = getattr(self, "_dashboard_snapshot", None)
+        if snapshot is None:
+            self._update_log_stats_history_availability()
+            return
+        segments, status = select_dashboard_segments(snapshot.native_log_segments)
+        if status not in {SegmentSelectionStatus.READY, SegmentSelectionStatus.PARTIAL}:
+            self._update_log_stats_history_availability()
+            return
+        scope = snapshot.task_log.name
+        reason = (
+            "仅分析了可用的部分原生日志片段。"
+            if status is SegmentSelectionStatus.PARTIAL
+            else ""
+        )
+        self._submit_log_stats_analysis(
+            scope,
+            lambda context: self.controller.analyse_run_logs(
+                scope,
+                context=context,
+                segments=segments,
+                located_reason=reason,
+            ),
+            automatic=False,
+            refresh_targets=("result_dashboard",),
+            located_reason=reason,
+        )
+
+    def _submit_log_stats_analysis(
+        self,
+        scope: str,
+        action: Callable[[object], object],
+        *,
+        automatic: bool,
+        refresh_targets: tuple[str, ...],
+        located_reason: str = "",
+    ) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        try:
+            self.controller.require_log_analysis_ready()
+        except ControllerError as exc:
+            self.log_stats_output.setPlainText(str(exc))
+            return
+        current = getattr(self.controller.engine, "current", None)
+        if current is not None and getattr(current, "running", False):
+            self.log_stats_output.setPlainText("下载引擎运行中，不能分析原生日志。")
+            return
+        spec = TaskSpec(
+            task_type="log_stats_analyse",
+            display_name="分析引擎原生日志统计",
+            resource_keys=frozenset({"task_logs"}),
+            deduplicate_key=f"log_stats_analyse:{scope}",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            refresh_targets=refresh_targets,
+            dynamic_cancellation=True,
+        )
+        if any(
+            binding.generation_key == spec.deduplicate_key
+            for binding in self._background_bindings.values()
+        ) or spec.deduplicate_key in self._background_pending:
+            return
+        self.log_stats_output.setPlainText("正在分析…")
+        task_id = self._submit_background(
+            spec,
+            action,
+            output=self.log_stats_output,
+            buttons=(self.log_stats_current_button, self.log_stats_history_button),
+            on_success=lambda stats: self._apply_log_stats_result(
+                stats, scope, located_reason=located_reason
+            ),
+            on_failure=lambda payload: self._log_stats_failed(payload, automatic=automatic),
+            on_cancelled=lambda payload: self._log_stats_cancelled(automatic=automatic),
+            on_removed=self._log_stats_analysis_removed,
+            generation_key=spec.deduplicate_key,
+        )
+        if task_id is not None:
+            self._log_stats_task_id = task_id
+            self.log_stats_cancel_button.setEnabled(True)
+
+    def _apply_log_stats_result(
+        self, stats: LogStats, scope: str, *, located_reason: str = ""
+    ) -> None:
+        if self.controller.startup_state is StartupState.CLOSING:
+            return
+        self._log_stats_result = stats
+        self._log_stats_scope = scope
+        self.log_stats_output.show_stats(stats, located_reason=located_reason)
+        self._update_log_stats_result_context()
+        self.log_stats_export_button.setEnabled(True)
+        self.log_stats_self_check.setText("最近一次导出：尚未执行产物自检。")
+        self.log_stats_export_path.clear()
+
+    def _log_stats_failed(self, payload: object, *, automatic: bool) -> None:
+        if self.controller.startup_state is StartupState.CLOSING:
+            return
+        if isinstance(payload, TaskFailure) and payload.error_type == "LogStatsReadError":
+            message = "原生日志片段不可读取、编码无效或记录不完整。"
+        else:
+            message = "分析发生内部错误，未显示任何原始日志内容。"
+        prefix = "自动分析失败" if automatic else "分析失败"
+        self.log_stats_output.setPlainText(f"{prefix}：{message}")
+
+    def _log_stats_cancelled(self, *, automatic: bool) -> None:
+        if self.controller.startup_state is StartupState.CLOSING:
+            return
+        self.log_stats_output.setPlainText("自动分析已取消。" if automatic else "分析已取消。")
+
+    def _log_stats_analysis_removed(self) -> None:
+        self._log_stats_task_id = None
+        if hasattr(self, "log_stats_cancel_button"):
+            self.log_stats_cancel_button.setEnabled(
+                self._log_stats_export_task_id is not None
+            )
+        MainWindow._update_log_stats_current_availability(self)
+        self._update_log_stats_history_availability()
+        if (
+            getattr(self, "_queue_start_waiting_for_log_stats", False)
+            and self.controller.startup_state is StartupState.READY
+        ):
+            self._queue_start_waiting_for_log_stats = False
+            MainWindow._start_next_queue_item(self)
+
+    def _start_log_stats_export(self, _checked: bool = False) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        if self._log_stats_result is None or self._log_stats_scope is None:
+            self.log_stats_output.setPlainText("没有可导出的日志统计结果。")
+            return
+        scope = self._log_stats_scope
+        spec = TaskSpec(
+            task_type="log_stats_export",
+            display_name="导出中英文日志诊断报告",
+            resource_keys=frozenset({"diagnostics_dir"}),
+            deduplicate_key=f"log_stats_export:{scope}",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            refresh_targets=(),
+            dynamic_cancellation=True,
+        )
+        task_id = self._submit_background(
+            spec,
+            lambda context: self.controller.engine.export_diagnostic_reports(
+                scope, context=context
+            ),
+            output=self.log_stats_output,
+            buttons=(self.log_stats_export_button,),
+            on_success=self._log_stats_exported,
+            on_failure=self._log_stats_export_failed,
+            on_cancelled=lambda _payload: self._log_stats_export_cancelled(),
+            on_removed=self._log_stats_export_removed,
+            generation_key=spec.deduplicate_key,
+        )
+        if task_id is not None:
+            self._log_stats_export_task_id = task_id
+            self.log_stats_cancel_button.setEnabled(True)
+
+    def _log_stats_exported(self, paths: tuple[Path, Path]) -> None:
+        if self.controller.startup_state is StartupState.CLOSING:
+            return
+        chinese_path, english_path = paths
+        self.log_stats_self_check.setText(
+            "最近一次导出：RESULT: CLEAN（中文版、英文版均通过）"
+        )
+        self.log_stats_self_check.setStyleSheet("color: #15803d; font-weight: 600;")
+        self.log_stats_export_path.setText(
+            f"已导出中文版：{chinese_path}\n已导出英文版：{english_path}"
+        )
+
+    def _log_stats_export_failed(self, payload: object) -> None:
+        if self.controller.startup_state is StartupState.CLOSING:
+            return
+        if isinstance(payload, TaskFailure) and payload.error_type == "LogStatsLeakError":
+            message = payload.message
+        else:
+            message = "诊断报告导出失败；未显示任何日志内容。"
+        self.controller.logger.error("日志诊断报告导出失败：%s", message)
+        self.log_stats_self_check.setText(f"最近一次导出：REVIEW NEEDED；{message}")
+        self.log_stats_self_check.setStyleSheet("color: #b91c1c; font-weight: 600;")
+
+    def _log_stats_export_cancelled(self) -> None:
+        if self.controller.startup_state is not StartupState.CLOSING:
+            self.log_stats_self_check.setText("最近一次导出：已取消，未写入报告。")
+
+    def _log_stats_export_removed(self) -> None:
+        self._log_stats_export_task_id = None
+        if hasattr(self, "log_stats_cancel_button"):
+            self.log_stats_cancel_button.setEnabled(self._log_stats_task_id is not None)
+        if self._log_stats_result is not None:
+            self.log_stats_export_button.setEnabled(True)
+
+    def _cancel_log_stats_task(self) -> None:
+        task_id = self._log_stats_task_id or self._log_stats_export_task_id
+        if task_id is not None:
+            self._cancel_background(task_id)
 
     def _defer_dashboard_refresh_until_results_idle(self) -> None:
         if (
@@ -2313,6 +3432,315 @@ class MainWindow(QMainWindow):
 
     def _cancel_background(self, task_id: str) -> bool:
         return self.coordinator.request_cancel(task_id)
+
+    def _start_account_audit_scan(self) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        native_log_analysis = self.account_audit_native_logs.isChecked()
+        threshold = self.account_audit_error_threshold.value()
+        minimum_runs = self.account_audit_minimum_runs.value()
+        if native_log_analysis:
+            try:
+                self.controller.require_log_analysis_ready()
+            except ControllerError as exc:
+                self.account_audit_progress.setText("账号审计未启动。")
+                self.account_audit_output.setPlainText(str(exc))
+                return
+        spec = TaskSpec(
+            task_type="account_audit_scan",
+            display_name="扫描账号健康审计",
+            resource_keys=frozenset({"settings", "task_logs"}),
+            deduplicate_key="account_audit_scan",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            refresh_targets=(),
+            dynamic_cancellation=True,
+        )
+        self.account_audit_progress.setText("正在准备账号审计……")
+        task_id = self._submit_coalesced_background(
+            spec,
+            lambda context: self.controller.audit_accounts(
+                error_threshold=threshold,
+                minimum_evidence_runs=minimum_runs,
+                native_log_analysis=native_log_analysis,
+                context=context,
+            ),
+            output=self.account_audit_output,
+            buttons=(
+                self.account_audit_apply_button,
+                self.account_audit_clear_button,
+                *self.account_audit_decision_buttons,
+            ),
+            on_success=self._apply_account_audit_report,
+            on_failure=self._account_audit_failed,
+            on_cancelled=lambda _payload: self._account_audit_cancelled(),
+            on_progress=self._account_audit_progressed,
+            on_removed=self._account_audit_task_removed,
+            generation_key="account_audit_scan",
+        )
+        if task_id is not None:
+            self._account_audit_task_id = task_id
+            self.account_audit_cancel_button.setEnabled(True)
+
+    def _account_audit_progressed(self, progress: object) -> None:
+        if self.controller.startup_state is StartupState.CLOSING:
+            return
+        message = str(getattr(progress, "message", progress))
+        current = getattr(progress, "current", None)
+        total = getattr(progress, "total", None)
+        if current is not None and total is not None and f"{current}" not in message:
+            message = f"{message}（{current} / {total}）"
+        self.account_audit_progress.setText(message)
+
+    def _apply_account_audit_report(self, report: AccountAuditReport) -> None:
+        if self.controller.startup_state is StartupState.CLOSING:
+            return
+        self._account_audit_report = report
+        self._account_audit_decisions.clear()
+        self._account_audit_model.set_decisions({})
+        self._account_audit_model.set_report(report)
+        newest = report.newest_run or "无"
+        native_summary = (
+            f"；原生日志：已复核 {report.native_log_runs_scanned} 轮 / "
+            f"{report.native_log_segments_scanned} 个区间"
+            if report.native_log_analysis
+            else "；原生日志：未启用"
+        )
+        self.account_audit_summary.setText(
+            f"扫描轮次：{report.runs_scanned}；最近：{newest}；"
+            f"主档：{report.total_accounts} 项；重复组：{report.duplicate_groups}"
+            f"{native_summary}。"
+        )
+        self.account_audit_progress.setText("账号审计完成。")
+        self.account_audit_warnings.setText(
+            "\n".join(f"警告：{warning}" for warning in report.warnings)
+        )
+        self.account_audit_details.clear()
+        self._apply_account_audit_filter()
+        self._update_account_audit_pending()
+
+    def _apply_account_audit_filter(self, _value: object = None) -> None:
+        if not hasattr(self, "_account_audit_model"):
+            return
+        self._account_audit_model.set_filter(
+            str(self.account_audit_filter.currentData()),
+            self.account_audit_search.text(),
+        )
+        self.account_audit_visible_count.setText(
+            f"显示 {self._account_audit_model.visible_count} / "
+            f"{self._account_audit_model.total_count}"
+        )
+
+    def _show_account_audit_selection_details(self, *_args: object) -> None:
+        rows = self.account_audit_table.selectionModel().selectedRows(0)
+        if not rows:
+            self.account_audit_details.clear()
+            return
+        entry = self._account_audit_model.entry_at(rows[0].row())
+        if entry is None:
+            self.account_audit_details.clear()
+            return
+        lines = [
+            f"A{entry.a_number}：{entry.suggestion_reason}",
+            f"当前决定：{_audit_disposition_label(self._account_audit_decisions.get(entry.a_number, entry.disposition))}",
+        ]
+        if entry.evidence.consecutive_error_run_ids:
+            lines.append(
+                "连续 ERROR 轮次："
+                + "、".join(entry.evidence.consecutive_error_run_ids)
+            )
+        self.account_audit_details.setPlainText("\n".join(lines))
+
+    def _selected_account_audit_entries(self) -> tuple[AccountAuditEntry, ...]:
+        entries: dict[int, AccountAuditEntry] = {}
+        for index in self.account_audit_table.selectionModel().selectedRows(0):
+            entry = self._account_audit_model.entry_at(index.row())
+            if entry is not None:
+                entries[entry.a_number] = entry
+        return tuple(entries[number] for number in sorted(entries))
+
+    def _set_account_audit_disposition(self, disposition: Disposition) -> None:
+        entries = self._selected_account_audit_entries()
+        if not entries:
+            self.statusBar().showMessage("请先选择账号审计行")
+            return
+        for entry in entries:
+            if disposition is entry.disposition:
+                self._account_audit_decisions.pop(entry.a_number, None)
+            else:
+                self._account_audit_decisions[entry.a_number] = disposition
+        self._account_audit_model.set_decisions(self._account_audit_decisions)
+        self._apply_account_audit_filter()
+        self._update_account_audit_pending()
+
+    def _update_account_audit_pending(self) -> None:
+        counts = {
+            disposition: sum(
+                value is disposition
+                for value in self._account_audit_decisions.values()
+            )
+            for disposition in Disposition
+        }
+        self.account_audit_pending.setText(
+            "待应用："
+            f"停用 {counts[Disposition.PERMANENTLY_DISABLED]} · "
+            f"恢复 {counts[Disposition.ENABLED]} · "
+            f"待复核 {counts[Disposition.PENDING_REVIEW]}"
+        )
+
+    def _clear_account_audit_decisions(self) -> None:
+        self._account_audit_decisions.clear()
+        self._account_audit_model.set_decisions({})
+        self._apply_account_audit_filter()
+        self._update_account_audit_pending()
+
+    def _account_audit_decision_tuple(self) -> tuple[AuditDecision, ...]:
+        return tuple(
+            AuditDecision(number, disposition)
+            for number, disposition in sorted(self._account_audit_decisions.items())
+        )
+
+    def _preview_and_apply_account_audit(self) -> None:
+        report = self._account_audit_report
+        decisions = self._account_audit_decision_tuple()
+        if report is None:
+            QMessageBox.information(self, "尚未审计", "请先完成一次账号审计。")
+            return
+        if not decisions:
+            QMessageBox.information(self, "没有待应用决定", "请先选择账号并设置决定。")
+            return
+        try:
+            preview = self.controller.account_audit.preview_decisions(report, decisions)
+        except Exception as exc:
+            QMessageBox.critical(self, "无法预览账号审计决定", str(exc))
+            return
+        enabled_before = sum(entry.master_enable for entry in report.entries)
+        warnings = "\n".join(report.warnings)
+        text = (
+            f"将永久停用 {len(preview.to_disable)} 个账号："
+            f"{compact_numbers(preview.to_disable) or '无'}\n"
+            f"将恢复启用 {len(preview.to_enable)} 个账号："
+            f"{compact_numbers(preview.to_enable) or '无'}\n"
+            f"标记待复核 {len(preview.to_pending)} 个账号："
+            f"{compact_numbers(preview.to_pending) or '无'}（不改主档）\n\n"
+            f"应用后启用账号数：{enabled_before} → {preview.enabled_after}\n\n"
+            f"主档数组长度保持 {preview.array_length_after} 项不变。\n"
+            "所有 A 编号保持不变。被停用的条目留在原位，不会被删除。\n\n"
+            "管理器会先做完整备份。"
+        )
+        if warnings:
+            text += f"\n\n{warnings}"
+        text += "\n\n确认写入？"
+        answer = QMessageBox.question(
+            self,
+            "确认写入账号主档",
+            text,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        spec = TaskSpec(
+            task_type="account_audit_apply",
+            display_name="应用账号审计决定",
+            resource_keys=frozenset({"settings", "volume", "collector_process"}),
+            deduplicate_key="account_audit_apply",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            refresh_targets=(),
+            dynamic_cancellation=True,
+        )
+        self._account_audit_refresh_after_apply = False
+        self.account_audit_progress.setText(
+            "正在创建完整备份并应用决定，请等待操作完成。"
+        )
+        self._replace_info(
+            self.account_audit_output,
+            "正在创建完整备份并应用账号审计决定，请等待操作完成。",
+            "待应用决定会在成功后刷新；当前显示不代表已写入主档。",
+        )
+        self.account_audit_progress.repaint()
+        self.account_audit_output.viewport().repaint()
+        task_id = self._submit_background(
+            spec,
+            lambda context: self.controller.apply_audit_decisions(
+                report, decisions, context=context
+            ),
+            output=self.account_audit_output,
+            buttons=(
+                self.account_audit_refresh_button,
+                self.account_audit_apply_button,
+                self.account_audit_clear_button,
+                *self.account_audit_decision_buttons,
+            ),
+            on_success=self._account_audit_applied,
+            on_failure=self._account_audit_failed,
+            on_cancelled=lambda _payload: self._account_audit_cancelled(),
+            on_progress=self._account_audit_progressed,
+            on_removed=self._account_audit_apply_removed,
+            generation_key="account_audit_apply",
+        )
+        if task_id is not None:
+            self._account_audit_task_id = task_id
+            self.account_audit_cancel_button.setEnabled(True)
+        else:
+            self.account_audit_progress.setText("应用未启动，决定仍待应用。")
+            self._append_info(
+                self.account_audit_output,
+                "决定仍待应用；账号主档未被本次操作修改。",
+            )
+
+    def _account_audit_applied(self, result: AuditApplyResult) -> None:
+        if self.controller.startup_state is StartupState.CLOSING:
+            return
+        self._account_audit_refresh_after_apply = True
+        self.account_audit_progress.setText("账号审计决定已安全应用。")
+        self._replace_info(
+            self.account_audit_output,
+            f"完整备份：{result.backup_path}",
+            "主档数组长度与 A 编号保持不变。",
+        )
+
+    def _account_audit_failed(self, payload: object) -> None:
+        if self.controller.startup_state is StartupState.CLOSING:
+            return
+        message = payload.message if isinstance(payload, TaskFailure) else str(payload)
+        self.account_audit_progress.setText("账号审计操作失败。")
+        self._append_info(self.account_audit_output, f"【失败】{message}")
+
+    def _account_audit_cancelled(self) -> None:
+        if self.controller.startup_state is StartupState.CLOSING:
+            return
+        self.account_audit_progress.setText("账号审计操作已取消；未应用迟到结果。")
+
+    def _account_audit_task_removed(self) -> None:
+        active = next(
+            (
+                task_id
+                for task_id, binding in self._background_bindings.items()
+                if binding.generation_key == "account_audit_scan"
+            ),
+            None,
+        )
+        self._account_audit_task_id = active
+        self.account_audit_cancel_button.setEnabled(active is not None)
+
+    def _account_audit_apply_removed(self) -> None:
+        self._account_audit_task_id = None
+        self.account_audit_cancel_button.setEnabled(False)
+        if (
+            self._account_audit_refresh_after_apply
+            and self.controller.startup_state is StartupState.READY
+        ):
+            self._account_audit_refresh_after_apply = False
+            self._start_account_audit_scan()
+
+    def _cancel_account_audit_task(self) -> None:
+        task_id = self._account_audit_task_id
+        if task_id is None:
+            return
+        if self._cancel_background(task_id):
+            self.account_audit_progress.setText("正在取消账号审计操作……")
 
     def _refresh_background_targets(self, targets: tuple[str, ...]) -> None:
         if "task_list" in targets:
@@ -2663,8 +4091,26 @@ class MainWindow(QMainWindow):
             and (account_number is None or row.a_number == account_number)
             and (not task_text or task_text in row.task_template.casefold())
         )
-        self.result_table.setRowCount(len(filtered))
-        for index, row in enumerate(filtered):
+        self._result_render_rows = filtered
+        self._result_render_cursor = 0
+        self._result_render_runs = len(snapshot.runs)
+        self._result_render_incomplete_old_runs = snapshot.incomplete_old_runs
+        self.result_table.setUpdatesEnabled(False)
+        try:
+            self.result_table.clearContents()
+            self.result_table.setRowCount(len(filtered))
+        finally:
+            self.result_table.setUpdatesEnabled(True)
+        self.result_note.setText(f"正在显示 {len(filtered)} 条账号结果……")
+        self.result_render_timer.start(0)
+
+    def _render_result_rows_chunk(self) -> None:
+        if not hasattr(self, "result_table"):
+            return
+        start = self._result_render_cursor
+        end = min(start + self._RESULT_RENDER_BATCH_SIZE, len(self._result_render_rows))
+        for index in range(start, end):
+            row = self._result_render_rows[index]
             values = (
                 row.ended_at.strftime("%Y-%m-%d %H:%M:%S"),
                 f"A{row.a_number}",
@@ -2678,9 +4124,13 @@ class MainWindow(QMainWindow):
                 if column == 5:
                     item.setToolTip("双击打开来源日志")
                 self.result_table.setItem(index, column, item)
-        incomplete_old = snapshot.incomplete_old_runs
+        self._result_render_cursor = end
+        if end < len(self._result_render_rows):
+            self.result_render_timer.start(0)
+            return
+        incomplete_old = self._result_render_incomplete_old_runs
         self.result_note.setText(
-            f"共读取 {len(snapshot.runs)} 次任务日志，显示 {len(filtered)} 条账号结果。"
+            f"共读取 {self._result_render_runs} 次任务日志，显示 {len(self._result_render_rows)} 条账号结果。"
             + (f"其中 {incomplete_old} 次旧日志没有完整列出正常账号，页面不会猜测缺失状态。" if incomplete_old else "")
         )
         self.result_last_refresh.setText(
@@ -3123,6 +4573,13 @@ class MainWindow(QMainWindow):
                 f"已将模板 {paths[0].name} 复制为正式 settings.json。",
                 "任务模板仍永久保留，以后可以再次勾选复用。",
             )
+            if isinstance(result, ActivatedTask) and result.vetoed_numbers:
+                self._append_info(
+                    self.queue_output,
+                    "主档永久停用已否决 "
+                    f"{len(result.vetoed_numbers)} 个账号："
+                    f"{compact_numbers(result.vetoed_numbers)}。",
+                )
 
     def _apply_queue_options(self) -> bool:
         values = {
@@ -3619,6 +5076,9 @@ class MainWindow(QMainWindow):
     def _start_next_queue_item(self) -> None:
         if getattr(self.controller, "startup_state", None) is StartupState.CLOSING:
             return
+        if getattr(self, "_log_stats_task_id", None) is not None:
+            self._queue_start_waiting_for_log_stats = True
+            return
         if self.queue_pending and self.queue_paused:
             self._append_info(
                 self.queue_output,
@@ -3879,6 +5339,12 @@ class MainWindow(QMainWindow):
         self._append_info(self.queue_output, *format_summary_for_ui(summary))
         run = binding.run
         run._summary_result = summary
+        self._latest_log_stats_run = run
+        MainWindow._update_log_stats_current_availability(self)
+        if getattr(self, "log_stats_auto_checkbox", None) is not None and (
+            self.log_stats_auto_checkbox.isChecked()
+        ):
+            self._pending_auto_log_stats_run = run
         if getattr(run, "completion_marker", None) is not None and run.running:
             if getattr(run, "pause_after_exit", False):
                 run.result_review_waiting = True
@@ -3906,6 +5372,10 @@ class MainWindow(QMainWindow):
 
         self._refresh_background_targets(("download_results", "runtime_status"))
         MainWindow._defer_dashboard_refresh_until_results_idle(self)
+        pending_auto = getattr(self, "_pending_auto_log_stats_run", None)
+        if pending_auto is binding.run:
+            self._pending_auto_log_stats_run = None
+            self._start_current_log_stats_for_run(pending_auto)
         if getattr(self.controller, "startup_state", None) is StartupState.CLOSING:
             MainWindow._finalize_download_summary_for_closing(self, binding)
             return
@@ -3955,6 +5425,12 @@ class MainWindow(QMainWindow):
         self.queue_active = False
         self._release_download_lifecycle()
         MainWindow._retire_download_summary_binding(self, binding)
+
+    def _start_current_log_stats_for_run(self, run) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        self._latest_log_stats_run = run
+        self._start_current_log_stats(automatic=True)
 
     def _collector_is_enabled(self) -> bool:
         return bool(self.controller.collector.running or self.controller.collector.health())
@@ -4693,6 +6169,416 @@ class MainWindow(QMainWindow):
             on_success=show_result,
         )
 
+    @staticmethod
+    def _canonical_engine_rollback_point(point: Path) -> str:
+        return os.path.normcase(os.path.normpath(os.path.abspath(os.fspath(point))))
+
+    def _selected_engine_rollback_point(self) -> EngineRollbackPoint | None:
+        if not hasattr(self, "engine_rollback_table"):
+            return None
+        row = self.engine_rollback_table.currentRow()
+        if row < 0 or row >= len(self._engine_rollback_points):
+            return None
+        return self._engine_rollback_points[row]
+
+    def _update_engine_rollback_buttons(self) -> None:
+        if not hasattr(self, "engine_rollback_preview_button"):
+            return
+        selected = self._selected_engine_rollback_point()
+        ready = self.controller.startup_state is StartupState.READY
+        preview_busy = any(
+            binding.spec.task_type in {
+                "engine_rollback_preview",
+                "engine_rollback_preview_for_apply",
+            }
+            for binding in self._background_bindings.values()
+        )
+        apply_busy = any(
+            binding.spec.task_type == "engine_rollback_apply"
+            for binding in self._background_bindings.values()
+        )
+        self.engine_rollback_preview_button.setEnabled(
+            ready and selected is not None and not preview_busy
+        )
+        allowed = (
+            selected is not None
+            and rollback_can_apply(selected).gate is not RollbackApplyGate.REJECTED
+        )
+        self.engine_rollback_apply_button.setEnabled(
+            ready and allowed and not apply_busy and not preview_busy
+        )
+        if hasattr(self, "engine_rollback_usage_cancel_button"):
+            self.engine_rollback_usage_cancel_button.setEnabled(
+                ready and getattr(self, "_engine_rollback_usage_task_id", None) is not None
+            )
+
+    def _render_engine_rollback_points(self, points: tuple[EngineRollbackPoint, ...]) -> None:
+        self._engine_rollback_points = tuple(points)
+        table = self.engine_rollback_table
+        signals_were_blocked = table.blockSignals(True)
+        try:
+            table.setRowCount(len(points))
+            origin_labels = {
+                "ROLLBACK": "更新时换下",
+                "SUPERSEDED": "回退时换下",
+            }
+            for row, point in enumerate(points):
+                decision = rollback_can_apply(point)
+                status = (
+                    point.integrity.value
+                    if decision.gate is not RollbackApplyGate.REJECTED
+                    else f"{point.integrity.value}：{decision.reason}"
+                )
+                observed_hash = point.observed_main_sha256
+                values = (
+                    point.stamp,
+                    origin_labels.get(point.origin.value, point.origin.value),
+                    point.archive_name or "（无记录）",
+                    (
+                        f"{point.main_exe_bytes} bytes"
+                        if point.main_exe_bytes is not None
+                        else "未知"
+                    ),
+                    observed_hash or "不可用",
+                    point.note,
+                    status,
+                )
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    tooltips: list[str] = []
+                    if column == 5:
+                        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
+                        tooltips.append("双击编辑备注；清空并确认后删除备注。")
+                    else:
+                        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    if column == 4 and observed_hash:
+                        tooltips.append(f"main.exe SHA-256：{observed_hash}")
+                    if decision.gate is RollbackApplyGate.REJECTED:
+                        item.setForeground(QColor("#94a3b8"))
+                        tooltips.append(decision.reason)
+                    if tooltips:
+                        item.setToolTip("\n".join(tooltips))
+                    table.setItem(row, column, item)
+        finally:
+            table.blockSignals(signals_were_blocked)
+        self._update_engine_rollback_buttons()
+
+    def _save_engine_rollback_note(self, item: QTableWidgetItem) -> None:
+        if item.column() != 5:
+            return
+        row = item.row()
+        if row < 0 or row >= len(self._engine_rollback_points):
+            return
+        point = self._engine_rollback_points[row]
+        if item.text() == point.note:
+            return
+        try:
+            saved_note = self.controller.save_engine_rollback_note(
+                point.directory,
+                item.text(),
+            )
+        except Exception as exc:
+            signals_were_blocked = self.engine_rollback_table.blockSignals(True)
+            try:
+                item.setText(point.note)
+            finally:
+                self.engine_rollback_table.blockSignals(signals_were_blocked)
+            self._replace_info(self.settings_output, "【备注保存失败】", str(exc))
+            self.statusBar().showMessage("回退点备注保存失败")
+            return
+
+        signals_were_blocked = self.engine_rollback_table.blockSignals(True)
+        try:
+            item.setText(saved_note)
+        finally:
+            self.engine_rollback_table.blockSignals(signals_were_blocked)
+        self._engine_rollback_points = tuple(
+            replace(candidate, note=saved_note) if index == row else candidate
+            for index, candidate in enumerate(self._engine_rollback_points)
+        )
+        self._replace_info(self.settings_output, "回退点备注已保存。")
+        self.statusBar().showMessage("回退点备注已保存")
+
+    def _refresh_engine_rollbacks(self) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        spec = TaskSpec(
+            task_type="engine_rollback_list",
+            display_name="刷新引擎回退点",
+            resource_keys=frozenset({"engine_files"}),
+            deduplicate_key="engine_rollback_list",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            dynamic_cancellation=True,
+        )
+        self._engine_rollback_usage_pending = False
+
+        def show_points(points: object) -> None:
+            self._render_engine_rollback_points(tuple(points))
+            self.engine_rollback_usage_label.setText("正在统计磁盘占用…")
+            self._engine_rollback_usage_pending = True
+
+        def submit_usage() -> None:
+            if self._engine_rollback_usage_pending:
+                self._engine_rollback_usage_pending = False
+                self._submit_engine_rollback_usage()
+
+        self._submit_background(
+            spec,
+            lambda context: self.controller.list_engine_rollbacks(context=context),
+            output=self.settings_output,
+            buttons=(self.engine_rollback_refresh_button,),
+            on_success=show_points,
+            on_removed=submit_usage,
+            generation_key="engine_rollback_list",
+        )
+
+    def _submit_engine_rollback_usage(self) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        spec = TaskSpec(
+            task_type="engine_rollback_usage",
+            display_name="统计引擎回退点占用",
+            resource_keys=frozenset({"engine_files"}),
+            deduplicate_key="engine_rollback_usage",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            dynamic_cancellation=True,
+        )
+
+        def show_usage(usage: object) -> None:
+            self.engine_rollback_usage_label.setText(
+                f"回退点 {usage.rollback_count} 份 · 已被换下的引擎 {usage.superseded_count} 份 · "
+                f"合计占用 {usage.total_bytes / 1024 / 1024 / 1024:.2f} GB"
+            )
+
+        def usage_cancelled(_payload: object) -> None:
+            self.engine_rollback_usage_label.setText(
+                "磁盘占用统计已取消（可重新刷新）"
+            )
+
+        task_id_holder: dict[str, str | None] = {"value": None}
+
+        def usage_removed() -> None:
+            if self._engine_rollback_usage_task_id == task_id_holder["value"]:
+                self._engine_rollback_usage_task_id = None
+                self.engine_rollback_usage_cancel_button.setEnabled(False)
+
+        task_id = self._submit_background(
+            spec,
+            lambda context: self.controller.measure_engine_rollback_usage(context=context),
+            output=self.settings_output,
+            buttons=(self.engine_rollback_refresh_button,),
+            on_success=show_usage,
+            on_cancelled=usage_cancelled,
+            on_removed=usage_removed,
+            generation_key="engine_rollback_usage",
+        )
+        task_id_holder["value"] = task_id
+        self._engine_rollback_usage_task_id = task_id
+        self.engine_rollback_usage_cancel_button.setEnabled(task_id is not None)
+        if task_id is None:
+            self.engine_rollback_usage_label.setText(
+                "磁盘占用统计未启动（可重新刷新）"
+            )
+
+    def _cancel_engine_rollback_usage(self) -> None:
+        task_id = self._engine_rollback_usage_task_id
+        if task_id is not None:
+            self._cancel_background(task_id)
+
+    def _preview_engine_rollback(self) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        point = self._selected_engine_rollback_point()
+        if point is None:
+            return
+        spec = TaskSpec(
+            task_type="engine_rollback_preview",
+            display_name="预检引擎回退点",
+            resource_keys=frozenset({"engine_files"}),
+            deduplicate_key=(
+                "engine_rollback_preview:"
+                f"{self._canonical_engine_rollback_point(point.directory)}"
+            ),
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            dynamic_cancellation=True,
+        )
+
+        def show_preview(preview: object) -> None:
+            item = preview.point
+            messages = [
+                f"回退点状态：{item.integrity.value}",
+                f"目标 main.exe SHA-256：{item.main_exe_sha256 or '无清单，未核对'}",
+                f"当前 main.exe SHA-256：{preview.current_main_sha256}",
+                f"正式 Volume 不会被替换：{'是' if preview.volume_stays else '否'}",
+            ]
+            if item.integrity is RollbackIntegrity.NO_MANIFEST:
+                messages.extend(
+                    (
+                        "main.exe：存在",
+                        "_internal：存在",
+                        "_internal/Volume：不存在",
+                        item.reject_reason,
+                        "无法核对与已安装版本的一致性。",
+                    )
+                )
+            elif rollback_can_apply(item).gate is RollbackApplyGate.REJECTED:
+                messages.extend((item.reject_reason, "此回退点不可执行，任何确认都无法放行。"))
+            else:
+                messages.append(f"与当前引擎相同：{'是' if preview.is_same_as_current else '否'}")
+            self._replace_info(self.settings_output, *messages)
+
+        self._submit_coalesced_background(
+            spec,
+            lambda context: self.controller.preview_engine_rollback(
+                point.directory,
+                context=context,
+            ),
+            output=self.settings_output,
+            buttons=(self.engine_rollback_preview_button,),
+            on_success=show_preview,
+            generation_key="engine_rollback_preview",
+        )
+
+    def _apply_engine_rollback(self) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        point = self._selected_engine_rollback_point()
+        if point is None:
+            return
+        decision = rollback_can_apply(point)
+        if decision.gate is RollbackApplyGate.REJECTED:
+            self._replace_info(
+                self.settings_output,
+                "该回退点不可执行。",
+                decision.reason,
+                "任何确认都不能放行。",
+            )
+            return
+        spec = TaskSpec(
+            task_type="engine_rollback_preview_for_apply",
+            display_name="预检引擎回退点",
+            resource_keys=frozenset({"engine_files"}),
+            deduplicate_key=(
+                "engine_rollback_preview:"
+                f"{self._canonical_engine_rollback_point(point.directory)}"
+            ),
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            dynamic_cancellation=True,
+        )
+        accepted = {"value": False}
+        accept_unverified = {"value": False}
+
+        def confirm(preview: object) -> None:
+            item = preview.point
+            if rollback_can_apply(item).gate is RollbackApplyGate.REJECTED:
+                self._replace_info(self.settings_output, "该回退点不可执行。", item.reject_reason)
+                return
+            answer = QMessageBox.question(
+                self,
+                "确认回退下载引擎",
+                "将只替换下载引擎程序文件，正式 Volume 不会被替换，也不会回到旧状态。\n\n"
+                f"安装时间：{item.installed_at.isoformat(sep=' ') if item.installed_at else item.stamp}\n"
+                f"来源：{item.archive_name or '无记录'}\n"
+                f"目标 main.exe SHA-256：{item.main_exe_sha256 or '无清单，未核对'}\n"
+                f"当前 main.exe SHA-256：{preview.current_main_sha256}\n\n"
+                "管理器会先永久备份完整正式 Volume，当前引擎会永久保存在 Updates\\EngineSuperseded。\n\n"
+                "确认继续？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+            if rollback_can_apply(item).requires_second_confirm:
+                warning_answer = QMessageBox.question(
+                    self,
+                    "确认无清单回退",
+                    "该回退点缺少安装清单，无法核对与已安装版本的一致性。\n\n"
+                    "已确认 main.exe、_internal 存在且 _internal 内不含 Volume。\n\n"
+                    "回退记录将保存本次实际读取的哈希、大小与来源目录。\n\n"
+                    "仍然回退？（不建议）",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if warning_answer != QMessageBox.Yes:
+                    return
+                accept_unverified["value"] = True
+            accepted["value"] = True
+
+        self._submit_coalesced_background(
+            spec,
+            lambda context: self.controller.preview_engine_rollback(
+                point.directory,
+                context=context,
+            ),
+            output=self.settings_output,
+            buttons=(self.engine_rollback_apply_button,),
+            on_success=confirm,
+            on_removed=lambda: self._submit_engine_rollback_apply(
+                point.directory,
+                accept_unverified=accept_unverified["value"],
+            )
+            if accepted["value"]
+            else None,
+            generation_key="engine_rollback_preview",
+        )
+
+    def _submit_engine_rollback_apply(
+        self,
+        point_dir: Path,
+        *,
+        accept_unverified: bool = False,
+    ) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        spec = TaskSpec(
+            task_type="engine_rollback_apply",
+            display_name="执行引擎回退",
+            resource_keys=frozenset(
+                {
+                    "engine_process",
+                    "collector_process",
+                    "engine_files",
+                    "volume",
+                    "settings",
+                }
+            ),
+            deduplicate_key="engine_rollback_apply",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            refresh_targets=("runtime_status",),
+            dynamic_cancellation=True,
+        )
+
+        def show_result(result: object) -> None:
+            if result.manifest_verified:
+                first = "下载引擎回退完成。"
+            else:
+                first = "回退完成（来源无清单，未与已安装版本核对）。"
+            self._replace_info(
+                self.settings_output,
+                first,
+                f"回退前永久备份：{result.backup_path}",
+                f"被换下引擎：{result.superseded_path}",
+                f"实际恢复 main.exe SHA-256：{result.restored_main_sha256}",
+                f"来源目录：{result.source_directory}",
+            )
+
+        self._submit_background(
+            spec,
+            lambda context: self.controller.apply_engine_rollback(
+                point_dir,
+                accept_unverified=accept_unverified,
+                context=context,
+            ),
+            output=self.settings_output,
+            buttons=(self.engine_rollback_apply_button,),
+            on_success=show_result,
+        )
+
     def _browse_dir(self, edit: QLineEdit) -> None:
         selected = QFileDialog.getExistingDirectory(self, "选择文件夹", edit.text())
         if selected:
@@ -4808,17 +6694,39 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         if self.coordinator.has_active_tasks():
+            startup_ending = (
+                getattr(self.controller, "startup_state", None)
+                is StartupState.SAFETY_CHECKING
+                or any(
+                    binding.spec.task_type == "startup_safety"
+                    for binding in getattr(
+                        self, "_background_bindings", {}
+                    ).values()
+                )
+            )
             self._close_pending = True
             self.coordinator.begin_closing()
             self.controller.begin_closing()
             self._apply_action_gate()
-            QMessageBox.information(
-                self,
-                "启动安全检查正在结束",
-                "已请求取消启动安全检查；后台线程安全退出后管理器将自动关闭。",
-            )
+            self._close_notice_active = True
+            try:
+                QMessageBox.information(
+                    self,
+                    "启动安全检查正在结束" if startup_ending else "后台任务正在结束",
+                    (
+                        "已请求取消启动安全检查。请阅读并确认本提示；"
+                        "后台线程安全退出后管理器将关闭。"
+                        if startup_ending
+                        else "已请求取消可取消的后台任务。请阅读并确认本提示；"
+                        "后台线程安全退出后管理器将关闭。"
+                    ),
+                )
+            finally:
+                self._close_notice_active = False
 
             event.ignore()
+            if not self.coordinator.has_active_tasks():
+                self._on_background_tasks_idle()
             return
         begin_closing = getattr(self.controller, "begin_closing", None)
         if callable(begin_closing):
@@ -4924,7 +6832,20 @@ class MainWindow(QMainWindow):
             QLabel#dashboardMetricTitle { color: #4b5563; font-size: 12px; }
             QLabel#dashboardMetricValue { color: #111827; font-size: 16px;
                                            font-weight: 700; }
+            QLabel#logStatsResultContext { background: #f8fafc; color: #374151;
+                                           border: 1px solid #cbd5e1;
+                                           padding: 8px 10px; font-size: 14px;
+                                           font-weight: 600; }
+            QLabel#logStatsResultContext[stale="true"] { background: #fff7ed;
+                                                          color: #9a3412;
+                                                          border-color: #fdba74; }
             QTableWidget { background: white; border: 1px solid #cbd5e1;
                            gridline-color: #e5e7eb; }
+            QTableWidget#engineRollbackTable::item:selected {
+                background: #dbeafe; color: #1e3a5f;
+            }
+            QTableWidget#engineRollbackTable::item:selected:!active {
+                background: #f1f5f9; color: #334155;
+            }
             """
         )

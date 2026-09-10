@@ -3,6 +3,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from douk_manager.core.account_identity import (
+    identity_token,
+    log_identity_tokens,
+    profile_identity_token,
+)
 from douk_manager.core.download_summary import (
     AccountStatus,
     LocatedNativeLogs,
@@ -93,6 +98,73 @@ class DownloadSummaryParserTests(unittest.TestCase):
         self.assertEqual(summary.completed_with_anomaly, (10,))
         self.assertTrue(summary.complete)
         self.assertTrue(summary.reliable)
+
+    def test_profile_identity_accepts_only_unambiguous_profile_path_shapes(self) -> None:
+        stable_id = "AbC_" + ("x" * 51)
+        expected = identity_token(stable_id)
+
+        self.assertEqual(
+            profile_identity_token(
+                f"HTTPS://DOUYIN.COM/user/{stable_id}/?from=search#profile"
+            ),
+            expected,
+        )
+        self.assertNotEqual(
+            profile_identity_token(f"https://www.douyin.com/user/{stable_id.lower()}"),
+            expected,
+        )
+        for raw_url in (
+            f"https://v.douyin.com/user/{stable_id}",
+            f"https://synthetic.invalid/user/{stable_id}",
+            f"https://www.douyin.com/user//{stable_id}",
+            f"https://www.douyin.com/user/{stable_id}/extra",
+            f"https://www.douyin.com:444/user/{stable_id}",
+            f"https://www.douyin.com/user/{stable_id}.suffix",
+            "https://www.douyin.com/user/synthetic-short-id",
+        ):
+            with self.subTest(raw_url=raw_url):
+                self.assertIsNone(profile_identity_token(raw_url))
+
+    def test_log_identity_supports_engine_failure_text_and_rejects_similar_fields(
+        self,
+    ) -> None:
+        stable_id = "S" * 55
+        alternate_id = "T" * 76
+
+        self.assertEqual(
+            log_identity_tokens(
+                f"{stable_id} 获取账号信息失败，请检查 Cookie 登录状态！"
+            ),
+            (identity_token(stable_id),),
+        )
+        self.assertEqual(
+            log_identity_tokens(f'payload={{"sec_uid": "{alternate_id}"}}'),
+            (identity_token(alternate_id),),
+        )
+        for line in (
+            f"not_sec_user_id={stable_id}",
+            f"mysecuid={stable_id}",
+            f"sec_user_id={stable_id}.suffix",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(log_identity_tokens(line), ())
+
+    def test_account_identity_is_hashed_and_similar_field_names_are_ignored(self) -> None:
+        raw_identity = "R" * 55
+        summary = self._parse(
+            [
+                "开始处理第 1 个账号",
+                "标识：A1example",
+                f"not_sec_user_id={raw_identity}",
+                f'payload={{"sec_user_id": "{raw_identity}"}}',
+                "筛选处理后作品数量: 0",
+            ],
+            self._planned(1),
+        )
+
+        outcome = summary.started_outcomes[0]
+        self.assertEqual(outcome.identity_tokens, (identity_token(raw_identity),))
+        self.assertNotIn(raw_identity, repr(outcome))
 
     def test_unrecovered_error_overrides_zero_filtered_result(self) -> None:
         summary = self._parse(
@@ -686,6 +758,95 @@ class DownloadSummaryParserTests(unittest.TestCase):
 
         self.assertFalse(summary.reliable)
         self.assertTrue(any("不一致" in reason for reason in summary.reasons))
+
+    def test_engine_cleaned_marks_keep_the_frozen_account_identity(self) -> None:
+        cases = (
+            ("A1164example.", "A1164example"),
+            ("A1164example..", "A1164example"),
+            ("A1164example...", "A1164example"),
+            ("A1164alpha  beta", "A1164alpha beta"),
+            ("A1164alpha\t\u00a0beta", "A1164alpha beta"),
+            ("A1164C\ufe0fexample", "A1164Cexample"),
+            ("A116\ufe0e4example", "A1164example"),
+            ("A1164C\ufe0f  example..", "A1164C example"),
+        )
+        for raw_mark, logged_mark in cases:
+            with self.subTest(raw_mark=raw_mark):
+                planned = (PlannedAccount(1, 116, raw_mark),)
+                summary = self._parse(
+                    [
+                        "开始处理第 1 个账号",
+                        f"标识：{logged_mark}",
+                        "筛选处理后作品数量: 0",
+                    ],
+                    planned,
+                )
+                self.assertTrue(summary.reliable)
+                self.assertTrue(summary.complete)
+                self.assertEqual(summary.started_outcomes[0].a_number, 116)
+                self.assertEqual(planned[0].mark, raw_mark)
+
+    def test_mark_alias_never_normalizes_unexpected_logged_text(self) -> None:
+        cases = (
+            ("A10example", "A10example."),
+            ("A10example..", "A10example..."),
+            ("A10alpha beta", "A10alpha  beta"),
+            ("A10example.", "A10Example"),
+            ("A10a.b.", "A10ab"),
+            ("A10example.", "A11example"),
+        )
+        for raw_mark, logged_mark in cases:
+            with self.subTest(raw_mark=raw_mark, logged_mark=logged_mark):
+                summary = self._parse(
+                    [
+                        "开始处理第 1 个账号",
+                        f"标识：{logged_mark}",
+                        "筛选处理后作品数量: 0",
+                    ],
+                    (PlannedAccount(1, 10, raw_mark),),
+                )
+                self.assertFalse(summary.reliable)
+                self.assertEqual(summary.started_outcomes, ())
+
+    def test_colliding_cleaned_marks_are_not_trusted(self) -> None:
+        # Numeric-leading mark bodies can make different A positions share text.
+        planned = (
+            PlannedAccount(1, 1, "A116example."),
+            PlannedAccount(2, 11, "A116example.."),
+        )
+        summary = self._parse(
+            [
+                "开始处理第 1 个账号",
+                "标识：A116example",
+                "筛选处理后作品数量: 0",
+                "开始处理第 2 个账号",
+                "标识：A116example",
+                "筛选处理后作品数量: 0",
+            ],
+            planned,
+        )
+        self.assertFalse(summary.reliable)
+        self.assertEqual(summary.started_outcomes, ())
+
+    def test_alias_collision_with_another_raw_mark_is_not_trusted(self) -> None:
+        planned = (
+            PlannedAccount(1, 1, "A116example."),
+            PlannedAccount(2, 11, "A116example"),
+        )
+        summary = self._parse(
+            [
+                "开始处理第 1 个账号",
+                "标识：A116example",
+                "筛选处理后作品数量: 0",
+                "开始处理第 2 个账号",
+                "标识：A116example",
+                "筛选处理后作品数量: 0",
+            ],
+            planned,
+        )
+        self.assertFalse(summary.reliable)
+        self.assertEqual(summary.started_count, 1)
+        self.assertEqual(summary.started_outcomes[0].a_number, 11)
 
     def test_prefix_like_logged_mark_never_matches_frozen_mark(self) -> None:
         summary = self._parse(
