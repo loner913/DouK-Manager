@@ -73,6 +73,7 @@ class StartupGuiTests(unittest.TestCase):
         return window
 
     def _dispose_window(self, window: MainWindow) -> None:
+        window.controller.begin_closing()
         window.hide()
         window.deleteLater()
         self.app.processEvents()

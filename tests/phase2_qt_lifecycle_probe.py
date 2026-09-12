@@ -1307,6 +1307,9 @@ def _dispose_window(window: MainWindow) -> dict[str, object]:
         app.processEvents()
     if not destroyed:
         run_until(lambda: bool(destroyed))
+    begin_closing = getattr(window.controller, "begin_closing", None)
+    if callable(begin_closing):
+        begin_closing()
     if logger is not None:
         for handler in handlers:
             logger.removeHandler(handler)

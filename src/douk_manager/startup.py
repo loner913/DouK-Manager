@@ -13,6 +13,7 @@ from douk_manager.core.engine import (
     ProcessProbeState,
 )
 from douk_manager.core.locks import critical_section
+from douk_manager.core.watchlist import WatchlistService
 
 
 class StartupState(Enum):
@@ -197,11 +198,21 @@ class StartupSafetyService:
 
                 self._checkpoint(token)
                 try:
-                    startup_backup = self.backup.create_critical_snapshot(
-                        "Startup",
-                        {"operation": "application_start"},
-                        keep_latest=3,
-                    )
+                    if self._observation_files_are_configured():
+                        watchlist = WatchlistService(self.paths)
+                        watchlist.block_writes(locked=True)
+                        startup_backup = self.backup.create_startup_snapshot(
+                            "Startup",
+                            {"operation": "application_start"},
+                            keep_latest=BackupService.STARTUP_KEEP_LATEST,
+                        )
+                        watchlist.mark_ready(locked=True)
+                    else:
+                        startup_backup = self.backup.create_critical_snapshot(
+                            "Startup",
+                            {"operation": "application_start"},
+                            keep_latest=3,
+                        )
                 except Exception as exc:
                     return self._failure(
                         generation,
@@ -262,3 +273,11 @@ class StartupSafetyService:
             startup_backup=startup_backup,
             recovered_command=bool(recovered_command),
         )
+
+    def _observation_files_are_configured(self) -> bool:
+        paths = (
+            getattr(self.paths, "watchlist", None),
+            getattr(self.paths, "watchlist_w_watermark", None),
+            getattr(self.paths, "watchlist_control", None),
+        )
+        return any(path is not None and path.exists() for path in paths)

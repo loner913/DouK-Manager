@@ -291,6 +291,9 @@ def run_probe() -> dict:
                     _run_until(lambda: not window.coordinator.has_active_tasks())
                 except Exception:
                     evidence["status"] = "failed"
+            begin_closing = getattr(window.controller, "begin_closing", None)
+            if callable(begin_closing):
+                begin_closing()
             window.hide()
             window.deleteLater()
             QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)

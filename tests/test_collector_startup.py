@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import io
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from douk_manager.config import AppConfig
+from douk_manager.core.json_store import read_json
+from douk_manager.core.watchlist import WatchlistService
+from douk_manager.core.watchlist_session import ManagerInstanceLease
 from douk_manager.integrations.collector import CollectorService, CollectorServiceError
 from douk_manager.operation import OperationContext, TaskCancelled
 from tests.helpers import make_test_paths
@@ -15,6 +20,7 @@ class FakeProcess:
     def __init__(self, poll_values: list[int | None]) -> None:
         self._poll_values = iter(poll_values)
         self._last: int | None = None
+        self.stdin = io.BytesIO()
 
     def poll(self) -> int | None:
         try:
@@ -71,6 +77,23 @@ class CollectorStartupTests(unittest.TestCase):
                 self.assertEqual(
                     child_env["DOUK_GLOBAL_LOCK_PATH"], str(service.paths.lock_file)
                 )
+                self.assertEqual(child_env["DOUK_MANAGER_SESSION_CHANNEL"], "1")
+                self.assertEqual(child_env["DOUK_WATCHLIST_PATH"], str(service.paths.watchlist))
+                self.assertEqual(
+                    child_env["DOUK_WATCHLIST_WATERMARK_PATH"],
+                    str(service.paths.watchlist_w_watermark),
+                )
+                self.assertEqual(
+                    child_env["DOUK_WATCHLIST_CONTROL_PATH"],
+                    str(service.paths.watchlist_control),
+                )
+                self.assertEqual(
+                    child_env["DOUK_MANAGER_INSTANCE_LOCK_PATH"],
+                    str(service.paths.instance_lock_file),
+                )
+                self.assertEqual(popen.call_args.kwargs["stdin"], subprocess.PIPE)
+                self.assertFalse(process.stdin.closed)
+                self.assertRegex(process.stdin.getvalue().decode("utf-8"), r"^.+\n$")
             finally:
                 service.stop()
 
@@ -137,6 +160,45 @@ class CollectorStartupTests(unittest.TestCase):
                 self.assertTrue(service.running)
             finally:
                 service.stop()
+
+    def test_manager_owned_instance_lease_survives_normal_collector_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = make_test_paths(root)
+            paths.collector_excel.write_bytes(b"test workbook placeholder")
+            config = AppConfig(
+                engine_exe=str(paths.engine_exe),
+                video_root=str(paths.video_root),
+                index_root=str(paths.index_root),
+                collector_port=18765,
+            )
+            lease = ManagerInstanceLease(paths.instance_lock_file)
+            lease.acquire()
+            service = CollectorService(config, paths, instance_lease=lease)
+            process = FakeProcess([None, None])
+            service.health = Mock(side_effect=[False, True])
+            with patch(
+                "douk_manager.integrations.collector.subprocess.Popen",
+                return_value=process,
+            ):
+                service.start()
+            try:
+                service.stop()
+                self.assertTrue(lease.active)
+                self.assertTrue(lease.manager_is_still_owner())
+            finally:
+                lease.release()
+
+    def test_stop_revokes_observation_write_gate_before_releasing_collector(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = self._service(Path(directory))
+            WatchlistService(service.paths).initialize(initialization_evidence=True)
+            WatchlistService(service.paths).mark_ready()
+            process = FakeProcess([None])
+            service.process = process
+            service.stop()
+            self.assertEqual(read_json(service.paths.watchlist_control)["write_gate"], "blocked")
+            self.assertEqual(process.poll(), 0)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import hashlib
+import secrets
 import shutil
 import subprocess
 import sys
@@ -16,6 +17,9 @@ from openpyxl import load_workbook
 
 from douk_manager.config import AppConfig, ManagedPaths, project_root, resource_path
 from douk_manager.core.json_store import read_json
+from douk_manager.core.locks import LockBusyError, critical_section
+from douk_manager.core.watchlist import WatchlistService
+from douk_manager.core.watchlist_session import ManagerInstanceLease
 from douk_manager.operation import TaskCancelled
 
 if TYPE_CHECKING:
@@ -41,12 +45,23 @@ class MigrationResult:
 class CollectorService:
     STARTUP_TIMEOUT_SECONDS = 15.0
 
-    def __init__(self, config: AppConfig, paths: ManagedPaths) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        paths: ManagedPaths,
+        *,
+        instance_lease: ManagerInstanceLease | None = None,
+    ) -> None:
         self.config = config
         self.paths = paths
         self.process: subprocess.Popen | None = None
         self._log_handle = None
         self.last_log_path: Path | None = None
+        self._manager_session_nonce: str | None = None
+        self._instance_lease = instance_lease or ManagerInstanceLease(
+            self.paths.instance_lock_file
+        )
+        self._owns_instance_lease = instance_lease is None
 
     @property
     def running(self) -> bool:
@@ -70,6 +85,8 @@ class CollectorService:
         if self.process is not None:
             self.process = None
             self._close_log_handle()
+            if self._owns_instance_lease:
+                self._instance_lease.release()
         if self.health():
             raise CollectorServiceError(
                 f"端口 {self.config.collector_port} 已有采集服务在运行，无需重复启动。"
@@ -82,6 +99,15 @@ class CollectorService:
             )
         self.paths.collector_data.mkdir(parents=True, exist_ok=True)
         self.paths.screenshot_inbox.mkdir(parents=True, exist_ok=True)
+        if self._owns_instance_lease:
+            try:
+                self._instance_lease.acquire()
+            except LockBusyError as exc:
+                raise CollectorServiceError(
+                    "当前管理器运行目录已被另一个管理器会话占用。"
+                ) from exc
+        elif not self._instance_lease.active:
+            raise CollectorServiceError("当前管理器会话未获得实例锁。")
         env = os.environ.copy()
         env.update(
             {
@@ -92,6 +118,11 @@ class CollectorService:
                 "DOUK_COLLECTOR_PORT": str(self.config.collector_port),
                 "DOUK_COLLECTOR_TOKEN": self.config.collector_token,
                 "DOUK_GLOBAL_LOCK_PATH": str(self.paths.lock_file),
+                "DOUK_MANAGER_SESSION_CHANNEL": "1",
+                "DOUK_WATCHLIST_PATH": str(self.paths.watchlist),
+                "DOUK_WATCHLIST_WATERMARK_PATH": str(self.paths.watchlist_w_watermark),
+                "DOUK_WATCHLIST_CONTROL_PATH": str(self.paths.watchlist_control),
+                "DOUK_MANAGER_INSTANCE_LOCK_PATH": str(self.paths.instance_lock_file),
                 "PYTHONUNBUFFERED": "1",
                 "PYTHONIOENCODING": "utf-8",
                 "PYTHONUTF8": "1",
@@ -110,6 +141,8 @@ class CollectorService:
             / f"Collector_{datetime.now():%Y-%m-%d_%H-%M-%S}.log"
         )
         self.last_log_path = log_path
+        session_nonce = secrets.token_urlsafe(32)
+        self._manager_session_nonce = session_nonce
         self._log_handle = log_path.open("a", encoding="utf-8")
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         try:
@@ -117,16 +150,32 @@ class CollectorService:
                 command,
                 cwd=str(self.paths.root),
                 env=env,
+                stdin=subprocess.PIPE,
                 stdout=self._log_handle,
                 stderr=subprocess.STDOUT,
                 creationflags=creationflags,
             )
         except OSError as exc:
+            if self._owns_instance_lease:
+                self._instance_lease.release()
             self._close_log_handle()
             raise CollectorServiceError(f"无法启动账号采集服务：{exc}") from exc
         try:
+            # Keep this write end open for the entire manager session.  EOF is
+            # the child-side revocation signal; stop() must not close stdin.
+            stream = getattr(self.process, "stdin", None)
+            if stream is not None and hasattr(stream, "write"):
+                stream.write((session_nonce + "\n").encode("utf-8"))
+                stream.flush()
+        except (OSError, ValueError) as exc:
+            self.stop()
+            raise CollectorServiceError("无法建立账号采集管理器会话。") from exc
+        try:
             self._wait_until_ready(log_path, context=context)
         except TaskCancelled:
+            self.stop()
+            raise
+        except Exception:
             self.stop()
             raise
 
@@ -171,15 +220,40 @@ class CollectorService:
             time.sleep(0.15)
 
     def stop(self) -> None:
-        if self.process is not None and self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=3)
-        self.process = None
-        self._close_log_handle()
+        block_error: Exception | None = None
+        try:
+            self._block_observation_writes()
+        except Exception as exc:
+            block_error = exc
+        try:
+            if self.process is not None and self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=3)
+        finally:
+            self.process = None
+            self._manager_session_nonce = None
+            self._close_log_handle()
+            if self._owns_instance_lease:
+                self._instance_lease.release()
+        if block_error is not None:
+            raise CollectorServiceError(
+                "观察写入许可关闭失败；采集服务已停止，请重新执行启动安全检查。"
+            ) from block_error
+
+    def _block_observation_writes(self) -> None:
+        observation_files = (
+            self.paths.watchlist,
+            self.paths.watchlist_w_watermark,
+            self.paths.watchlist_control,
+        )
+        if not all(path.is_file() for path in observation_files):
+            return
+        with critical_section(self.paths.lock_file, timeout=3.0):
+            WatchlistService(self.paths).block_writes(locked=True)
 
     def _close_log_handle(self) -> None:
         if self._log_handle is not None:

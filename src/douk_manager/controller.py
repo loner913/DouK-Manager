@@ -32,7 +32,7 @@ from douk_manager.core.engine_update import (
     EngineUpdateService,
 )
 from douk_manager.core.json_store import read_json
-from douk_manager.core.locks import critical_section
+from douk_manager.core.locks import LockBusyError, critical_section
 from douk_manager.core.selector import compact_numbers
 from douk_manager.core.settings_tasks import (
     ActivatedTask,
@@ -42,6 +42,8 @@ from douk_manager.core.settings_tasks import (
 )
 from douk_manager.core.task_order import TaskOrderService
 from douk_manager.core.result_history import RecentPrivateMatch, ResultHistoryService
+from douk_manager.core.watchlist import WatchlistService
+from douk_manager.core.watchlist_session import ManagerInstanceLease
 from douk_manager.core.result_dashboard import (
     DashboardFileFingerprint,
     ResultDashboardService,
@@ -74,8 +76,21 @@ class ManagerController:
         self.paths.ensure_manager_directories()
         self.logger, self.log_path = setup_logging(self.paths.manager_logs)
         self.startup_backup: Path | None = None
-        self.read_only_reason = ""
-        self.startup_state = StartupState.BOOTSTRAPPING
+        self.instance_lease = ManagerInstanceLease(self.paths.instance_lock_file)
+        self.instance_session_error = ""
+        try:
+            self.instance_lease.acquire()
+        except LockBusyError as exc:
+            self.instance_session_error = (
+                "当前管理器运行目录已被另一个管理器会话占用。"
+            )
+            self.logger.warning("管理器实例锁获取失败：%s", exc)
+        self.read_only_reason = self.instance_session_error
+        self.startup_state = (
+            StartupState.DEGRADED_READ_ONLY
+            if self.instance_session_error
+            else StartupState.BOOTSTRAPPING
+        )
         self.startup_generation = 0
         self._startup_result: StartupSafetyResult | None = None
         self._last_collector_running = False
@@ -100,7 +115,11 @@ class ManagerController:
             self.backup,
             process_guard=lambda: self._require_engine_change_processes_idle("回退"),
         )
-        self.collector = CollectorService(self.config, self.paths)
+        self.collector = CollectorService(
+            self.config,
+            self.paths,
+            instance_lease=getattr(self, "instance_lease", None),
+        )
         self.screenshots = ScreenshotService()
         self.indexer = IndexService()
 
@@ -110,6 +129,10 @@ class ManagerController:
         return getattr(self, "startup_state", StartupState.READY)
 
     def begin_startup_check(self, generation: int) -> bool:
+        if getattr(self, "instance_session_error", ""):
+            self.startup_state = StartupState.DEGRADED_READ_ONLY
+            self.read_only_reason = self.instance_session_error
+            return False
         if self._current_startup_state() in (
             StartupState.SAFETY_CHECKING,
             StartupState.CLOSING,
@@ -122,6 +145,12 @@ class ManagerController:
         self.startup_state = StartupState.SAFETY_CHECKING
         self.startup_backup = None
         return True
+
+    def _manager_session_is_valid(self) -> bool:
+        lease = getattr(self, "instance_lease", None)
+        if lease is None:
+            return True
+        return lease.active and lease.manager_is_still_owner()
 
     def apply_startup_result(self, result: StartupSafetyResult) -> bool:
         if self._current_startup_state() is StartupState.CLOSING:
@@ -136,19 +165,34 @@ class ManagerController:
         probe = result.process_probe
         if probe is not None:
             self._last_engine_running = probe.state.name != "SAFE"
-        if result.success and result.state is StartupState.READY:
+        if (
+            result.success
+            and result.state is StartupState.READY
+            and self._manager_session_is_valid()
+        ):
             self.startup_state = StartupState.READY
             self.read_only_reason = ""
         else:
             self.startup_state = StartupState.DEGRADED_READ_ONLY
             self.read_only_reason = result.summary or result.details
+            if result.success and not self._manager_session_is_valid():
+                self.read_only_reason = "当前管理器会话已失效，已保持只读保护。"
         return True
 
     def begin_closing(self) -> bool:
         if self._current_startup_state() is StartupState.CLOSING:
+            if getattr(getattr(self, "collector", None), "process", None) is None:
+                self._release_instance_session()
             return False
         self.startup_state = StartupState.CLOSING
+        if getattr(getattr(self, "collector", None), "process", None) is None:
+            self._release_instance_session()
         return True
+
+    def _release_instance_session(self) -> None:
+        lease = getattr(self, "instance_lease", None)
+        if lease is not None:
+            lease.release()
 
     def startup_error_text(self) -> str:
         result = getattr(self, "_startup_result", None)
@@ -300,11 +344,21 @@ class ManagerController:
             return self.read_only_reason
         try:
             with critical_section(self.paths.lock_file, timeout=5.0):
-                self.startup_backup = self.backup.create_critical_snapshot(
-                    "Startup",
-                    {"operation": "application_start"},
-                    keep_latest=3,
-                )
+                if self._observation_files_are_configured():
+                    watchlist = WatchlistService(self.paths)
+                    watchlist.block_writes(locked=True)
+                    self.startup_backup = self.backup.create_startup_snapshot(
+                        "Startup",
+                        {"operation": "application_start"},
+                        keep_latest=BackupService.STARTUP_KEEP_LATEST,
+                    )
+                    watchlist.mark_ready(locked=True)
+                else:
+                    self.startup_backup = self.backup.create_critical_snapshot(
+                        "Startup",
+                        {"operation": "application_start"},
+                        keep_latest=3,
+                    )
             if self.engine.recover_batch_command_if_idle():
                 self.logger.warning(
                     "检测到上次后台监听遗留 run_command=%s，已恢复为 %s。",
@@ -318,6 +372,17 @@ class ManagerController:
             self.read_only_reason = f"启动前备份失败：{exc}"
             self.logger.exception("启动前备份失败")
             return self.read_only_reason
+
+    def _observation_files_are_configured(self) -> bool:
+        return any(
+            path.exists()
+            for path in (
+                getattr(self.paths, "watchlist", None),
+                getattr(self.paths, "watchlist_w_watermark", None),
+                getattr(self.paths, "watchlist_control", None),
+            )
+            if path is not None
+        )
 
     def require_download_lifecycle_idle(self) -> None:
         if getattr(self, "_download_lifecycle_active", False):
@@ -939,7 +1004,11 @@ class ManagerController:
             "停止账号采集服务",
             managed=getattr(self.collector, "process", None) is not None,
         )
-        self.collector.stop()
+        try:
+            self.collector.stop()
+        finally:
+            if self._current_startup_state() is StartupState.CLOSING:
+                self._release_instance_session()
         self._last_collector_running = False
         self.logger.info("账号采集服务已停止")
 

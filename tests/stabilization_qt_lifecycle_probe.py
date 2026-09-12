@@ -48,6 +48,7 @@ def drain_until(app: QApplication, condition, *, timeout_ms: int = 5000) -> None
 
 
 def close_logger(window: MainWindow) -> None:
+    window.controller.begin_closing()
     for handler in list(window.controller.logger.handlers):
         window.controller.logger.removeHandler(handler)
         handler.close()

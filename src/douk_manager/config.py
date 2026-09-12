@@ -82,6 +82,10 @@ class ManagedPaths:
     account_audit: Path
     updates: Path
     lock_file: Path
+    instance_lock_file: Path
+    watchlist: Path
+    watchlist_w_watermark: Path
+    watchlist_control: Path
     screenshot_inbox: Path
     collector_data: Path
     collector_excel: Path
@@ -118,6 +122,10 @@ class ManagedPaths:
             account_audit=data / "AccountAudit",
             updates=app_root / "Updates",
             lock_file=data / ".douk_manager.lock",
+            instance_lock_file=data / ".douk_manager.instance.lock",
+            watchlist=data / "watchlist.json",
+            watchlist_w_watermark=data / "watchlist_w_watermark.json",
+            watchlist_control=data / "watchlist_control.json",
             screenshot_inbox=data / "Screenshots" / "Inbox",
             collector_data=collector_data,
             collector_excel=collector_data / "录制名单.xlsx",

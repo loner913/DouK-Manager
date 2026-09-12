@@ -313,6 +313,7 @@ class WindowStateTests(unittest.TestCase):
                 for handler in list(restored.controller.logger.handlers):
                     restored.controller.logger.removeHandler(handler)
                     handler.close()
+                restored.controller.begin_closing()
                 first.deleteLater()
                 restored.deleteLater()
                 self.app.processEvents()
@@ -334,6 +335,7 @@ class WindowStateTests(unittest.TestCase):
                         f"minimum={window.minimumSize()}; hint={window.sizeHint()}",
                     )
                 finally:
+                    window.controller.begin_closing()
                     for handler in list(window.controller.logger.handlers):
                         window.controller.logger.removeHandler(handler)
                         handler.close()
@@ -366,6 +368,7 @@ class WindowStateTests(unittest.TestCase):
                         f"geometry={window.geometry()}",
                     )
                 finally:
+                    window.controller.begin_closing()
                     for handler in list(window.controller.logger.handlers):
                         window.controller.logger.removeHandler(handler)
                         handler.close()
@@ -399,6 +402,7 @@ class WindowStateTests(unittest.TestCase):
                 for handler in list(window.controller.logger.handlers):
                     window.controller.logger.removeHandler(handler)
                     handler.close()
+                window.controller.begin_closing()
                 window.deleteLater()
                 self.app.processEvents()
 

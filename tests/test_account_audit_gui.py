@@ -366,6 +366,7 @@ class AccountAuditGuiTests(unittest.TestCase):
         if window.coordinator.has_active_tasks():
             window.coordinator.begin_closing()
             self._run_until(lambda: not window.coordinator.has_active_tasks())
+        window.controller.begin_closing()
         window.hide()
         window.deleteLater()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)

@@ -13,6 +13,8 @@ from unittest.mock import Mock, patch
 from douk_manager.core import engine as engine_module
 from douk_manager.core.backup import BackupService
 from douk_manager.core.engine import EngineService
+from douk_manager.core.json_store import read_json
+from douk_manager.core.watchlist import WatchlistService
 from tests.helpers import make_test_paths
 
 try:
@@ -289,6 +291,42 @@ class StartupSafetyServiceTests(unittest.TestCase):
             self.assertEqual(result.stage, startup_module.StartupStage.SNAPSHOT)
             self.assertEqual(result.health_snapshot, final_health)
             self.assertEqual(health.call_count, 2)
+
+    def test_configured_watchlist_uses_startup_six_file_snapshot_and_reopens_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service, engine, backup, probe_state, paths = self._service(Path(directory))
+            watchlist = WatchlistService(paths)
+            watchlist.initialize(initialization_evidence=True)
+            watchlist.mark_ready()
+            snapshot = paths.backups / "Startup-synthetic-v3"
+            engine.probe_external_running.return_value = self._probe(probe_state.SAFE)
+            backup.create_startup_snapshot.return_value = snapshot
+
+            result = service.run(generation=14, token=None)
+
+            self.assertTrue(result.success)
+            backup.create_startup_snapshot.assert_called_once_with(
+                "Startup",
+                {"operation": "application_start"},
+                keep_latest=BackupService.STARTUP_KEEP_LATEST,
+            )
+            backup.create_critical_snapshot.assert_not_called()
+            self.assertEqual(read_json(paths.watchlist_control)["write_gate"], "ready")
+
+    def test_configured_watchlist_backup_failure_leaves_gate_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service, engine, backup, probe_state, paths = self._service(Path(directory))
+            watchlist = WatchlistService(paths)
+            watchlist.initialize(initialization_evidence=True)
+            watchlist.mark_ready()
+            engine.probe_external_running.return_value = self._probe(probe_state.SAFE)
+            backup.create_startup_snapshot.side_effect = OSError("synthetic snapshot failure")
+
+            result = service.run(generation=15, token=None)
+
+            self.assertFalse(result.success)
+            self.assertEqual(result.stage, startup_module.StartupStage.BACKUP)
+            self.assertEqual(read_json(paths.watchlist_control)["write_gate"], "blocked")
 
     def test_lock_recheck_stops_backup_when_process_becomes_running(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
