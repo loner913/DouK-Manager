@@ -7,7 +7,7 @@ settings, while avoiding a runtime dependency on external icon files.
 
 from __future__ import annotations
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt
+from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
 
 
@@ -65,11 +65,11 @@ def _pixmap(name: str, color: str, size: int) -> QPixmap:
         painter.drawRoundedRect(QRectF(4.5, 17, 15, 3.5), 1.2, 1.2)
     elif name == "users":
         painter.drawEllipse(QRectF(8.5, 4, 7, 7))
-        painter.drawArc(QRectF(5.2, 10.5, 13.6, 10, 15 * 16, 150 * 16))
+        painter.drawArc(QRectF(5.2, 10.5, 13.6, 10), 15 * 16, 150 * 16)
         painter.drawArc(QRectF(2.6, 7.5, 7.2, 7.2), 45 * 16, 105 * 16)
         painter.drawArc(QRectF(14.2, 7.5, 7.2, 7.2), 30 * 16, 105 * 16)
     elif name == "image":
-        painter.drawRoundedRect(QRectF(3.5, 5, 17, 14, 2.2, 2.2))
+        painter.drawRoundedRect(QRectF(3.5, 5, 17, 14), 2.2, 2.2)
         painter.drawEllipse(QRectF(7, 8, 2.8, 2.8))
         path = QPainterPath(QPointF(5.2, 17))
         path.lineTo(10.2, 12)
