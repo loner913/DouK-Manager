@@ -76,7 +76,6 @@ class ModernOverviewPage(QWidget):
         self._last_snapshot_identity: tuple[object, ...] | None = None
         self._dashboard_refresh_requested = False
         self._diagnostics_expanded = False
-        self._auto_expanded_for_degraded = False
         self._layout_width = 0
 
         root = QVBoxLayout(self)
@@ -268,7 +267,7 @@ class ModernOverviewPage(QWidget):
         title = QLabel("系统状态与安全控制", self.compatibility)
         title.setObjectName("modernSectionTitle")
         note = QLabel(
-            "V0.1.6 原始安全控件完整保留；只读保护时自动展开，正常状态下可按需查看。",
+            "V0.1.6 原始安全控件完整保留。只读保护属于受支持的安全运行模式，诊断与路径状态按需展开查看。",
             self.compatibility,
         )
         note.setObjectName("modernSectionNote")
@@ -377,12 +376,15 @@ class ModernOverviewPage(QWidget):
         text, kind = labels.get(state, ("状态未知", "info"))
         self.startup_badge.setText(text)
         self.startup_badge.setProperty("startupKind", kind)
-        self.startup_badge.setToolTip(summary or text)
+        if state is StartupState.DEGRADED_READ_ONLY:
+            tooltip = "当前处于只读保护：写操作已禁用。这是受支持的安全运行模式。"
+            if summary:
+                tooltip += f"\n{summary}"
+            self.startup_badge.setToolTip(tooltip)
+        else:
+            self.startup_badge.setToolTip(summary or text)
         self.startup_badge.style().unpolish(self.startup_badge)
         self.startup_badge.style().polish(self.startup_badge)
-        if state is StartupState.DEGRADED_READ_ONLY and not self._auto_expanded_for_degraded:
-            self._auto_expanded_for_degraded = True
-            self.set_diagnostics_expanded(True)
 
     def _refresh_runtime(self, host: Any) -> None:
         if getattr(host, "queue_active", False):
