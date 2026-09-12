@@ -7,7 +7,7 @@ from enum import Enum
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QWidget
 
-from ..theme.tokens import DARK_THEME, LIGHT_THEME, UiMetrics
+from ..theme.tokens import UiMetrics
 
 
 class StatusKind(str, Enum):
@@ -18,17 +18,15 @@ class StatusKind(str, Enum):
     NEUTRAL = "neutral"
 
 
-_STATUS_COLOURS = {
-    StatusKind.SUCCESS: (LIGHT_THEME.success, DARK_THEME.success),
-    StatusKind.INFO: (LIGHT_THEME.info, DARK_THEME.info),
-    StatusKind.WARNING: (LIGHT_THEME.warning, DARK_THEME.warning),
-    StatusKind.DANGER: (LIGHT_THEME.danger, DARK_THEME.danger),
-    StatusKind.NEUTRAL: (LIGHT_THEME.text_muted, DARK_THEME.text_muted),
-}
-
-
 class StatusPill(QFrame):
-    """Label + coloured state dot with no domain-specific behaviour."""
+    """Label + coloured state dot with responsive compact presentation."""
+
+    _COMPACT_LABELS = {
+        "采集服务": "采集",
+        "下载进程": "下载",
+        "数据库": "DB",
+        "Volume": "Vol",
+    }
 
     def __init__(
         self,
@@ -41,24 +39,50 @@ class StatusPill(QFrame):
         super().__init__(parent)
         self.setProperty("modernUi", True)
         self.setProperty("statusPill", True)
+        self._label_text = label
+        self._compact = False
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(UiMetrics.SPACE_M, UiMetrics.SPACE_S, UiMetrics.SPACE_M, UiMetrics.SPACE_S)
-        layout.setSpacing(UiMetrics.SPACE_S)
+        layout.setContentsMargins(
+            UiMetrics.SPACE_M,
+            7,
+            UiMetrics.SPACE_M,
+            7,
+        )
+        layout.setSpacing(6)
 
         self.dot = QLabel("●", self)
+        self.dot.setObjectName("modernStatusDot")
         self.dot.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.label = QLabel(label, self)
+        self.label.setObjectName("modernStatusLabel")
         self.value = QLabel(value, self)
+        self.value.setObjectName("modernStatusValue")
 
         layout.addWidget(self.dot)
         layout.addWidget(self.label)
         layout.addWidget(self.value)
-
         self.set_status(value=value, kind=kind)
+
+    def set_compact(self, compact: bool) -> None:
+        if self._compact == compact:
+            return
+        self._compact = compact
+        self.label.setText(
+            self._COMPACT_LABELS.get(self._label_text, self._label_text)
+            if compact
+            else self._label_text
+        )
+        self.setProperty("compact", compact)
+        self.style().unpolish(self)
+        self.style().polish(self)
 
     def set_status(self, *, value: str, kind: StatusKind) -> None:
         self.value.setText(value)
+        self.setToolTip(f"{self._label_text}：{value}")
         self.setProperty("statusKind", kind.value)
-        light, _dark = _STATUS_COLOURS[kind]
-        self.dot.setStyleSheet(f"color: {light};")
+        self.dot.setProperty("statusKind", kind.value)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.dot.style().unpolish(self.dot)
+        self.dot.style().polish(self.dot)
