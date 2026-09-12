@@ -1,10 +1,10 @@
 """Windows geometry polish for reflowed V0.1.6 feature cards.
 
-The modern shell keeps the original V0.1.6 widgets.  Some legacy layouts contain
+The modern shell keeps the original V0.1.6 widgets. Some legacy layouts contain
 vertical stretches that made sense in the old full-page design, but look awkward
-inside the new card layout on 1440p/4K displays.  This module removes only those
-presentation spacers and constrains compact cards; data views and output editors
-remain free to expand.
+inside the new card layout on 1440p/4K displays. This module removes only those
+presentation spacers, constrains compact cards, and keeps empty output areas from
+turning into giant blank panels. Real tables and populated outputs still expand.
 """
 
 from __future__ import annotations
@@ -29,12 +29,29 @@ _EXPANDING_TYPES = (
     QPlainTextEdit,
     QScrollArea,
 )
+_MAX_WIDGET_HEIGHT = 16777215
+_EMPTY_OUTPUT_HEIGHT = 230
+_POPULATED_OUTPUT_MINIMUM = 180
+
+
+def _is_empty_adaptive_output(widget: QWidget) -> bool:
+    return bool(
+        isinstance(widget, QTextEdit)
+        and widget.property("legacyOutput")
+        and not widget.toPlainText().strip()
+    )
 
 
 def _widget_has_expanding_content(widget: QWidget) -> bool:
+    if _is_empty_adaptive_output(widget):
+        return False
     if isinstance(widget, _EXPANDING_TYPES):
         return True
-    return bool(widget.findChildren(_EXPANDING_TYPES))
+    for child in widget.findChildren(_EXPANDING_TYPES):
+        if _is_empty_adaptive_output(child):
+            continue
+        return True
+    return False
 
 
 def _layout_has_expanding_content(layout: QLayout) -> bool:
@@ -76,20 +93,55 @@ def _strip_legacy_vertical_spacers(layout: QLayout) -> None:
                 _strip_legacy_vertical_spacers(widget.layout())
 
 
+def _set_vertical_policy(widget: QWidget, policy: QSizePolicy.Policy) -> None:
+    current = widget.sizePolicy()
+    widget.setSizePolicy(current.horizontalPolicy(), policy)
+
+
 def _cap_vertical_growth(widget: QWidget) -> None:
-    policy = widget.sizePolicy()
     widget.setMinimumHeight(0)
-    widget.setSizePolicy(policy.horizontalPolicy(), QSizePolicy.Policy.Maximum)
+    _set_vertical_policy(widget, QSizePolicy.Policy.Maximum)
 
     # Wrapped legacy labels sometimes inherited a large minimum height from the
-    # former full-page layout.  Let Qt recompute them from their real text again.
+    # former full-page layout. Let Qt recompute them from their real text again.
     if isinstance(widget, QLabel):
-        widget.setMaximumHeight(16777215)
+        widget.setMaximumHeight(_MAX_WIDGET_HEIGHT)
         widget.adjustSize()
 
 
+def _bind_adaptive_output(editor: QTextEdit, card: QFrame) -> None:
+    """Keep an empty output compact, but let it grow as soon as content arrives."""
+
+    if editor.property("legacyAdaptiveOutputBound"):
+        return
+    editor.setProperty("legacyAdaptiveOutputBound", True)
+
+    def refresh() -> None:
+        has_content = bool(editor.toPlainText().strip())
+        if has_content:
+            editor.setMinimumHeight(_POPULATED_OUTPUT_MINIMUM)
+            editor.setMaximumHeight(_MAX_WIDGET_HEIGHT)
+            _set_vertical_policy(editor, QSizePolicy.Policy.Expanding)
+            _set_vertical_policy(card, QSizePolicy.Policy.Expanding)
+            card.setProperty("legacyCompactGeometry", False)
+        else:
+            editor.setMinimumHeight(150)
+            editor.setMaximumHeight(_EMPTY_OUTPUT_HEIGHT)
+            _set_vertical_policy(editor, QSizePolicy.Policy.Preferred)
+            # If the output is the only potentially expanding child, the whole
+            # card can stay compact instead of filling half the screen with blank.
+            if not _layout_has_expanding_content(card.layout()):
+                _set_vertical_policy(card, QSizePolicy.Policy.Maximum)
+                card.setProperty("legacyCompactGeometry", True)
+        editor.updateGeometry()
+        card.updateGeometry()
+
+    editor.textChanged.connect(refresh)
+    refresh()
+
+
 def polish_feature_card_geometry(page: QWidget) -> None:
-    """Keep compact feature content dense and top-aligned on tall Windows screens.
+    """Keep feature content dense and top-aligned on tall Windows screens.
 
     This is presentation-only: no control is replaced, no signal is disconnected,
     and no model/controller state or enabled/disabled gate is changed.
@@ -101,6 +153,10 @@ def polish_feature_card_geometry(page: QWidget) -> None:
         layout = card.layout()
         if layout is None:
             continue
+
+        for editor in card.findChildren(QTextEdit):
+            if editor.property("legacyOutput"):
+                _bind_adaptive_output(editor, card)
 
         card_has_expanding_content = _layout_has_expanding_content(layout)
         if not card_has_expanding_content:
