@@ -54,14 +54,16 @@ class ThemeManager(QObject):
         p = self.palette
         m = UiMetrics
         selected = "#EAF3FF" if self._mode is ThemeMode.LIGHT else "#173457"
-        canvas = "#F6F9FD" if self._mode is ThemeMode.LIGHT else p.app_background
+        canvas = "#F4F8FD" if self._mode is ThemeMode.LIGHT else p.app_background
         subtle = "#F9FBFE" if self._mode is ThemeMode.LIGHT else p.surface_alt
+        success_bg = "#ECFDF5" if self._mode is ThemeMode.LIGHT else "#103529"
+        warning_bg = "#FFF8E8" if self._mode is ThemeMode.LIGHT else "#3B2B12"
         return f"""
 QWidget#modernRoot {{
     background: {canvas};
     color: {p.text_primary};
     font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
-    font-size: 13px;
+    font-size: 14px;
 }}
 
 QWidget#modernHeader {{
@@ -71,26 +73,27 @@ QWidget#modernHeader {{
 QLabel#modernBrandIcon {{
     color: white;
     background: {p.primary};
-    border-radius: 11px;
-    font-size: 21px;
+    border-radius: 12px;
+    font-size: 23px;
     font-weight: 700;
 }}
 QLabel#modernProductName {{
     color: {p.text_primary};
-    font-size: 16px;
+    font-size: 18px;
     font-weight: 700;
 }}
 QLabel#modernWorkspaceLabel {{
     color: {p.text_secondary};
-    font-size: 10px;
+    font-size: 11px;
 }}
 QLineEdit#modernGlobalSearch {{
-    min-height: 38px;
-    padding: 0 13px;
+    min-height: 42px;
+    padding: 0 14px;
     border: 1px solid {p.border};
-    border-radius: 10px;
+    border-radius: 11px;
     color: {p.text_primary};
     background: {subtle};
+    font-size: 13px;
     selection-background-color: {p.primary};
 }}
 QLineEdit#modernGlobalSearch:focus {{
@@ -99,25 +102,23 @@ QLineEdit#modernGlobalSearch:focus {{
 }}
 
 QFrame[statusPill="true"] {{
-    min-height: 36px;
+    min-height: 42px;
     background: {subtle};
     border: 1px solid {p.border};
-    border-radius: 18px;
+    border-radius: 21px;
 }}
-QFrame[statusPill="true"] QLabel {{
-    background: transparent;
-}}
+QFrame[statusPill="true"] QLabel {{ background: transparent; }}
 QLabel#modernStatusLabel {{
     color: {p.text_primary};
-    font-size: 11px;
+    font-size: 12px;
     font-weight: 600;
 }}
 QLabel#modernStatusValue {{
     color: {p.text_secondary};
-    font-size: 11px;
+    font-size: 12px;
     font-weight: 600;
 }}
-QLabel#modernStatusDot {{ font-size: 10px; }}
+QLabel#modernStatusDot {{ font-size: 11px; }}
 QLabel#modernStatusDot[statusKind="success"] {{ color: {p.success}; }}
 QLabel#modernStatusDot[statusKind="info"] {{ color: {p.info}; }}
 QLabel#modernStatusDot[statusKind="warning"] {{ color: {p.warning}; }}
@@ -129,14 +130,15 @@ QWidget#modernSidebar {{
     border-right: 1px solid {p.border};
 }}
 QPushButton[navigationItem="true"] {{
-    min-height: 46px;
-    padding: 0 14px;
+    min-height: 50px;
+    padding: 0 16px;
     border: none;
-    border-radius: 9px;
+    border-radius: 10px;
     color: {p.text_secondary};
     background: transparent;
     text-align: left;
-    font-size: 13px;
+    font-size: 14px;
+    font-weight: 500;
 }}
 QPushButton[navigationItem="true"]:hover {{
     color: {p.text_primary};
@@ -150,7 +152,6 @@ QPushButton[navigationItem="true"]:checked {{
 QPushButton[navigationItem="true"][collapsed="true"] {{
     padding: 0;
     text-align: center;
-    font-size: 18px;
 }}
 QFrame#modernSidebarDivider {{
     color: {p.border};
@@ -159,37 +160,26 @@ QFrame#modernSidebarDivider {{
     border: none;
 }}
 
-QTabWidget#modernPageHost::pane {{
-    border: 0;
-    background: transparent;
-}}
-QTabWidget#modernPageHost > QWidget {{
-    background: transparent;
-}}
-
+QTabWidget#modernPageHost::pane {{ border: 0; background: transparent; }}
+QTabWidget#modernPageHost > QWidget {{ background: transparent; }}
 QWidget#modernOverviewPage,
 QScrollArea#modernOverviewScroll,
-QWidget#modernOverviewCanvas {{
-    background: transparent;
-    border: none;
-}}
+QWidget#modernOverviewCanvas {{ background: transparent; border: none; }}
+
 QLabel#modernPageTitle {{
     color: {p.text_primary};
-    font-size: 25px;
+    font-size: 29px;
     font-weight: 700;
 }}
 QLabel#modernPageSubtitle {{
     color: {p.text_secondary};
-    font-size: 12px;
+    font-size: 13px;
 }}
-QLabel#modernClockDate {{
-    color: {p.text_secondary};
-    font-size: 10px;
-}}
+QLabel#modernClockDate {{ color: {p.text_secondary}; font-size: 11px; }}
 QLabel#modernClockTime {{
     color: {p.text_primary};
-    font-size: 22px;
-    font-weight: 600;
+    font-size: 25px;
+    font-weight: 700;
 }}
 
 QFrame[modernCard="true"] {{
@@ -197,28 +187,21 @@ QFrame[modernCard="true"] {{
     border: 1px solid {p.border};
     border-radius: {m.RADIUS_CARD}px;
 }}
-QFrame[metricCard="true"] {{
-    background: {p.surface};
-}}
+QFrame[metricCard="true"] {{ background: {p.surface}; }}
 QLabel#modernMetricTitle {{
     color: {p.text_secondary};
-    font-size: 11px;
+    font-size: 12px;
     font-weight: 600;
 }}
 QLabel#modernMetricValue {{
     color: {p.text_primary};
-    font-size: 24px;
+    font-size: 29px;
     font-weight: 700;
 }}
-QLabel#modernMetricNote {{
-    color: {p.text_muted};
-    font-size: 10px;
-}}
+QLabel#modernMetricNote {{ color: {p.text_muted}; font-size: 11px; }}
 QLabel#modernMetricIcon {{
     color: white;
-    border-radius: 12px;
-    font-size: 22px;
-    font-weight: 700;
+    border-radius: 13px;
 }}
 QLabel#modernMetricIcon[tone="primary"] {{ background: {p.primary}; }}
 QLabel#modernMetricIcon[tone="success"] {{ background: {p.success}; }}
@@ -229,37 +212,37 @@ QLabel#modernMetricIcon[tone="warning"] {{ background: {p.warning}; }}
 
 QLabel#modernSectionTitle {{
     color: {p.text_primary};
-    font-size: 15px;
+    font-size: 16px;
     font-weight: 700;
 }}
 QLabel#modernSectionNote,
 QLabel#modernDetailLabel {{
     color: {p.text_muted};
-    font-size: 10px;
+    font-size: 11px;
 }}
 QLabel#modernDetailValue {{
     color: {p.text_primary};
-    font-size: 11px;
+    font-size: 13px;
     font-weight: 600;
 }}
 QLabel#modernOverviewStartupBadge {{
-    min-height: 28px;
-    padding: 0 11px;
+    min-height: 30px;
+    padding: 0 12px;
     color: {p.text_secondary};
     background: {subtle};
     border: 1px solid {p.border};
-    border-radius: 14px;
-    font-size: 11px;
+    border-radius: 15px;
+    font-size: 12px;
     font-weight: 700;
 }}
 QLabel#modernOverviewStartupBadge[startupKind="success"] {{
     color: {p.success};
-    background: #ECFDF5;
+    background: {success_bg};
     border-color: #C7F3DF;
 }}
 QLabel#modernOverviewStartupBadge[startupKind="warning"] {{
     color: #B56A00;
-    background: #FFF8E8;
+    background: {warning_bg};
     border-color: #FBE4AD;
 }}
 QLabel#modernOverviewStartupBadge[startupKind="info"] {{
@@ -269,28 +252,30 @@ QLabel#modernOverviewStartupBadge[startupKind="info"] {{
 }}
 
 QPushButton[overviewAction="primary"] {{
-    min-height: 36px;
-    padding: 0 14px;
+    min-height: 40px;
+    padding: 0 16px;
     border: none;
-    border-radius: 8px;
+    border-radius: 9px;
     color: white;
     background: {p.primary};
+    font-size: 13px;
     font-weight: 600;
 }}
 QPushButton[overviewAction="primary"]:hover {{ background: {p.primary_hover}; }}
 QPushButton[overviewAction="secondary"] {{
-    min-height: 34px;
-    padding: 0 12px;
+    min-height: 38px;
+    padding: 0 14px;
     border: 1px solid {p.border};
-    border-radius: 8px;
+    border-radius: 9px;
     color: {p.text_primary};
     background: {subtle};
+    font-size: 13px;
 }}
 QPushButton[overviewAction="secondary"]:hover {{ background: {p.surface_hover}; }}
 
 QProgressBar#modernThroughputBar {{
-    min-height: 8px;
-    max-height: 8px;
+    min-height: 9px;
+    max-height: 9px;
     border: none;
     border-radius: 4px;
     background: #E7EEF7;
@@ -302,12 +287,12 @@ QProgressBar#modernThroughputBar::chunk {{
 }}
 
 QScrollBar:vertical {{
-    width: 10px;
+    width: 11px;
     margin: 2px;
     background: transparent;
 }}
 QScrollBar::handle:vertical {{
-    min-height: 30px;
+    min-height: 32px;
     border-radius: 4px;
     background: {p.border_strong};
 }}

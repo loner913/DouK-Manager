@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from PySide6.QtCore import Signal, Qt
+from PySide6.QtCore import QSize, Signal, Qt
 from PySide6.QtWidgets import QButtonGroup, QFrame, QPushButton, QVBoxLayout, QWidget
 
+from ..icons import vector_icon
 from ..theme.tokens import UiMetrics
 
 
@@ -14,12 +15,26 @@ from ..theme.tokens import UiMetrics
 class NavigationItem:
     route: str
     label: str
-    icon_text: str = "•"
+    icon_text: str = ""
     placement: str = "main"
 
 
+_ICON_BY_LABEL = {
+    "总览": "home",
+    "账号任务": "clipboard",
+    "账号审计": "shield",
+    "批次生成": "plus-square",
+    "下载队列": "download",
+    "账号采集": "users",
+    "截图与索引": "image",
+    "下载结果": "folder",
+    "结果看板": "chart",
+    "设置": "settings",
+}
+
+
 class NavigationSidebar(QWidget):
-    """Pure navigation view with a Fluent-style compact mode."""
+    """Pure navigation view with font-independent vector icons."""
 
     route_requested = Signal(str)
 
@@ -40,13 +55,8 @@ class NavigationSidebar(QWidget):
         self._group.setExclusive(True)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(
-            UiMetrics.SPACE_S,
-            UiMetrics.SPACE_L,
-            UiMetrics.SPACE_S,
-            UiMetrics.SPACE_L,
-        )
-        layout.setSpacing(UiMetrics.SPACE_XS)
+        layout.setContentsMargins(10, 18, 10, 18)
+        layout.setSpacing(5)
 
         main_items = tuple(item for item in items if item.placement != "bottom")
         bottom_items = tuple(item for item in items if item.placement == "bottom")
@@ -59,28 +69,33 @@ class NavigationSidebar(QWidget):
             divider.setObjectName("modernSidebarDivider")
             divider.setFrameShape(QFrame.Shape.HLine)
             layout.addWidget(divider)
-            layout.addSpacing(UiMetrics.SPACE_XS)
+            layout.addSpacing(5)
             for item in bottom_items:
                 layout.addWidget(self._make_button(item))
 
     def _make_button(self, item: NavigationItem) -> QPushButton:
-        button = QPushButton(self._button_text(item), self)
+        button = QPushButton(item.label, self)
         button.setCheckable(True)
         button.setProperty("navigationItem", True)
         button.setProperty("placement", item.placement)
         button.setCursor(Qt.CursorShape.PointingHandCursor)
         button.setToolTip(item.label)
+        icon_name = _ICON_BY_LABEL.get(item.label, "home")
+        button.setIcon(
+            vector_icon(
+                icon_name,
+                color="#60738E",
+                checked_color="#1677FF",
+                size=21,
+            )
+        )
+        button.setIconSize(QSize(21, 21))
         button.clicked.connect(
             lambda checked=False, route=item.route: self.route_requested.emit(route)
         )
         self._group.addButton(button)
         self._buttons[item.route] = button
         return button
-
-    def _button_text(self, item: NavigationItem) -> str:
-        if self._collapsed:
-            return item.icon_text
-        return f"{item.icon_text}   {item.label}"
 
     def set_collapsed(self, collapsed: bool) -> None:
         if self._collapsed == collapsed:
@@ -93,9 +108,9 @@ class NavigationSidebar(QWidget):
         )
         for route, button in self._buttons.items():
             item = self._items[route]
-            button.setText(self._button_text(item))
+            button.setText("" if collapsed else item.label)
+            button.setIconSize(QSize(23 if collapsed else 21, 23 if collapsed else 21))
             button.setProperty("collapsed", collapsed)
-            button.setStyleSheet("")
             button.style().unpolish(button)
             button.style().polish(button)
 

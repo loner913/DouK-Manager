@@ -1,9 +1,4 @@
-"""Central design tokens for the modern DouK Manager interface.
-
-All modern widgets should consume these values rather than embedding ad-hoc
-colours or spacing constants.  This keeps light and dark themes visually
-consistent and makes later tuning low risk.
-"""
+"""Central design tokens for the modern DouK Manager interface."""
 
 from __future__ import annotations
 
@@ -30,13 +25,13 @@ class ThemePalette:
 
 
 class UiMetrics:
-    """Shared sizing constants for the modern shell."""
+    """Shared sizing constants tuned against real Windows rendering."""
 
-    SIDEBAR_WIDTH = 230
-    SIDEBAR_COLLAPSED_WIDTH = 64
-    HEADER_HEIGHT = 72
+    SIDEBAR_WIDTH = 246
+    SIDEBAR_COLLAPSED_WIDTH = 72
+    HEADER_HEIGHT = 82
 
-    PAGE_MARGIN = 24
+    PAGE_MARGIN = 26
     SPACE_XS = 4
     SPACE_S = 8
     SPACE_M = 12
@@ -45,11 +40,11 @@ class UiMetrics:
     SPACE_XXL = 32
 
     RADIUS_SMALL = 6
-    RADIUS_CONTROL = 8
+    RADIUS_CONTROL = 9
     RADIUS_CARD = 12
 
-    CONTROL_HEIGHT = 36
-    PRIMARY_CONTROL_HEIGHT = 40
+    CONTROL_HEIGHT = 40
+    PRIMARY_CONTROL_HEIGHT = 42
 
 
 LIGHT_THEME = ThemePalette(
