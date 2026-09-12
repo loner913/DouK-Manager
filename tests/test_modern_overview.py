@@ -36,6 +36,7 @@ class ModernOverviewTests(unittest.TestCase):
         overview = getattr(window, "modern_overview", None)
         if overview is not None:
             overview._timer.stop()
+            overview._clock_timer.stop()
         window.hide()
         window.deleteLater()
         self.app.processEvents()
@@ -78,6 +79,8 @@ class ModernOverviewTests(unittest.TestCase):
                 complete=False,
                 reliable=False,
                 reliability_reasons=("任务被中断",),
+                main_status_counts=(),
+                pre_start_error_count=0,
                 task_log=Path("DownloadTask_demo.log"),
                 ended_at=None,
                 duration_seconds=45,
@@ -116,6 +119,20 @@ class ModernOverviewTests(unittest.TestCase):
             window.modern_overview.request_real_dashboard_refresh()
 
             window.refresh_result_dashboard.assert_called_once_with(auto_refresh=True)
+            self._dispose_window(window)
+
+    def test_read_only_protection_is_presented_as_safe_mode_without_auto_expanding_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window = self._window(Path(directory))
+            window.controller.startup_state = StartupState.DEGRADED_READ_ONLY
+            window.modern_overview.set_diagnostics_expanded(False)
+
+            window.modern_overview._refresh_startup(window)
+
+            self.assertEqual(window.modern_overview.startup_badge.text(), "只读保护")
+            self.assertFalse(window.modern_overview._diagnostics_expanded)
+            self.assertFalse(window._legacy_overview_page.isVisible())
+            self.assertIn("安全运行模式", window.modern_overview.startup_badge.toolTip())
             self._dispose_window(window)
 
 
