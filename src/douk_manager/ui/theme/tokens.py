@@ -61,11 +61,12 @@ LIGHT_THEME = ThemePalette(
     warning="#FFA940",
     danger="#FF4D5E",
     text_primary="#0F172A",
-    # Real Windows rendering at 1440p/4K made the former #64748B / #94A3B8
-    # pair look washed out, especially on legacy feature pages and disabled
-    # read-only controls. Keep the hierarchy, but raise contrast substantially.
-    text_secondary="#475569",
-    text_muted="#64748B",
+    # Real Windows 1440p/4K rendering needs stronger contrast than the usual
+    # web-dashboard palette. Secondary copy is intentionally close to primary,
+    # while muted text remains clearly readable even for disabled read-only
+    # controls.
+    text_secondary="#334155",
+    text_muted="#475569",
 )
 
 DARK_THEME = ThemePalette(
@@ -82,6 +83,6 @@ DARK_THEME = ThemePalette(
     warning="#FFB347",
     danger="#FF5967",
     text_primary="#F4F7FB",
-    text_secondary="#A7B6C9",
-    text_muted="#8295AD",
+    text_secondary="#C2CEDD",
+    text_muted="#9FB0C4",
 )
