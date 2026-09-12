@@ -2,8 +2,8 @@
 
 The migration strategy is intentionally conservative: the legacy ``QTabWidget`` and
 all of its already-wired pages remain alive. The modern shell hides the native tab
-bar, routes page selection through the Fluent navigation, and progressively wraps
-individual pages without reimplementing their business behaviour.
+bar, routes page selection through the Fluent navigation, and wraps every page in a
+V0.1.7 presentation layer without reimplementing its business behaviour.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QHBoxLayout, QTabWidget, QVBoxLayout, QWidget
 
 from douk_manager.gui import MainWindow as LegacyMainWindow
 
+from ..pages.legacy_page import ModernLegacyPage
 from ..pages.overview_page import ModernOverviewPage
 from ..theme.theme_manager import ThemeManager, ThemeMode
 from ..widgets.status_pill import StatusKind
@@ -38,6 +39,17 @@ class ModernMainWindow(LegacyMainWindow):
         "结果看板": "◔",
         "设置": "⚙",
     }
+    _PAGE_DESCRIPTIONS = {
+        "账号任务": "创建与执行账号任务；原有账号表达式、Earliest、智能跳过和任务动作完整保留。",
+        "账号审计": "审计账号状态、筛选建议并应用决定；所有审计模型与原操作逻辑保持不变。",
+        "批次生成": "按账号范围批量生成任务模板；继续使用 V0.1.6 的生成规则与文件写入流程。",
+        "下载队列": "管理任务队列、顺序与本次运行控制；暂停、恢复、取消和日志行为保持原样。",
+        "账号采集": "管理采集服务、Excel 与收集箱；继续复用原采集后台服务和现有操作入口。",
+        "截图与索引": "维护截图收集箱、视频目录、索引与快捷方式；原扫描和构建流程保持不变。",
+        "下载结果": "浏览 DownloadTask 任务结果与筛选条件；继续使用原任务日志读取和刷新逻辑。",
+        "结果看板": "汇总任务完整性、可靠性、状态分布与账号关注项；数据全部来自原结果模型。",
+        "设置": "配置正式路径、下载引擎与回退历史；安全校验、备份和升级行为保持原样。",
+    }
 
     def __init__(self, *, window_state_store=None) -> None:
         super().__init__(window_state_store=window_state_store)
@@ -62,6 +74,10 @@ class ModernMainWindow(LegacyMainWindow):
         tab_bar = legacy_tabs.tabBar()
         previous_tab_bar_visible = tab_bar.isVisible()
         previous_corner_visible = bool(corner and corner.isVisible())
+        original_pages = tuple(
+            (legacy_tabs.widget(index), legacy_tabs.tabText(index))
+            for index in range(legacy_tabs.count())
+        )
 
         taken = self.takeCentralWidget()
         if taken is not legacy_tabs:
@@ -70,20 +86,40 @@ class ModernMainWindow(LegacyMainWindow):
             raise RuntimeError("failed to detach the V0.1.6 tab container")
 
         modern_root: QWidget | None = None
-        legacy_overview: QWidget | None = None
         modern_overview: ModernOverviewPage | None = None
-        overview_label = ""
-        overview_replaced = False
+        modern_feature_pages: dict[str, ModernLegacyPage] = {}
         try:
-            if legacy_tabs.count() < 1:
-                raise RuntimeError("V0.1.6 overview tab is missing")
-            legacy_overview = legacy_tabs.widget(0)
-            overview_label = legacy_tabs.tabText(0)
-            legacy_tabs.removeTab(0)
-            modern_overview = ModernOverviewPage(self, legacy_overview)
-            legacy_tabs.insertTab(0, modern_overview, overview_label)
-            overview_replaced = True
-            legacy_tabs.setCurrentIndex(min(current_index, legacy_tabs.count() - 1))
+            if not original_pages:
+                raise RuntimeError("V0.1.6 pages are missing")
+
+            previous_block = legacy_tabs.blockSignals(True)
+            try:
+                overview_page, overview_label = original_pages[0]
+                legacy_tabs.removeTab(0)
+                modern_overview = ModernOverviewPage(self, overview_page)
+                legacy_tabs.insertTab(0, modern_overview, overview_label)
+
+                for index in range(1, len(original_pages)):
+                    original_page, original_label = original_pages[index]
+                    # The preceding replacement keeps all later indexes stable.
+                    current_page = legacy_tabs.widget(index)
+                    if current_page is not original_page:
+                        raise RuntimeError(f"legacy page index changed during migration: {index}")
+                    legacy_tabs.removeTab(index)
+                    display_label = self._LABEL_OVERRIDES.get(original_label, original_label)
+                    wrapper = ModernLegacyPage(
+                        original_page,
+                        title=display_label,
+                        subtitle=self._PAGE_DESCRIPTIONS.get(
+                            display_label,
+                            "V0.1.6 原功能与数据流保持不变，仅升级页面视觉与布局。",
+                        ),
+                    )
+                    legacy_tabs.insertTab(index, wrapper, original_label)
+                    modern_feature_pages[display_label] = wrapper
+                legacy_tabs.setCurrentIndex(min(current_index, legacy_tabs.count() - 1))
+            finally:
+                legacy_tabs.blockSignals(previous_block)
 
             modern_root = QWidget(self)
             modern_root.setProperty("modernUi", True)
@@ -129,7 +165,12 @@ class ModernMainWindow(LegacyMainWindow):
             self.modern_header = header
             self.modern_sidebar = sidebar
             self.modern_overview = modern_overview
-            self._legacy_overview_page = legacy_overview
+            self.modern_feature_pages = modern_feature_pages
+            self._legacy_overview_page = original_pages[0][0]
+            self._legacy_feature_pages = {
+                self._LABEL_OVERRIDES.get(label, label): page
+                for page, label in original_pages[1:]
+            }
             self._legacy_tab_corner = corner
 
             sidebar.route_requested.connect(self._on_modern_route_requested)
@@ -148,13 +189,17 @@ class ModernMainWindow(LegacyMainWindow):
         except Exception:
             if modern_root is not None and self.centralWidget() is modern_root:
                 self.takeCentralWidget()
-            if overview_replaced and modern_overview is not None and legacy_overview is not None:
-                index = legacy_tabs.indexOf(modern_overview)
-                if index >= 0:
-                    legacy_tabs.removeTab(index)
-                legacy_overview.setParent(legacy_tabs)
-                legacy_tabs.insertTab(0, legacy_overview, overview_label)
-                legacy_tabs.setCurrentIndex(min(current_index, legacy_tabs.count() - 1))
+            previous_block = legacy_tabs.blockSignals(True)
+            try:
+                while legacy_tabs.count():
+                    legacy_tabs.removeTab(0)
+                for index, (page, label) in enumerate(original_pages):
+                    page.setParent(legacy_tabs)
+                    legacy_tabs.insertTab(index, page, label)
+                if legacy_tabs.count():
+                    legacy_tabs.setCurrentIndex(min(current_index, legacy_tabs.count() - 1))
+            finally:
+                legacy_tabs.blockSignals(previous_block)
             legacy_tabs.setParent(self)
             self.setCentralWidget(legacy_tabs)
             tab_bar.setVisible(previous_tab_bar_visible)
