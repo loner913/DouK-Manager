@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QVBoxLayout, QWidget
 
 from ..theme.tokens import UiMetrics
@@ -28,8 +29,19 @@ class GlobalHeader(QWidget):
         self.setFixedHeight(UiMetrics.HEADER_HEIGHT)
 
         root = QHBoxLayout(self)
-        root.setContentsMargins(UiMetrics.SPACE_L, UiMetrics.SPACE_S, UiMetrics.SPACE_L, UiMetrics.SPACE_S)
+        root.setContentsMargins(
+            UiMetrics.SPACE_L,
+            UiMetrics.SPACE_S,
+            UiMetrics.SPACE_L,
+            UiMetrics.SPACE_S,
+        )
         root.setSpacing(UiMetrics.SPACE_L)
+
+        self.brand_icon = QLabel("D", self)
+        self.brand_icon.setObjectName("modernBrandIcon")
+        self.brand_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.brand_icon.setFixedSize(42, 42)
+        root.addWidget(self.brand_icon)
 
         brand = QVBoxLayout()
         brand.setSpacing(0)
@@ -47,10 +59,18 @@ class GlobalHeader(QWidget):
         self.search.setMaximumWidth(470)
         root.addWidget(self.search, 1)
 
-        self.collector_status = StatusPill("采集服务", "未知", kind=StatusKind.NEUTRAL, parent=self)
-        self.download_status = StatusPill("下载进程", "未知", kind=StatusKind.NEUTRAL, parent=self)
-        self.database_status = StatusPill("数据库", "未知", kind=StatusKind.NEUTRAL, parent=self)
-        self.volume_status = StatusPill("Volume", "未知", kind=StatusKind.NEUTRAL, parent=self)
+        self.collector_status = StatusPill(
+            "采集服务", "未知", kind=StatusKind.NEUTRAL, parent=self
+        )
+        self.download_status = StatusPill(
+            "下载进程", "未知", kind=StatusKind.NEUTRAL, parent=self
+        )
+        self.database_status = StatusPill(
+            "数据库", "未知", kind=StatusKind.NEUTRAL, parent=self
+        )
+        self.volume_status = StatusPill(
+            "Volume", "未知", kind=StatusKind.NEUTRAL, parent=self
+        )
 
         root.addWidget(self.collector_status)
         root.addWidget(self.download_status)

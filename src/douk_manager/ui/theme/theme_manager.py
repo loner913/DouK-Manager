@@ -18,14 +18,18 @@ class ThemeMode(str, Enum):
 class ThemeManager(QObject):
     """Own the active palette and apply a shared stylesheet.
 
-    The manager is deliberately opt-in.  Creating the modern UI package does not
+    The manager is deliberately opt-in. Creating the modern UI package does not
     mutate the existing V0.1.6 application stylesheet; callers must explicitly
     invoke :meth:`apply`.
     """
 
     theme_changed = Signal(str)
 
-    def __init__(self, mode: ThemeMode = ThemeMode.LIGHT, parent: QObject | None = None) -> None:
+    def __init__(
+        self,
+        mode: ThemeMode = ThemeMode.LIGHT,
+        parent: QObject | None = None,
+    ) -> None:
         super().__init__(parent)
         self._mode = mode
 
@@ -51,8 +55,8 @@ class ThemeManager(QObject):
     def apply(self, app: QApplication) -> None:
         """Apply the modern stylesheet to ``app``.
 
-        This is kept separate from :meth:`set_mode` so migration code can update
-        state without unexpectedly replacing a legacy stylesheet.
+        This remains separate from :meth:`set_mode` so migration code can update
+        state without unexpectedly replacing a legacy application stylesheet.
         """
 
         app.setStyleSheet(self.stylesheet())
@@ -73,6 +77,13 @@ QWidget#modernRoot {{
 QWidget#modernHeader {{
     background: {p.surface};
     border-bottom: 1px solid {p.border};
+}}
+QLabel#modernBrandIcon {{
+    color: white;
+    background: {p.primary};
+    border-radius: 10px;
+    font-size: 20px;
+    font-weight: 700;
 }}
 QLabel#modernProductName {{
     color: {p.text_primary};
