@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
 
 from ..theme.tokens import UiMetrics
 from .feature_reflow import reflow_feature_page
+from .layout_polish import polish_feature_card_geometry
 
 
 _PRIMARY_HINTS = (
@@ -148,6 +149,7 @@ class ModernLegacyPage(QWidget):
         self._mark_descendants(legacy_page)
         try:
             self.layout_profile = reflow_feature_page(legacy_page, title)
+            polish_feature_card_geometry(legacy_page)
             legacy_page.setProperty("legacyReflowed", True)
         except Exception as exc:  # Defensive: visual reflow must never remove V0.1.6 access.
             self.layout_reflow_error = exc
