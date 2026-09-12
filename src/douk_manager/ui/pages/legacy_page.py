@@ -2,7 +2,7 @@
 
 The wrapper changes presentation only: every original widget instance remains alive,
 with the same signals, slots, models, delegates and controller references. This lets
-V0.1.7 modernise all feature pages in one pass without re-implementing behaviour.
+V0.1.7 modernise all feature pages without re-implementing behaviour.
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..theme.tokens import UiMetrics
+from .feature_reflow import reflow_feature_page
 
 
 _PRIMARY_HINTS = (
@@ -45,6 +46,14 @@ _PRIMARY_HINTS = (
     "创建、激活",
     "开始下载",
     "开始执行",
+    "生成全部批次",
+    "重新审计",
+    "按顺序运行已选",
+    "启动采集服务",
+    "立即安全归档截图",
+    "立即刷新索引",
+    "立即刷新结果",
+    "保存全部设置",
     "执行回退",
     "保存各路径",
     "保存配置",
@@ -83,6 +92,8 @@ class ModernLegacyPage(QWidget):
         self.setObjectName("modernLegacyPage")
         self.legacy_page = legacy_page
         self.page_title = title
+        self.layout_profile: str | None = None
+        self.layout_reflow_error: Exception | None = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -135,6 +146,12 @@ class ModernLegacyPage(QWidget):
         legacy_page.setProperty("legacyRoot", True)
         legacy_page.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._mark_descendants(legacy_page)
+        try:
+            self.layout_profile = reflow_feature_page(legacy_page, title)
+            legacy_page.setProperty("legacyReflowed", True)
+        except Exception as exc:  # Defensive: visual reflow must never remove V0.1.6 access.
+            self.layout_reflow_error = exc
+            legacy_page.setProperty("legacyReflowed", False)
         surface_layout.addWidget(legacy_page, 1)
 
         # QTabWidget hides inactive pages explicitly. That hidden flag survives
