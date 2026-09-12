@@ -101,11 +101,26 @@ class ModernFeatureReflowTests(unittest.TestCase):
                 QSizePolicy.Policy.Maximum,
             )
             self.assertEqual(
+                window.result_table.sizePolicy().verticalPolicy(),
+                QSizePolicy.Policy.Expanding,
+            )
+            self._dispose_window(window)
+
+    def test_empty_output_panels_stay_compact_then_expand_with_content(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window = self._window(Path(directory))
+            self.assertTrue(window.task_output.property("legacyAdaptiveOutputBound"))
+            self.assertLessEqual(window.task_output.maximumHeight(), 230)
+            self.assertNotEqual(
                 window.task_output.sizePolicy().verticalPolicy(),
                 QSizePolicy.Policy.Expanding,
             )
+
+            window.task_output.setPlainText("preview result")
+            self.app.processEvents()
+            self.assertGreater(window.task_output.maximumHeight(), 230)
             self.assertEqual(
-                window.result_table.sizePolicy().verticalPolicy(),
+                window.task_output.sizePolicy().verticalPolicy(),
                 QSizePolicy.Policy.Expanding,
             )
             self._dispose_window(window)
