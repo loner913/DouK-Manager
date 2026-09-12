@@ -1,9 +1,9 @@
 """Modern application shell that preserves the complete V0.1.6 GUI implementation.
 
 The migration strategy is intentionally conservative: the legacy ``QTabWidget`` and
-all of its already-wired pages remain alive and keep their original object identity.
-This class only hides the tab bar and routes page selection through the new Fluent
-navigation shell.
+all of its already-wired pages remain alive. The modern shell hides the native tab
+bar, routes page selection through the Fluent navigation, and progressively wraps
+individual pages without reimplementing their business behaviour.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QHBoxLayout, QTabWidget, QVBoxLayout, QWidget
 
 from douk_manager.gui import MainWindow as LegacyMainWindow
 
+from ..pages.overview_page import ModernOverviewPage
 from ..theme.theme_manager import ThemeManager, ThemeMode
 from ..widgets.status_pill import StatusKind
 from .global_header import GlobalHeader
@@ -22,9 +23,8 @@ from .navigation import NavigationItem, NavigationSidebar
 class ModernMainWindow(LegacyMainWindow):
     """V0.1.7 shell layered around the proven V0.1.6 window.
 
-    No controller, background-task, startup-safety, queue, collector, audit,
-    result, or persistence behaviour is reimplemented here. Every existing
-    page remains the exact widget created by :class:`LegacyMainWindow`.
+    Controller, background-task, startup-safety, queue, collector, audit,
+    result, and persistence behaviour stay inherited from ``LegacyMainWindow``.
     """
 
     _LABEL_OVERRIDES = {
@@ -62,7 +62,24 @@ class ModernMainWindow(LegacyMainWindow):
             raise RuntimeError("failed to detach the V0.1.6 tab container")
 
         modern_root: QWidget | None = None
+        legacy_overview: QWidget | None = None
+        modern_overview: ModernOverviewPage | None = None
+        overview_label = ""
+        overview_replaced = False
         try:
+            # Phase 3 migration rule: keep the original overview widget alive,
+            # but host it inside the new dashboard so every V0.1.6 safety
+            # control keeps the exact same object identity and signal wiring.
+            if legacy_tabs.count() < 1:
+                raise RuntimeError("V0.1.6 overview tab is missing")
+            legacy_overview = legacy_tabs.widget(0)
+            overview_label = legacy_tabs.tabText(0)
+            legacy_tabs.removeTab(0)
+            modern_overview = ModernOverviewPage(self, legacy_overview)
+            legacy_tabs.insertTab(0, modern_overview, overview_label)
+            overview_replaced = True
+            legacy_tabs.setCurrentIndex(min(current_index, legacy_tabs.count() - 1))
+
             modern_root = QWidget(self)
             modern_root.setProperty("modernUi", True)
             modern_root.setObjectName("modernRoot")
@@ -96,9 +113,9 @@ class ModernMainWindow(LegacyMainWindow):
             sidebar = NavigationSidebar(navigation_items, body)
             body_layout.addWidget(sidebar)
 
-            # This is the key compatibility guarantee: the original QTabWidget
-            # itself is retained, with all page instances and signal wiring
-            # untouched. Only its native tab strip is hidden.
+            # The original QTabWidget itself remains the router. All pages
+            # except the overview are still the untouched V0.1.6 page widgets;
+            # the overview wrapper itself embeds the untouched old overview.
             legacy_tabs.setParent(body)
             tab_bar.hide()
             if corner is not None:
@@ -110,14 +127,16 @@ class ModernMainWindow(LegacyMainWindow):
             self._modern_root = modern_root
             self.modern_header = header
             self.modern_sidebar = sidebar
+            self.modern_overview = modern_overview
+            self._legacy_overview_page = legacy_overview
             self._legacy_tab_corner = corner
 
             sidebar.route_requested.connect(self._on_modern_route_requested)
             legacy_tabs.currentChanged.connect(self._on_legacy_tab_changed_for_shell)
-            self._on_legacy_tab_changed_for_shell(current_index)
+            self._on_legacy_tab_changed_for_shell(legacy_tabs.currentIndex())
 
             # Apply only selectors scoped to the modern shell. The V0.1.6 page
-            # stylesheet remains in force for the legacy pages during migration.
+            # stylesheet remains in force for legacy controls during migration.
             modern_root.setStyleSheet(self._modern_theme.stylesheet())
 
             self._modern_status_timer = QTimer(self)
@@ -128,6 +147,24 @@ class ModernMainWindow(LegacyMainWindow):
         except Exception:
             if modern_root is not None and self.centralWidget() is modern_root:
                 self.takeCentralWidget()
+
+            # Roll back the overview replacement before restoring the original
+            # central widget. This guarantees a shell failure returns the exact
+            # V0.1.6 page structure rather than a half-installed migration.
+            if (
+                overview_replaced
+                and modern_overview is not None
+                and legacy_overview is not None
+            ):
+                index = legacy_tabs.indexOf(modern_overview)
+                if index >= 0:
+                    legacy_tabs.removeTab(index)
+                legacy_overview.setParent(legacy_tabs)
+                legacy_tabs.insertTab(0, legacy_overview, overview_label)
+                legacy_tabs.setCurrentIndex(
+                    min(current_index, legacy_tabs.count() - 1)
+                )
+
             legacy_tabs.setParent(self)
             self.setCentralWidget(legacy_tabs)
             tab_bar.setVisible(previous_tab_bar_visible)
@@ -155,6 +192,8 @@ class ModernMainWindow(LegacyMainWindow):
     def _on_legacy_tab_changed_for_shell(self, index: int) -> None:
         if hasattr(self, "modern_sidebar") and 0 <= index < self.tabs.count():
             self.modern_sidebar.set_current_route(self._route_for_index(index))
+        if index == 0 and hasattr(self, "modern_overview"):
+            self.modern_overview.activate()
 
     def _sync_modern_status(self) -> None:
         """Mirror existing V0.1.6 status labels without querying backends again."""
