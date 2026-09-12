@@ -1,13 +1,14 @@
 """Modern presentation wrapper for untouched V0.1.6 feature pages.
 
 The wrapper changes presentation only: every original widget instance remains alive,
-with the same signals, slots, models, delegates and controller references.  This lets
+with the same signals, slots, models, delegates and controller references. This lets
 V0.1.7 modernise all feature pages in one pass without re-implementing behaviour.
 """
 
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QShowEvent
 from PySide6.QtWidgets import (
     QAbstractButton,
     QCheckBox,
@@ -60,7 +61,14 @@ _DANGER_HINTS = (
 
 
 class ModernLegacyPage(QWidget):
-    """Place one original feature page inside the V0.1.7 visual system."""
+    """Place one original feature page inside the V0.1.7 visual system.
+
+    ``QTabWidget`` explicitly hides every non-current page. Reparenting one of those
+    pages preserves that explicit hidden state, so a wrapper can otherwise appear
+    completely blank even though every original control is still present. The
+    wrapper therefore explicitly restores visibility after reparenting and again
+    when the wrapper itself is shown.
+    """
 
     def __init__(
         self,
@@ -128,6 +136,12 @@ class ModernLegacyPage(QWidget):
         legacy_page.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._mark_descendants(legacy_page)
         surface_layout.addWidget(legacy_page, 1)
+
+        # QTabWidget hides inactive pages explicitly. That hidden flag survives
+        # setParent(), so every page except the tab that happened to be current at
+        # migration time would otherwise remain invisible inside its new wrapper.
+        legacy_page.show()
+
         layout.addWidget(self.surface, 1)
 
     @staticmethod
@@ -177,6 +191,13 @@ class ModernLegacyPage(QWidget):
 
         root.style().unpolish(root)
         root.style().polish(root)
+
+    def showEvent(self, event: QShowEvent) -> None:  # noqa: N802 - Qt API
+        super().showEvent(event)
+        # Defensive repeat: keep the legacy root visible whenever this wrapper is
+        # the active page, without touching any child control's own visibility.
+        if self.legacy_page.isHidden():
+            self.legacy_page.show()
 
 
 __all__ = ["ModernLegacyPage"]
