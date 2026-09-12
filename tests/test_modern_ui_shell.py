@@ -11,6 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication
 
 from douk_manager.gui import MainWindow as LegacyMainWindow
+from douk_manager.ui.pages.legacy_page import ModernLegacyPage
 from douk_manager.ui.shell.main_window import ModernMainWindow
 
 
@@ -31,6 +32,10 @@ class ModernUiShellTests(unittest.TestCase):
         timer = getattr(window, "_modern_status_timer", None)
         if timer is not None:
             timer.stop()
+        overview = getattr(window, "modern_overview", None)
+        if overview is not None:
+            overview._timer.stop()
+            overview._clock_timer.stop()
         window.poll_timer.stop()
         window.hide()
         window.deleteLater()
@@ -42,15 +47,38 @@ class ModernUiShellTests(unittest.TestCase):
                 handler.close()
         self._home_patch.stop()
 
-    def test_shell_wraps_the_existing_v016_pages_without_recreating_them(self) -> None:
+    def test_shell_wraps_every_existing_v016_page_without_recreating_it(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             window = self._window(Path(directory))
             self.assertIsInstance(window, LegacyMainWindow)
             self.assertIsNone(window._modern_shell_install_error)
             self.assertEqual(window.tabs.count(), 10)
-            self.assertIs(window.tabs.widget(window.audit_tab_index), window.account_audit_page)
-            self.assertIs(window.tabs.widget(window.result_tab_index), window.result_page)
-            self.assertIs(window.tabs.widget(window.dashboard_tab_index), window.dashboard_page)
+
+            audit_wrapper = window.tabs.widget(window.audit_tab_index)
+            result_wrapper = window.tabs.widget(window.result_tab_index)
+            dashboard_wrapper = window.tabs.widget(window.dashboard_tab_index)
+            self.assertIsInstance(audit_wrapper, ModernLegacyPage)
+            self.assertIsInstance(result_wrapper, ModernLegacyPage)
+            self.assertIsInstance(dashboard_wrapper, ModernLegacyPage)
+            self.assertIs(audit_wrapper.legacy_page, window.account_audit_page)
+            self.assertIs(result_wrapper.legacy_page, window.result_page)
+            self.assertIs(dashboard_wrapper.legacy_page, window.dashboard_page)
+
+            expected_labels = {
+                "账号任务",
+                "账号审计",
+                "批次生成",
+                "下载队列",
+                "账号采集",
+                "截图与索引",
+                "下载结果",
+                "结果看板",
+                "设置",
+            }
+            self.assertEqual(set(window.modern_feature_pages), expected_labels)
+            for label, wrapper in window.modern_feature_pages.items():
+                self.assertIs(wrapper.legacy_page, window._legacy_feature_pages[label])
+
             self.assertFalse(window.tabs.tabBar().isVisible())
             self.assertIs(window.centralWidget(), window._modern_root)
             self._dispose_window(window)
