@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import re
-from urllib.parse import unquote, urlsplit, urlunsplit
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlsplit, urlunsplit
+
+from .json_store import read_json
+from .locks import critical_section
 
 
 _ALLOWED_HOSTS = frozenset({"douyin.com", "www.douyin.com"})
@@ -18,6 +24,85 @@ class ProfileUrlError(ValueError):
 
     def __init__(self, reason: str = "invalid profile URL") -> None:
         super().__init__(reason)
+
+
+class ProfileUrlStatus(str, Enum):
+    FOUND = "FOUND"
+    MISSING = "MISSING"
+    INVALID = "INVALID"
+    READ_ERROR = "READ_ERROR"
+
+
+@dataclass(frozen=True)
+class FormalAccountRef:
+    """A stable reference to a formal account array position."""
+
+    a_number: int
+
+
+@dataclass(frozen=True)
+class ProfileUrlResolution:
+    """A non-sensitive result of resolving one formal account reference."""
+
+    reference: FormalAccountRef
+    status: ProfileUrlStatus
+    url: str | None = None
+
+
+class ProfileUrlResolver:
+    """Resolve a formal A number from the current master settings snapshot."""
+
+    def __init__(self, master_settings: Path, *, lock_path: Path | None = None) -> None:
+        self.master_settings = Path(master_settings)
+        self.lock_path = Path(lock_path) if lock_path is not None else None
+
+    def resolve(self, reference: FormalAccountRef) -> ProfileUrlResolution:
+        if not self._valid_reference(reference):
+            return ProfileUrlResolution(reference, ProfileUrlStatus.MISSING)
+        try:
+            document = self._read_master()
+        except Exception:
+            # Do not expose the path, parser exception, or any data from the file.
+            return ProfileUrlResolution(reference, ProfileUrlStatus.READ_ERROR)
+
+        if not isinstance(document, dict):
+            return ProfileUrlResolution(reference, ProfileUrlStatus.READ_ERROR)
+        accounts = document.get("accounts_urls")
+        if not isinstance(accounts, list):
+            return ProfileUrlResolution(reference, ProfileUrlStatus.READ_ERROR)
+        index = reference.a_number - 1
+        if index >= len(accounts):
+            return ProfileUrlResolution(reference, ProfileUrlStatus.MISSING)
+        account = accounts[index]
+        if not isinstance(account, dict):
+            return ProfileUrlResolution(reference, ProfileUrlStatus.READ_ERROR)
+        raw_url = account.get("url")
+        if not isinstance(raw_url, str) or not raw_url.strip():
+            return ProfileUrlResolution(reference, ProfileUrlStatus.MISSING)
+        try:
+            admitted_url = strict_admit_url(raw_url)
+        except ProfileUrlError:
+            return ProfileUrlResolution(reference, ProfileUrlStatus.INVALID)
+        return ProfileUrlResolution(
+            reference,
+            ProfileUrlStatus.FOUND,
+            url=admitted_url,
+        )
+
+    @staticmethod
+    def _valid_reference(reference: FormalAccountRef) -> bool:
+        return (
+            isinstance(reference, FormalAccountRef)
+            and isinstance(reference.a_number, int)
+            and not isinstance(reference.a_number, bool)
+            and reference.a_number >= 1
+        )
+
+    def _read_master(self) -> Any:
+        if self.lock_path is None:
+            return read_json(self.master_settings)
+        with critical_section(self.lock_path):
+            return read_json(self.master_settings)
 
 
 def _text(value: Any) -> str:

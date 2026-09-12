@@ -96,6 +96,12 @@ from douk_manager.core.log_stats import (
     truncate_reason_zh,
 )
 from douk_manager.core.power import request_normal_shutdown
+from douk_manager.core.profile_url import (
+    ProfileUrlError,
+    ProfileUrlResolution,
+    ProfileUrlStatus,
+    strict_admit_url,
+)
 from douk_manager.core.result_history import ResultPageSnapshot
 from douk_manager.core.result_dashboard import (
     DashboardAccountRow,
@@ -637,6 +643,11 @@ class DashboardAccountTableModel(QAbstractTableModel):
             return getattr(row.status, "value", row.status) == expected
         return False
 
+    def account_number_at(self, row: int) -> int | None:
+        if row < 0 or row >= len(self._visible_rows):
+            return None
+        return self._visible_rows[row].a_number
+
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self._visible_rows)
 
@@ -933,6 +944,9 @@ class MainWindow(QMainWindow):
         self._result_render_cursor = 0
         self._result_render_runs = 0
         self._result_render_incomplete_old_runs = 0
+        self._result_sorting_enabled_before_render = False
+        self._result_sort_column_before_render = 0
+        self._result_sort_order_before_render = Qt.SortOrder.AscendingOrder
         self._latest_log_stats_run: Any | None = None
         self._pending_auto_log_stats_run: Any | None = None
         self._log_stats_result: LogStats | None = None
@@ -947,6 +961,8 @@ class MainWindow(QMainWindow):
         self._account_audit_decisions: dict[int, Disposition] = {}
         self._account_audit_task_id: str | None = None
         self._account_audit_refresh_after_apply = False
+        self._profile_open_task_id: str | None = None
+        self._homepage_buttons: list[QPushButton] = []
         self._queue_start_waiting_for_log_stats = False
         self._log_stats_auto_enabled = self._read_log_stats_auto_enabled()
         self._collector_stop_task_id: str | None = None
@@ -1124,6 +1140,198 @@ class MainWindow(QMainWindow):
             self.account_audit_clear_button.setEnabled(decision_ready)
             for button in self.account_audit_decision_buttons:
                 button.setEnabled(decision_ready)
+        self._update_profile_button_states()
+
+    def _selected_result_a_number(self) -> int | None:
+        if not hasattr(self, "result_table"):
+            return None
+        rows = self.result_table.selectionModel().selectedRows()
+        if len(rows) != 1:
+            return None
+        item = self.result_table.item(rows[0].row(), 1)
+        if item is None:
+            return None
+        value = item.text().strip()
+        if value[:1].casefold() != "a":
+            return None
+        number = value[1:].strip()
+        if not number.isdecimal():
+            return None
+        parsed = int(number)
+        return parsed if parsed >= 1 else None
+
+    def _selected_dashboard_a_number(self) -> int | None:
+        if not hasattr(self, "dashboard_account_table"):
+            return None
+        rows = self.dashboard_account_table.selectionModel().selectedRows(0)
+        if len(rows) != 1:
+            return None
+        return self._dashboard_account_model.account_number_at(rows[0].row())
+
+    def _selected_account_audit_a_number(self) -> int | None:
+        if not hasattr(self, "account_audit_table"):
+            return None
+        rows = self.account_audit_table.selectionModel().selectedRows(0)
+        if len(rows) != 1:
+            return None
+        entry = self._account_audit_model.entry_at(rows[0].row())
+        return None if entry is None else entry.a_number
+
+    def _profile_open_is_active(self) -> bool:
+        return any(
+            binding.generation_key == "profile_url_resolve"
+            for binding in self._background_bindings.values()
+        )
+
+    def _update_profile_button_states(self) -> None:
+        homepage_buttons = getattr(self, "_homepage_buttons", ())
+        if not homepage_buttons:
+            return
+        for button in homepage_buttons:
+            button.setEnabled(False)
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        if self._profile_open_is_active():
+            return
+        selections = (
+            (
+                getattr(self, "result_open_home_button", None),
+                self._selected_result_a_number(),
+            ),
+            (
+                getattr(self, "dashboard_open_home_button", None),
+                self._selected_dashboard_a_number(),
+            ),
+            (
+                getattr(self, "account_audit_open_home_button", None),
+                self._selected_account_audit_a_number(),
+            ),
+        )
+        for button, a_number in selections:
+            if button is not None and a_number is not None:
+                button.setEnabled(True)
+
+    def _profile_selection_matches(self, source: str, a_number: int) -> bool:
+        selected = {
+            "result": self._selected_result_a_number,
+            "dashboard": self._selected_dashboard_a_number,
+            "audit": self._selected_account_audit_a_number,
+        }.get(source)
+        return selected is not None and selected() == a_number
+
+    def _open_result_profile(self) -> None:
+        self._open_profile_for_selection("result", self._selected_result_a_number())
+
+    def _open_dashboard_profile(self) -> None:
+        self._open_profile_for_selection(
+            "dashboard", self._selected_dashboard_a_number()
+        )
+
+    def _open_account_audit_profile(self) -> None:
+        self._open_profile_for_selection(
+            "audit", self._selected_account_audit_a_number()
+        )
+
+    def _open_profile_for_selection(self, source: str, a_number: int | None) -> None:
+        if a_number is None:
+            QMessageBox.information(self, "打开主页", "请先选择一个账号。")
+            self._update_profile_button_states()
+            return
+        self._submit_profile_open(source, a_number)
+
+    def _submit_profile_open(self, source: str, a_number: int) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        spec = TaskSpec(
+            task_type="profile_url_resolve",
+            display_name="读取账号主页地址",
+            resource_keys=frozenset({"settings"}),
+            deduplicate_key="profile_url_resolve",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            refresh_targets=(),
+            dynamic_cancellation=True,
+        )
+        task_id = self._submit_coalesced_background(
+            spec,
+            lambda context: self.controller.resolve_profile_url(
+                a_number, context=context
+            ),
+            buttons=tuple(self._homepage_buttons),
+            on_success=lambda resolution: self._apply_profile_resolution(
+                resolution, source, a_number
+            ),
+            on_failure=lambda _payload: self._profile_resolution_failed(
+                source, a_number
+            ),
+            on_cancelled=lambda _payload: self._profile_open_cancelled(),
+            on_removed=self._profile_open_removed,
+            generation_key="profile_url_resolve",
+        )
+        if task_id is not None:
+            self._profile_open_task_id = task_id
+        self._update_profile_button_states()
+
+    def _apply_profile_resolution(
+        self,
+        resolution: object,
+        source: str,
+        a_number: int,
+    ) -> None:
+        if not self._profile_selection_matches(source, a_number):
+            return
+        if not isinstance(resolution, ProfileUrlResolution):
+            self._profile_resolution_failed(source, a_number)
+            return
+        if getattr(resolution.reference, "a_number", None) != a_number:
+            return
+        if resolution.status is ProfileUrlStatus.MISSING:
+            self._show_profile_resolution_message(a_number, "账号主页地址不存在。")
+            return
+        if resolution.status is ProfileUrlStatus.INVALID:
+            self._show_profile_resolution_message(a_number, "账号主页地址无效。")
+            return
+        if resolution.status is ProfileUrlStatus.READ_ERROR:
+            self._show_profile_resolution_message(
+                a_number, "无法读取账号主页地址，请先处理数据错误。"
+            )
+            return
+        if resolution.status is not ProfileUrlStatus.FOUND or not resolution.url:
+            self._profile_resolution_failed(source, a_number)
+            return
+        try:
+            admitted_url = strict_admit_url(resolution.url)
+        except (ProfileUrlError, TypeError):
+            self._show_profile_resolution_message(a_number, "账号主页地址无效。")
+            return
+        if not QDesktopServices.openUrl(QUrl(admitted_url)):
+            self._show_profile_resolution_message(a_number, "默认浏览器打开主页失败。")
+            return
+        self.statusBar().showMessage(f"已请求默认浏览器打开 A{a_number} 主页")
+
+    def _show_profile_resolution_message(self, a_number: int, reason: str) -> None:
+        QMessageBox.information(self, "无法打开主页", f"A{a_number}：{reason}")
+
+    def _profile_resolution_failed(self, source: str, a_number: int) -> None:
+        if not self._profile_selection_matches(source, a_number):
+            return
+        self._show_profile_resolution_message(
+            a_number, "无法读取账号主页地址，请先处理数据错误。"
+        )
+
+    def _profile_open_cancelled(self) -> None:
+        self.statusBar().showMessage("打开主页操作已取消。")
+
+    def _profile_open_removed(self) -> None:
+        self._profile_open_task_id = next(
+            (
+                task_id
+                for task_id, binding in self._background_bindings.items()
+                if binding.generation_key == "profile_url_resolve"
+            ),
+            None,
+        )
+        self._update_profile_button_states()
 
     def begin_startup_check(self) -> bool:
         if self.controller.startup_state is StartupState.CLOSING:
@@ -1554,6 +1762,16 @@ class MainWindow(QMainWindow):
             "这不是实时联网检测；分析结果仍只是建议，不会自动修改账号状态。"
         )
         controls.addWidget(self.account_audit_native_logs)
+        self.account_audit_open_home_button = QPushButton("打开主页")
+        self.account_audit_open_home_button.setToolTip(
+            "从当前正式主档按选中 A 编号读取并打开主页。"
+        )
+        self.account_audit_open_home_button.clicked.connect(
+            self._open_account_audit_profile
+        )
+        self.account_audit_open_home_button.setEnabled(False)
+        self._homepage_buttons.append(self.account_audit_open_home_button)
+        controls.addWidget(self.account_audit_open_home_button)
         controls.addStretch()
         self.account_audit_cancel_button = QPushButton("取消当前审计操作")
         self.account_audit_cancel_button.setEnabled(False)
@@ -1632,6 +1850,9 @@ class MainWindow(QMainWindow):
         self.account_audit_table.setColumnWidth(2, 48)
         self.account_audit_table.selectionModel().selectionChanged.connect(
             self._show_account_audit_selection_details
+        )
+        self.account_audit_table.selectionModel().selectionChanged.connect(
+            self._update_profile_button_states
         )
         layout.addWidget(self.account_audit_table, 1)
 
@@ -2194,6 +2415,14 @@ class MainWindow(QMainWindow):
         refresh_button.setToolTip("立即重新读取 Logs\\DownloadTasks 中的最新任务结果。")
         refresh_button.clicked.connect(self.refresh_results)
         filters.addWidget(refresh_button)
+        self.result_open_home_button = QPushButton("打开主页")
+        self.result_open_home_button.setToolTip(
+            "从当前正式主档按选中 A 编号读取并打开主页。"
+        )
+        self.result_open_home_button.clicked.connect(self._open_result_profile)
+        self.result_open_home_button.setEnabled(False)
+        self._homepage_buttons.append(self.result_open_home_button)
+        filters.addWidget(self.result_open_home_button)
         layout.addLayout(filters)
         self.result_table = QTableWidget(0, 6)
         self.result_table.setHorizontalHeaderLabels(
@@ -2201,8 +2430,15 @@ class MainWindow(QMainWindow):
         )
         self.result_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.result_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.result_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.result_table.setSortingEnabled(True)
         self.result_table.horizontalHeader().setStretchLastSection(True)
         self.result_table.cellDoubleClicked.connect(self._open_result_log)
+        self.result_table.itemSelectionChanged.connect(
+            self._update_profile_button_states
+        )
         self.result_table.setToolTip("双击“来源日志”单元格可直接打开对应任务日志。")
         layout.addWidget(self.result_table, 1)
         self.result_note = QLabel()
@@ -2346,6 +2582,14 @@ class MainWindow(QMainWindow):
         self.dashboard_account_search.setPlaceholderText("A 编号，例如 55")
         self.dashboard_account_search.setClearButtonEnabled(True)
         account_filters.addWidget(self.dashboard_account_search)
+        self.dashboard_open_home_button = QPushButton("打开主页")
+        self.dashboard_open_home_button.setToolTip(
+            "从当前正式主档按选中 A 编号读取并打开主页。"
+        )
+        self.dashboard_open_home_button.clicked.connect(self._open_dashboard_profile)
+        self.dashboard_open_home_button.setEnabled(False)
+        self._homepage_buttons.append(self.dashboard_open_home_button)
+        account_filters.addWidget(self.dashboard_open_home_button)
         self.dashboard_account_summary = QLabel("显示 0 / 0；需关注 0；无法归类 未知")
         self.dashboard_account_summary.setWordWrap(True)
         account_filters.addWidget(self.dashboard_account_summary, 1)
@@ -2385,6 +2629,9 @@ class MainWindow(QMainWindow):
         )
         self.dashboard_account_search.textChanged.connect(
             self._apply_dashboard_account_filter
+        )
+        self.dashboard_account_table.selectionModel().selectionChanged.connect(
+            self._update_profile_button_states
         )
         account_layout.addWidget(self.dashboard_account_table)
         layout.addWidget(account_box)
@@ -4095,12 +4342,18 @@ class MainWindow(QMainWindow):
         self._result_render_cursor = 0
         self._result_render_runs = len(snapshot.runs)
         self._result_render_incomplete_old_runs = snapshot.incomplete_old_runs
+        header = self.result_table.horizontalHeader()
+        self._result_sorting_enabled_before_render = self.result_table.isSortingEnabled()
+        self._result_sort_column_before_render = header.sortIndicatorSection()
+        self._result_sort_order_before_render = header.sortIndicatorOrder()
+        self.result_table.setSortingEnabled(False)
         self.result_table.setUpdatesEnabled(False)
         try:
             self.result_table.clearContents()
             self.result_table.setRowCount(len(filtered))
         finally:
             self.result_table.setUpdatesEnabled(True)
+        self._update_profile_button_states()
         self.result_note.setText(f"正在显示 {len(filtered)} 条账号结果……")
         self.result_render_timer.start(0)
 
@@ -4136,6 +4389,14 @@ class MainWindow(QMainWindow):
         self.result_last_refresh.setText(
             f"最近刷新：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
+        if self._result_sorting_enabled_before_render:
+            self.result_table.setSortingEnabled(True)
+            if self._result_sort_column_before_render >= 0:
+                self.result_table.sortItems(
+                    self._result_sort_column_before_render,
+                    self._result_sort_order_before_render,
+                )
+        self._update_profile_button_states()
 
     def refresh_results(self) -> None:
         if (

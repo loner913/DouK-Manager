@@ -41,6 +41,11 @@ from douk_manager.core.settings_tasks import (
     SettingsTaskService,
 )
 from douk_manager.core.task_order import TaskOrderService
+from douk_manager.core.profile_url import (
+    FormalAccountRef,
+    ProfileUrlResolution,
+    ProfileUrlResolver,
+)
 from douk_manager.core.result_history import RecentPrivateMatch, ResultHistoryService
 from douk_manager.core.watchlist import WatchlistService
 from douk_manager.core.watchlist_session import ManagerInstanceLease
@@ -103,6 +108,10 @@ class ManagerController:
         self.tasks = SettingsTaskService(self.paths, self.backup)
         self.task_order = TaskOrderService(self.paths)
         self.results = ResultHistoryService(self.paths.download_task_logs)
+        self.profile_url_resolver = ProfileUrlResolver(
+            self.paths.master_settings,
+            lock_path=self.paths.lock_file,
+        )
         self.account_audit = AccountAuditService(
             self.results,
             paths=self.paths,
@@ -550,6 +559,27 @@ class ManagerController:
 
     def result_rows(self, *, limit: int = 500):
         return self.results.list_account_rows(limit=limit)
+
+    def resolve_profile_url(
+        self,
+        a_number: int,
+        *,
+        context: OperationContext | None = None,
+    ) -> ProfileUrlResolution:
+        """Resolve one formal A number without exposing its URL to the UI."""
+        self._require_operational_ready_with_context(
+            "读取账号主页地址", context=context
+        )
+        resolver = getattr(self, "profile_url_resolver", None)
+        if resolver is None:
+            resolver = ProfileUrlResolver(
+                self.paths.master_settings,
+                lock_path=self.paths.lock_file,
+            )
+        result = resolver.resolve(FormalAccountRef(a_number))
+        if context is not None:
+            context.raise_if_cancelled()
+        return result
 
     def result_snapshot(
         self,
