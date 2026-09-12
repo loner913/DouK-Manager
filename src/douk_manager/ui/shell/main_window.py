@@ -15,6 +15,7 @@ from douk_manager.gui import MainWindow as LegacyMainWindow
 
 from ..pages.legacy_page import ModernLegacyPage
 from ..pages.overview_page import ModernOverviewPage
+from ..theme.readability import feature_readability_stylesheet
 from ..theme.theme_manager import ThemeManager, ThemeMode
 from ..widgets.status_pill import StatusKind
 from .global_header import GlobalHeader
@@ -178,7 +179,11 @@ class ModernMainWindow(LegacyMainWindow):
             legacy_tabs.currentChanged.connect(self._on_legacy_tab_changed_for_shell)
             self._on_legacy_tab_changed_for_shell(legacy_tabs.currentIndex())
 
-            modern_root.setStyleSheet(self._modern_theme.stylesheet())
+            modern_root.setStyleSheet(
+                self._modern_theme.stylesheet()
+                + "\n\n"
+                + feature_readability_stylesheet(self._modern_theme.palette)
+            )
 
             self._modern_status_timer = QTimer(self)
             self._modern_status_timer.setInterval(250)
