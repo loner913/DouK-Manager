@@ -83,6 +83,32 @@ class ModernUiShellTests(unittest.TestCase):
             self.assertIs(window.centralWidget(), window._modern_root)
             self._dispose_window(window)
 
+    def test_every_wrapped_legacy_page_becomes_visible_when_selected(self) -> None:
+        """Regression: QTabWidget keeps inactive pages explicitly hidden.
+
+        Reparenting that hidden page into a modern wrapper must clear the hidden flag,
+        otherwise the wrapper renders as an empty white page on real Windows.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = self._window(Path(directory))
+            for index in range(1, window.tabs.count()):
+                window.tabs.setCurrentIndex(index)
+                self.app.processEvents()
+                wrapper = window.tabs.widget(index)
+                self.assertIsInstance(wrapper, ModernLegacyPage)
+                self.assertFalse(
+                    wrapper.legacy_page.isHidden(),
+                    f"{wrapper.page_title} legacy root remained explicitly hidden",
+                )
+                self.assertTrue(
+                    wrapper.legacy_page.isVisibleTo(wrapper.surface),
+                    f"{wrapper.page_title} legacy root is not visible inside its surface",
+                )
+                self.assertGreater(wrapper.legacy_page.width(), 0)
+                self.assertGreater(wrapper.legacy_page.height(), 0)
+            self._dispose_window(window)
+
     def test_sidebar_routes_through_the_original_qtabwidget(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             window = self._window(Path(directory))
