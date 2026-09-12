@@ -8,10 +8,8 @@ from .tokens import ThemePalette
 def feature_readability_stylesheet(p: ThemePalette) -> str:
     """Return presentation-only typography and layout styles for migrated pages.
 
-    These rules deliberately target only widgets under ``legacyRoot``. They do not
-    replace controls, signals, models, validators or enabled/disabled state; they
-    make the preserved V0.1.6 UI readable and visually grouped on real Windows
-    1440p/4K displays.
+    These rules deliberately target only the migrated legacy surface. They do not
+    replace controls, signals, models, validators or enabled/disabled state.
     """
 
     warning_bg = "#FFF8E8" if p.surface == "#FFFFFF" else "#3B2B12"
@@ -23,6 +21,14 @@ QLabel#modernPageSubtitle {{
     color: {p.text_secondary};
     font-size: 14px;
     font-weight: 500;
+}}
+
+/* The page canvas is already the Fluent background.  Avoid the previous giant
+   white panel around every feature page; individual section cards provide the
+   hierarchy instead. */
+QFrame[modernFeatureSurface="true"] {{
+    background: transparent;
+    border: none;
 }}
 
 QWidget[legacyRoot="true"] {{
@@ -38,8 +44,7 @@ QWidget[legacyRoot="true"] QGroupBox[legacyCard="true"] {{
     font-weight: 700;
 }}
 
-/* V0.1.7 reflow cards.  These containers are presentation-only; their children
-   are the original V0.1.6 widget instances. */
+/* Section cards are now the primary visual containers. */
 QWidget[legacyRoot="true"] QFrame[legacySectionCard="true"] {{
     background: {p.surface};
     border: 1px solid {p.border};
@@ -50,7 +55,7 @@ QWidget[legacyRoot="true"] QFrame[legacyCompactCard="true"] {{
 }}
 QWidget[legacyRoot="true"] QLabel[legacySectionTitle="true"] {{
     color: {p.text_primary};
-    font-size: 17px;
+    font-size: 18px;
     font-weight: 700;
 }}
 QWidget[legacyRoot="true"] QLabel[legacySectionNote="true"] {{
@@ -59,7 +64,7 @@ QWidget[legacyRoot="true"] QLabel[legacySectionNote="true"] {{
     font-weight: 500;
 }}
 QWidget[legacyRoot="true"] QLabel[legacyBanner="true"] {{
-    padding: 11px 13px;
+    padding: 10px 13px;
     color: {p.text_secondary};
     background: {info_bg};
     border: 1px solid {p.border};
@@ -88,14 +93,23 @@ QWidget[legacyRoot="true"] QTextEdit[legacyOutput="true"] {{
     background: {p.surface_alt};
 }}
 
-/* Reflowed group boxes become inner control groups rather than giant page-level
-   rectangles.  Keep their titles but reduce the visual weight inside cards. */
+/* Legacy group boxes used to be page-sized panels.  Inside a modern section card
+   they become flat sub-groups, eliminating the boxes-inside-boxes look. */
 QWidget[legacyRoot="true"][legacyReflowed="true"] QGroupBox[legacyCard="true"] {{
-    margin-top: 16px;
-    padding: 17px 14px 13px 14px;
-    background: {p.surface_alt};
-    border: 1px solid {p.border};
-    border-radius: 9px;
+    margin-top: 14px;
+    padding: 16px 0 0 0;
+    background: transparent;
+    border: none;
+    border-radius: 0px;
+}}
+QWidget[legacyRoot="true"][legacyReflowed="true"] QGroupBox[legacyCard="true"]::title {{
+    subcontrol-origin: margin;
+    left: 0px;
+    padding: 0 4px 0 0;
+    color: {p.text_primary};
+    background: transparent;
+    font-size: 14px;
+    font-weight: 700;
 }}
 
 QWidget[legacyRoot="true"] QLineEdit[legacyModernized="true"],
