@@ -33,10 +33,6 @@ def _text_or_dash(value: object | None) -> str:
     return text or "—"
 
 
-def _format_datetime(value: datetime | None) -> str:
-    return "—" if value is None else value.strftime("%Y-%m-%d %H:%M:%S")
-
-
 def _status_name(status: object) -> str:
     name = getattr(status, "name", "")
     if name:
@@ -58,8 +54,8 @@ class ModernOverviewPage(QWidget):
     """Modern dashboard that reads real V0.1.6 runtime state.
 
     The legacy overview widget is retained verbatim in the expandable diagnostics
-    area, keeping every original button, signal/slot, action gate, startup label,
-    diagnostic field, and object identity alive.
+    area.  The modern layer only presents already-existing data and navigation;
+    original buttons, signals, action gates and startup safety logic remain alive.
     """
 
     def __init__(
@@ -86,11 +82,13 @@ class ModernOverviewPage(QWidget):
         self.scroll.setObjectName("modernOverviewScroll")
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         root.addWidget(self.scroll)
 
         self.canvas = QWidget(self.scroll)
         self.canvas.setProperty("modernUi", True)
         self.canvas.setObjectName("modernOverviewCanvas")
+        self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.scroll.setWidget(self.canvas)
 
         self.layout = QVBoxLayout(self.canvas)
@@ -107,7 +105,13 @@ class ModernOverviewPage(QWidget):
         self._build_analytics()
         self._build_work_area()
         self._build_diagnostics()
-        self.layout.addStretch(1)
+
+        # Do not put a catch-all stretch at the bottom.  On a maximized Windows
+        # desktop that made the whole dashboard hug the top edge while hundreds
+        # of pixels of the viewport remained empty.  Instead, let the two useful
+        # information bands absorb available height in a stable 3:2 proportion.
+        self.layout.setStretchFactor(self.analytics_grid, 3)
+        self.layout.setStretchFactor(self.work_grid, 2)
 
         self._timer = QTimer(self)
         self._timer.setInterval(350)
@@ -123,6 +127,7 @@ class ModernOverviewPage(QWidget):
 
     def _build_heading(self) -> None:
         row = QHBoxLayout()
+        row.setSpacing(14)
         heading = QVBoxLayout()
         heading.setSpacing(2)
         self.title = QLabel("运行总览", self.canvas)
@@ -161,22 +166,22 @@ class ModernOverviewPage(QWidget):
         self.metric_grid.setVerticalSpacing(10)
         self.metrics = {
             "planned": MetricCard(
-                "计划账号", note="最近一次可用任务", icon_text="◎", tone="primary", parent=self.canvas
+                "计划账号", note="最近一次可用任务", tone="primary", parent=self.canvas
             ),
             "started": MetricCard(
-                "实际开始", note="最近一次可用任务", icon_text="▶", tone="success", parent=self.canvas
+                "实际开始", note="最近一次可用任务", tone="success", parent=self.canvas
             ),
             "complete": MetricCard(
-                "完整性", note="基于任务日志证据", icon_text="✓", tone="info", parent=self.canvas
+                "完整性", note="基于任务日志证据", tone="info", parent=self.canvas
             ),
             "reliable": MetricCard(
-                "可靠性", note="基于任务日志证据", icon_text="◆", tone="violet", parent=self.canvas
+                "可靠性", note="基于任务日志证据", tone="violet", parent=self.canvas
             ),
             "anomaly": MetricCard(
-                "附加异常", note="完成后发现的异常", icon_text="!", tone="danger", parent=self.canvas
+                "附加异常", note="完成后发现的异常", tone="danger", parent=self.canvas
             ),
             "not_started": MetricCard(
-                "未进入处理", note="计划内但未开始", icon_text="◷", tone="warning", parent=self.canvas
+                "未进入处理", note="计划内但未开始", tone="warning", parent=self.canvas
             ),
         }
         self.layout.addLayout(self.metric_grid)
@@ -186,21 +191,39 @@ class ModernOverviewPage(QWidget):
         self.analytics_grid.setHorizontalSpacing(10)
         self.analytics_grid.setVerticalSpacing(10)
 
-        self.trend_card = self._make_card("最近 7 天任务趋势", "按真实任务日志结束时间统计")
+        self.trend_card = self._make_card(
+            "最近 7 天任务趋势", "按真实任务日志结束时间统计"
+        )
+        self.trend_card.setMinimumHeight(260)
+        self.trend_card.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
         self.trend_chart = TaskTrendChart(self.trend_card)
         self.trend_card.layout().addWidget(self.trend_chart, 1)
 
         self.composition_card = self._make_card("结果构成", "最近一次可用任务")
+        self.composition_card.setMinimumHeight(260)
+        self.composition_card.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
         composition_body = QHBoxLayout()
+        composition_body.setContentsMargins(0, 0, 0, 0)
+        composition_body.setSpacing(8)
         self.donut_chart = DonutChart(self.composition_card)
         composition_body.addWidget(self.donut_chart, 1)
         self.composition_legend = QLabel("暂无可用任务结果", self.composition_card)
         self.composition_legend.setObjectName("modernDetailLabel")
         self.composition_legend.setWordWrap(True)
         composition_body.addWidget(self.composition_legend, 1)
-        self.composition_card.layout().addLayout(composition_body)
+        self.composition_card.layout().addLayout(composition_body, 1)
 
-        self.throughput_card = self._make_card("下载吞吐", "最近一次任务的真实处理效率")
+        self.throughput_card = self._make_card(
+            "下载吞吐", "最近一次任务的真实处理效率"
+        )
+        self.throughput_card.setMinimumHeight(260)
+        self.throughput_card.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
         self.throughput_value = QLabel("—", self.throughput_card)
         self.throughput_value.setObjectName("modernMetricValue")
         self.throughput_note = QLabel("等待真实任务日志", self.throughput_card)
@@ -213,7 +236,7 @@ class ModernOverviewPage(QWidget):
         self.throughput_bar.setValue(0)
         self.throughput_card.layout().addWidget(self.throughput_value)
         self.throughput_card.layout().addWidget(self.throughput_note)
-        self.throughput_card.layout().addSpacing(8)
+        self.throughput_card.layout().addSpacing(10)
         self.throughput_card.layout().addWidget(self.throughput_bar)
         self.throughput_card.layout().addStretch(1)
 
@@ -224,32 +247,64 @@ class ModernOverviewPage(QWidget):
         self.work_grid.setHorizontalSpacing(10)
         self.work_grid.setVerticalSpacing(10)
 
-        self.task_card = self._make_card("账号任务", "快速进入原有 V0.1.6 账号任务功能")
-        self.task_summary = QLabel("账号表达式、Earliest、智能跳过等行为保持原样。", self.task_card)
+        self.task_card = self._make_card(
+            "账号任务", "快速进入原有 V0.1.6 账号任务功能"
+        )
+        self.task_card.setProperty("workCard", True)
+        self.task_card.setMinimumHeight(190)
+        self.task_card.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        self.task_summary = QLabel(
+            "账号表达式、Earliest、智能跳过与执行入口继续使用原有逻辑。",
+            self.task_card,
+        )
         self.task_summary.setObjectName("modernDetailLabel")
         self.task_summary.setWordWrap(True)
         self.task_card.layout().addWidget(self.task_summary)
-        task_button = self._action_button("打开账号任务", "primary")
-        task_button.clicked.connect(lambda: self._navigate("账号任务"))
-        self.task_card.layout().addWidget(task_button)
+        self.task_card.layout().addStretch(1)
+        self.task_button = self._action_button("打开账号任务", "primary")
+        self.task_button.clicked.connect(lambda: self._navigate("账号任务"))
+        self.task_card.layout().addWidget(self.task_button)
 
         self.queue_card = self._make_card("下载队列", "当前队列状态")
+        self.queue_card.setProperty("workCard", True)
+        self.queue_card.setMinimumHeight(190)
+        self.queue_card.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
         self.queue_state_value = QLabel("空闲", self.queue_card)
-        self.queue_state_value.setObjectName("modernDetailValue")
+        self.queue_state_value.setObjectName("modernWorkValue")
         self.queue_state_value.setWordWrap(True)
         self.queue_card.layout().addWidget(self.queue_state_value)
-        queue_button = self._action_button("打开下载队列", "secondary")
-        queue_button.clicked.connect(lambda: self._navigate("下载队列"))
-        self.queue_card.layout().addWidget(queue_button)
+        queue_note = QLabel(
+            "队列、暂停、继续、取消和完成处理仍由 V0.1.6 原流程负责。",
+            self.queue_card,
+        )
+        queue_note.setObjectName("modernDetailLabel")
+        queue_note.setWordWrap(True)
+        self.queue_card.layout().addWidget(queue_note)
+        self.queue_card.layout().addStretch(1)
+        self.queue_button = self._action_button("打开下载队列", "secondary")
+        self.queue_button.clicked.connect(lambda: self._navigate("下载队列"))
+        self.queue_card.layout().addWidget(self.queue_button)
 
-        self.attention_card = self._make_card("最近异常", "只展示已有证据，不推断未知状态")
+        self.attention_card = self._make_card(
+            "最近异常", "只展示已有证据，不推断未知状态"
+        )
+        self.attention_card.setProperty("workCard", True)
+        self.attention_card.setMinimumHeight(190)
+        self.attention_card.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
         self.attention_value = QLabel("尚无可用任务结果", self.attention_card)
         self.attention_value.setObjectName("modernDetailLabel")
         self.attention_value.setWordWrap(True)
         self.attention_card.layout().addWidget(self.attention_value)
-        dashboard_button = self._action_button("查看结果看板", "secondary")
-        dashboard_button.clicked.connect(lambda: self._navigate("结果看板"))
-        self.attention_card.layout().addWidget(dashboard_button)
+        self.attention_card.layout().addStretch(1)
+        self.dashboard_button = self._action_button("查看结果看板", "secondary")
+        self.dashboard_button.clicked.connect(lambda: self._navigate("结果看板"))
+        self.attention_card.layout().addWidget(self.dashboard_button)
 
         self.layout.addLayout(self.work_grid)
 
@@ -257,6 +312,10 @@ class ModernOverviewPage(QWidget):
         self.compatibility = QFrame(self.canvas)
         self.compatibility.setProperty("modernUi", True)
         self.compatibility.setProperty("modernCard", True)
+        self.compatibility.setProperty("diagnosticCard", True)
+        self.compatibility.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum
+        )
         compatibility_layout = QVBoxLayout(self.compatibility)
         compatibility_layout.setContentsMargins(16, 14, 16, 16)
         compatibility_layout.setSpacing(10)
@@ -282,7 +341,9 @@ class ModernOverviewPage(QWidget):
 
         self._hide_duplicate_legacy_heading()
         self.legacy_page.setParent(self.compatibility)
-        self.legacy_page.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.legacy_page.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
         compatibility_layout.addWidget(self.legacy_page)
         self.legacy_page.hide()
         self.layout.addWidget(self.compatibility)
@@ -293,8 +354,8 @@ class ModernOverviewPage(QWidget):
         card.setProperty("modernUi", True)
         card.setProperty("modernCard", True)
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(6)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(7)
         label = QLabel(title, card)
         label.setObjectName("modernSectionTitle")
         layout.addWidget(label)
@@ -333,7 +394,12 @@ class ModernOverviewPage(QWidget):
     def set_diagnostics_expanded(self, expanded: bool) -> None:
         self._diagnostics_expanded = expanded
         self.legacy_page.setVisible(expanded)
+        self.compatibility.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred if expanded else QSizePolicy.Policy.Maximum,
+        )
         self.diagnostic_toggle.setText("收起诊断" if expanded else "展开诊断")
+        self.compatibility.updateGeometry()
 
     def activate(self) -> None:
         self._dashboard_refresh_requested = False
@@ -451,7 +517,9 @@ class ModernOverviewPage(QWidget):
         reasons = tuple(getattr(snapshot, "reliability_reasons", ()) or ())
         self.metrics["reliable"].set_metric(
             "可靠" if reliable else "需复核",
-            note="任务证据可信" if reliable else ("；".join(map(str, reasons[:2])) or "证据不足"),
+            note="任务证据可信"
+            if reliable
+            else ("；".join(map(str, reasons[:2])) or "证据不足"),
         )
 
         segments: list[tuple[str, int]] = []
@@ -488,7 +556,7 @@ class ModernOverviewPage(QWidget):
             self.throughput_bar.setValue(0)
             self.throughput_bar.setToolTip("暂无处理覆盖率")
 
-        attention_lines = []
+        attention_lines: list[str] = []
         if anomaly:
             attention_lines.append(f"完成后附加异常：{anomaly}")
         error_count = next(
@@ -515,7 +583,9 @@ class ModernOverviewPage(QWidget):
             attention_lines.append(f"进入处理前异常：{pre_start}")
         if not_started:
             attention_lines.append(f"未开始：{not_started}")
-        self.attention_value.setText("\n".join(attention_lines) or "最近任务没有需要关注的异常证据")
+        self.attention_value.setText(
+            "\n".join(attention_lines) or "最近任务没有需要关注的异常证据"
+        )
 
     def _update_clock(self) -> None:
         now = datetime.now()
@@ -544,36 +614,51 @@ class ModernOverviewPage(QWidget):
             self.metric_grid.removeWidget(card)
         for index, card in enumerate(self.metrics.values()):
             self.metric_grid.addWidget(card, index // columns, index % columns)
+            self.metric_grid.setColumnStretch(index % columns, 1)
 
     def _relayout_analytics(self, width: int) -> None:
         for card in (self.trend_card, self.composition_card, self.throughput_card):
             self.analytics_grid.removeWidget(card)
+        for column in range(4):
+            self.analytics_grid.setColumnStretch(column, 0)
         if width >= 1080:
             self.analytics_grid.addWidget(self.trend_card, 0, 0, 1, 2)
             self.analytics_grid.addWidget(self.composition_card, 0, 2)
             self.analytics_grid.addWidget(self.throughput_card, 0, 3)
-            for column in range(4):
-                self.analytics_grid.setColumnStretch(column, 1)
+            self.analytics_grid.setColumnStretch(0, 2)
+            self.analytics_grid.setColumnStretch(1, 2)
+            self.analytics_grid.setColumnStretch(2, 1)
+            self.analytics_grid.setColumnStretch(3, 1)
         elif width >= 720:
             self.analytics_grid.addWidget(self.trend_card, 0, 0, 1, 2)
             self.analytics_grid.addWidget(self.composition_card, 1, 0)
             self.analytics_grid.addWidget(self.throughput_card, 1, 1)
+            self.analytics_grid.setColumnStretch(0, 1)
+            self.analytics_grid.setColumnStretch(1, 1)
         else:
             self.analytics_grid.addWidget(self.trend_card, 0, 0)
             self.analytics_grid.addWidget(self.composition_card, 1, 0)
             self.analytics_grid.addWidget(self.throughput_card, 2, 0)
+            self.analytics_grid.setColumnStretch(0, 1)
 
     def _relayout_work(self, width: int) -> None:
         cards = (self.task_card, self.queue_card, self.attention_card)
         for card in cards:
             self.work_grid.removeWidget(card)
+        for column in range(3):
+            self.work_grid.setColumnStretch(column, 0)
         if width >= 900:
             for index, card in enumerate(cards):
                 self.work_grid.addWidget(card, 0, index)
-                self.work_grid.setColumnStretch(index, 1)
+            # Match the approved dashboard composition: the task and queue areas
+            # carry more information than the attention summary.
+            self.work_grid.setColumnStretch(0, 5)
+            self.work_grid.setColumnStretch(1, 5)
+            self.work_grid.setColumnStretch(2, 3)
         else:
             for index, card in enumerate(cards):
                 self.work_grid.addWidget(card, index, 0)
+            self.work_grid.setColumnStretch(0, 1)
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt API
         super().resizeEvent(event)
