@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QFrame
+from PySide6.QtWidgets import QApplication, QFrame, QSizePolicy
 
 from douk_manager.ui.pages.legacy_page import ModernLegacyPage
 from douk_manager.ui.shell.main_window import ModernMainWindow
@@ -63,6 +63,10 @@ class ModernFeatureReflowTests(unittest.TestCase):
                     if frame.property("legacySectionCard")
                 ]
                 self.assertGreater(len(cards), 0, f"{label} has no modern section cards")
+                self.assertTrue(
+                    all(card.property("legacyGeometryPolished") for card in cards),
+                    f"{label} has a section card without Windows geometry polish",
+                )
             self._dispose_window(window)
 
     def test_reflow_keeps_original_v016_controls_inside_original_pages(self) -> None:
@@ -85,6 +89,25 @@ class ModernFeatureReflowTests(unittest.TestCase):
                     wrapper.legacy_page.isAncestorOf(control),
                     f"{label} control was recreated or detached from the original page",
                 )
+            self._dispose_window(window)
+
+    def test_compact_forms_do_not_absorb_tall_window_whitespace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window = self._window(Path(directory))
+            task_group = window.task_expression.parentWidget()
+            self.assertIsNotNone(task_group)
+            self.assertEqual(
+                task_group.sizePolicy().verticalPolicy(),
+                QSizePolicy.Policy.Maximum,
+            )
+            self.assertEqual(
+                window.task_output.sizePolicy().verticalPolicy(),
+                QSizePolicy.Policy.Expanding,
+            )
+            self.assertEqual(
+                window.result_table.sizePolicy().verticalPolicy(),
+                QSizePolicy.Policy.Expanding,
+            )
             self._dispose_window(window)
 
     def test_reflowed_pages_remain_visible_when_navigated(self) -> None:
