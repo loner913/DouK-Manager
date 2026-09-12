@@ -3,17 +3,13 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QFrame, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
 from ..theme.tokens import UiMetrics
 
 
 class MetricCard(QFrame):
-    """Compact read-only KPI card.
-
-    The card owns presentation only. Values are pushed in by presenters/pages;
-    it never reads controllers, logs, databases, or process state itself.
-    """
+    """Compact read-only KPI card with a Fluent-style icon tile."""
 
     def __init__(
         self,
@@ -21,23 +17,34 @@ class MetricCard(QFrame):
         *,
         value: str = "—",
         note: str = "",
+        icon_text: str = "•",
+        tone: str = "primary",
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.setProperty("modernUi", True)
         self.setProperty("modernCard", True)
         self.setProperty("metricCard", True)
-        self.setMinimumHeight(112)
+        self.setMinimumHeight(116)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(
+        root = QHBoxLayout(self)
+        root.setContentsMargins(
             UiMetrics.SPACE_L,
-            UiMetrics.SPACE_M,
             UiMetrics.SPACE_L,
-            UiMetrics.SPACE_M,
+            UiMetrics.SPACE_L,
+            UiMetrics.SPACE_L,
         )
-        layout.setSpacing(UiMetrics.SPACE_XS)
+        root.setSpacing(UiMetrics.SPACE_M)
 
+        self.icon_label = QLabel(icon_text, self)
+        self.icon_label.setObjectName("modernMetricIcon")
+        self.icon_label.setProperty("tone", tone)
+        self.icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.icon_label.setFixedSize(52, 52)
+        root.addWidget(self.icon_label, 0, Qt.AlignmentFlag.AlignTop)
+
+        content = QVBoxLayout()
+        content.setSpacing(2)
         self.title_label = QLabel(title, self)
         self.title_label.setObjectName("modernMetricTitle")
         self.value_label = QLabel(value, self)
@@ -49,10 +56,11 @@ class MetricCard(QFrame):
         self.note_label.setObjectName("modernMetricNote")
         self.note_label.setWordWrap(True)
 
-        layout.addWidget(self.title_label)
-        layout.addWidget(self.value_label)
-        layout.addWidget(self.note_label)
-        layout.addStretch(1)
+        content.addWidget(self.title_label)
+        content.addWidget(self.value_label)
+        content.addWidget(self.note_label)
+        content.addStretch(1)
+        root.addLayout(content, 1)
 
     def set_metric(self, value: object, *, note: str = "") -> None:
         self.value_label.setText("—" if value is None else str(value))
