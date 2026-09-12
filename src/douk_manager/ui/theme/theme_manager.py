@@ -16,12 +16,7 @@ class ThemeMode(str, Enum):
 
 
 class ThemeManager(QObject):
-    """Own the active palette and apply a shared stylesheet.
-
-    The manager is deliberately opt-in. Creating the modern UI package does not
-    mutate the existing V0.1.6 application stylesheet; callers must explicitly
-    invoke :meth:`apply`.
-    """
+    """Own the active palette and apply the scoped modern stylesheet."""
 
     theme_changed = Signal(str)
 
@@ -53,25 +48,20 @@ class ThemeManager(QObject):
         return mode
 
     def apply(self, app: QApplication) -> None:
-        """Apply the modern stylesheet to ``app``.
-
-        This remains separate from :meth:`set_mode` so migration code can update
-        state without unexpectedly replacing a legacy application stylesheet.
-        """
-
         app.setStyleSheet(self.stylesheet())
 
     def stylesheet(self) -> str:
         p = self.palette
         m = UiMetrics
+        selected = "#EAF3FF" if self._mode is ThemeMode.LIGHT else "#173457"
+        canvas = "#F6F9FD" if self._mode is ThemeMode.LIGHT else p.app_background
+        subtle = "#F9FBFE" if self._mode is ThemeMode.LIGHT else p.surface_alt
         return f"""
-QWidget[modernUi="true"] {{
+QWidget#modernRoot {{
+    background: {canvas};
     color: {p.text_primary};
     font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
-}}
-
-QWidget#modernRoot {{
-    background: {p.app_background};
+    font-size: 13px;
 }}
 
 QWidget#modernHeader {{
@@ -81,8 +71,8 @@ QWidget#modernHeader {{
 QLabel#modernBrandIcon {{
     color: white;
     background: {p.primary};
-    border-radius: 10px;
-    font-size: 20px;
+    border-radius: 11px;
+    font-size: 21px;
     font-weight: 700;
 }}
 QLabel#modernProductName {{
@@ -92,22 +82,61 @@ QLabel#modernProductName {{
 }}
 QLabel#modernWorkspaceLabel {{
     color: {p.text_secondary};
-    font-size: 11px;
+    font-size: 10px;
 }}
+QLineEdit#modernGlobalSearch {{
+    min-height: 38px;
+    padding: 0 13px;
+    border: 1px solid {p.border};
+    border-radius: 10px;
+    color: {p.text_primary};
+    background: {subtle};
+    selection-background-color: {p.primary};
+}}
+QLineEdit#modernGlobalSearch:focus {{
+    border-color: {p.primary};
+    background: {p.surface};
+}}
+
+QFrame[statusPill="true"] {{
+    min-height: 36px;
+    background: {subtle};
+    border: 1px solid {p.border};
+    border-radius: 18px;
+}}
+QFrame[statusPill="true"] QLabel {{
+    background: transparent;
+}}
+QLabel#modernStatusLabel {{
+    color: {p.text_primary};
+    font-size: 11px;
+    font-weight: 600;
+}}
+QLabel#modernStatusValue {{
+    color: {p.text_secondary};
+    font-size: 11px;
+    font-weight: 600;
+}}
+QLabel#modernStatusDot {{ font-size: 10px; }}
+QLabel#modernStatusDot[statusKind="success"] {{ color: {p.success}; }}
+QLabel#modernStatusDot[statusKind="info"] {{ color: {p.info}; }}
+QLabel#modernStatusDot[statusKind="warning"] {{ color: {p.warning}; }}
+QLabel#modernStatusDot[statusKind="danger"] {{ color: {p.danger}; }}
+QLabel#modernStatusDot[statusKind="neutral"] {{ color: {p.text_muted}; }}
 
 QWidget#modernSidebar {{
     background: {p.surface};
     border-right: 1px solid {p.border};
 }}
 QPushButton[navigationItem="true"] {{
-    min-height: 42px;
+    min-height: 46px;
     padding: 0 14px;
     border: none;
-    border-radius: {m.RADIUS_CONTROL}px;
+    border-radius: 9px;
     color: {p.text_secondary};
     background: transparent;
     text-align: left;
-    font-size: 14px;
+    font-size: 13px;
 }}
 QPushButton[navigationItem="true"]:hover {{
     color: {p.text_primary};
@@ -115,7 +144,51 @@ QPushButton[navigationItem="true"]:hover {{
 }}
 QPushButton[navigationItem="true"]:checked {{
     color: {p.primary};
-    background: {p.surface_hover};
+    background: {selected};
+    font-weight: 700;
+}}
+QPushButton[navigationItem="true"][collapsed="true"] {{
+    padding: 0;
+    text-align: center;
+    font-size: 18px;
+}}
+QFrame#modernSidebarDivider {{
+    color: {p.border};
+    background: {p.border};
+    max-height: 1px;
+    border: none;
+}}
+
+QTabWidget#modernPageHost::pane {{
+    border: 0;
+    background: transparent;
+}}
+QTabWidget#modernPageHost > QWidget {{
+    background: transparent;
+}}
+
+QWidget#modernOverviewPage,
+QScrollArea#modernOverviewScroll,
+QWidget#modernOverviewCanvas {{
+    background: transparent;
+    border: none;
+}}
+QLabel#modernPageTitle {{
+    color: {p.text_primary};
+    font-size: 25px;
+    font-weight: 700;
+}}
+QLabel#modernPageSubtitle {{
+    color: {p.text_secondary};
+    font-size: 12px;
+}}
+QLabel#modernClockDate {{
+    color: {p.text_secondary};
+    font-size: 10px;
+}}
+QLabel#modernClockTime {{
+    color: {p.text_primary};
+    font-size: 22px;
     font-weight: 600;
 }}
 
@@ -124,52 +197,119 @@ QFrame[modernCard="true"] {{
     border: 1px solid {p.border};
     border-radius: {m.RADIUS_CARD}px;
 }}
+QFrame[metricCard="true"] {{
+    background: {p.surface};
+}}
+QLabel#modernMetricTitle {{
+    color: {p.text_secondary};
+    font-size: 11px;
+    font-weight: 600;
+}}
+QLabel#modernMetricValue {{
+    color: {p.text_primary};
+    font-size: 24px;
+    font-weight: 700;
+}}
+QLabel#modernMetricNote {{
+    color: {p.text_muted};
+    font-size: 10px;
+}}
+QLabel#modernMetricIcon {{
+    color: white;
+    border-radius: 12px;
+    font-size: 22px;
+    font-weight: 700;
+}}
+QLabel#modernMetricIcon[tone="primary"] {{ background: {p.primary}; }}
+QLabel#modernMetricIcon[tone="success"] {{ background: {p.success}; }}
+QLabel#modernMetricIcon[tone="info"] {{ background: {p.info}; }}
+QLabel#modernMetricIcon[tone="violet"] {{ background: #7C4DFF; }}
+QLabel#modernMetricIcon[tone="danger"] {{ background: {p.danger}; }}
+QLabel#modernMetricIcon[tone="warning"] {{ background: {p.warning}; }}
 
-QFrame[statusPill="true"] {{
-    background: {p.surface_alt};
+QLabel#modernSectionTitle {{
+    color: {p.text_primary};
+    font-size: 15px;
+    font-weight: 700;
+}}
+QLabel#modernSectionNote,
+QLabel#modernDetailLabel {{
+    color: {p.text_muted};
+    font-size: 10px;
+}}
+QLabel#modernDetailValue {{
+    color: {p.text_primary};
+    font-size: 11px;
+    font-weight: 600;
+}}
+QLabel#modernOverviewStartupBadge {{
+    min-height: 28px;
+    padding: 0 11px;
+    color: {p.text_secondary};
+    background: {subtle};
     border: 1px solid {p.border};
-    border-radius: {m.RADIUS_CONTROL}px;
+    border-radius: 14px;
+    font-size: 11px;
+    font-weight: 700;
+}}
+QLabel#modernOverviewStartupBadge[startupKind="success"] {{
+    color: {p.success};
+    background: #ECFDF5;
+    border-color: #C7F3DF;
+}}
+QLabel#modernOverviewStartupBadge[startupKind="warning"] {{
+    color: #B56A00;
+    background: #FFF8E8;
+    border-color: #FBE4AD;
+}}
+QLabel#modernOverviewStartupBadge[startupKind="info"] {{
+    color: {p.primary};
+    background: {selected};
+    border-color: #CFE2FF;
 }}
 
-QPushButton[buttonRole="primary"] {{
-    min-height: {m.PRIMARY_CONTROL_HEIGHT}px;
-    padding: 0 16px;
+QPushButton[overviewAction="primary"] {{
+    min-height: 36px;
+    padding: 0 14px;
     border: none;
-    border-radius: {m.RADIUS_CONTROL}px;
+    border-radius: 8px;
     color: white;
     background: {p.primary};
     font-weight: 600;
 }}
-QPushButton[buttonRole="primary"]:hover {{
-    background: {p.primary_hover};
-}}
-QPushButton[buttonRole="primary"]:disabled {{
-    background: {p.border_strong};
-    color: {p.text_muted};
-}}
-
-QPushButton[buttonRole="secondary"] {{
-    min-height: {m.CONTROL_HEIGHT}px;
-    padding: 0 14px;
-    border: 1px solid {p.border};
-    border-radius: {m.RADIUS_CONTROL}px;
-    color: {p.text_primary};
-    background: {p.surface};
-}}
-QPushButton[buttonRole="secondary"]:hover {{
-    background: {p.surface_hover};
-}}
-
-QLineEdit[modernControl="true"] {{
-    min-height: {m.CONTROL_HEIGHT}px;
+QPushButton[overviewAction="primary"]:hover {{ background: {p.primary_hover}; }}
+QPushButton[overviewAction="secondary"] {{
+    min-height: 34px;
     padding: 0 12px;
     border: 1px solid {p.border};
-    border-radius: {m.RADIUS_CONTROL}px;
+    border-radius: 8px;
     color: {p.text_primary};
-    background: {p.surface_alt};
-    selection-background-color: {p.primary};
+    background: {subtle};
 }}
-QLineEdit[modernControl="true"]:focus {{
-    border-color: {p.primary};
+QPushButton[overviewAction="secondary"]:hover {{ background: {p.surface_hover}; }}
+
+QProgressBar#modernThroughputBar {{
+    min-height: 8px;
+    max-height: 8px;
+    border: none;
+    border-radius: 4px;
+    background: #E7EEF7;
+    text-align: center;
 }}
+QProgressBar#modernThroughputBar::chunk {{
+    border-radius: 4px;
+    background: {p.primary};
+}}
+
+QScrollBar:vertical {{
+    width: 10px;
+    margin: 2px;
+    background: transparent;
+}}
+QScrollBar::handle:vertical {{
+    min-height: 30px;
+    border-radius: 4px;
+    background: {p.border_strong};
+}}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
 """.strip()
