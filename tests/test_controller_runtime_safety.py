@@ -669,6 +669,27 @@ class ControllerRuntimeSafetyTests(unittest.TestCase):
 
             controller.backup.restore_startup_snapshot.assert_not_called()
 
+    def test_restore_startup_snapshot_preserves_closing_state_when_close_begins_during_restore(self) -> None:
+        state = self._startup_state()
+        with tempfile.TemporaryDirectory() as directory:
+            controller = self._degraded_controller(Path(directory))
+            snapshot = Path(directory) / "synthetic-startup"
+            original_reason = controller.read_only_reason
+
+            def restore_and_begin_closing(_snapshot: Path) -> None:
+                controller.startup_state = state.CLOSING
+
+            controller.backup.restore_startup_snapshot = Mock(
+                side_effect=restore_and_begin_closing
+            )
+
+            controller.restore_startup_snapshot(snapshot)
+
+            controller.backup.restore_startup_snapshot.assert_called_once_with(snapshot)
+            self.assertIsNone(controller.startup_backup)
+            self.assertIs(controller.startup_state, state.CLOSING)
+            self.assertEqual(controller.read_only_reason, original_reason)
+
     def test_restore_startup_snapshot_rejects_active_engine_or_collector(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             snapshot = Path(directory) / "synthetic-startup"

@@ -926,6 +926,12 @@ class ManagerController:
             context.raise_if_cancelled()
         self.backup.restore_startup_snapshot(Path(snapshot))
         self.startup_backup = None
+        if self._current_startup_state() is StartupState.CLOSING:
+            self.logger.info(
+                "Startup 观察数据恢复在关闭期间完成，保持 CLOSING：%s",
+                snapshot,
+            )
+            return
         self.startup_state = StartupState.DEGRADED_READ_ONLY
         self.read_only_reason = "Startup 观察数据已恢复，等待重新执行启动安全检查。"
         self.logger.info("Startup 观察数据恢复完成，等待重新执行启动安全检查：%s", snapshot)
