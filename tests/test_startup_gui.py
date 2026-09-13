@@ -462,6 +462,7 @@ class StartupGuiTests(unittest.TestCase):
                     spec.resource_keys,
                     frozenset({"startup_safety", "watchlist", "settings", "volume"}),
                 )
+                self.assertEqual(spec.refresh_targets, ())
                 self.assertEqual(
                     window._submit_background.call_args.kwargs["buttons"],
                     (window.startup_snapshot_restore_button,),
@@ -474,6 +475,17 @@ class StartupGuiTests(unittest.TestCase):
                 self.assertIn("blocked", output)
                 self.assertTrue(window.startup_recheck_timer.isActive())
                 window.startup_recheck_timer.stop()
+
+                window.coordinator.start = Mock(return_value="startup-task")
+                window.refresh_tasks = Mock()
+                window.refresh_results = Mock()
+                self.assertTrue(window.begin_startup_check())
+                generation = window.startup_generation
+                self.assertTrue(window.apply_startup_result(make_result(generation)))
+                output = window.settings_output.toPlainText()
+                self.assertIn("重新执行启动安全检查已完成", output)
+                self.assertIn("当前状态：READY", output)
+                self.assertNotIn("正在重新执行启动安全检查", output)
             finally:
                 self._dispose_window(window)
 

@@ -969,6 +969,7 @@ class MainWindow(QMainWindow):
         self.startup_generation = 0
         self._startup_task_id: str | None = None
         self._startup_result: StartupSafetyResult | None = None
+        self._startup_restore_recheck_source: Path | None = None
         self._close_pending = False
         self._close_notice_active = False
         self._safe_widgets: list[QWidget] = []
@@ -1452,6 +1453,27 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             "启动安全检查通过" if result.success else "启动安全检查失败，已进入只读保护"
         )
+        restore_source = self._startup_restore_recheck_source
+        if restore_source is not None:
+            self._startup_restore_recheck_source = None
+            if result.success and self.controller.startup_state is StartupState.READY:
+                self._replace_info(
+                    self.settings_output,
+                    "Startup 观察数据恢复完成。",
+                    f"来源快照：{restore_source}",
+                    "W 高水位和请求收据已按不可回退规则合并；正式 Volume 未执行恢复。",
+                    "重新执行启动安全检查已完成，当前状态：READY；观察写入已恢复。",
+                )
+            else:
+                self._replace_info(
+                    self.settings_output,
+                    "Startup 观察数据已恢复，但重新执行启动安全检查未通过。",
+                    f"来源快照：{restore_source}",
+                    "W 高水位和请求收据已按不可回退规则合并；正式 Volume 未执行恢复。",
+                    f"当前状态：{self.controller.startup_state.value}",
+                    f"检查摘要：{result.summary}",
+                    f"技术详情：{result.details or '无额外技术详情。'}",
+                )
         QTimer.singleShot(0, self._refresh_noncritical_after_startup)
         return True
 
@@ -1572,10 +1594,11 @@ class MainWindow(QMainWindow):
             deduplicate_key="startup_snapshot_restore",
             cancellable=False,
             close_policy=ClosePolicy.WAIT,
-            refresh_targets=("runtime_status",),
+            refresh_targets=(),
         )
 
         def show_success(_result: object) -> None:
+            self._startup_restore_recheck_source = snapshot
             self._replace_info(
                 self.settings_output,
                 "Startup 观察数据恢复完成。",

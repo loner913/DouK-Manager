@@ -364,16 +364,20 @@ def _reflow_settings(page: QWidget, root: QLayout, items: list[QLayoutItem]) -> 
     root.addLayout(config)
     root.addWidget(_card(content, "Startup 观察数据恢复", (startup,)))
 
-    # Keep the action layout on a real, parented holder. The previous temporary
-    # QWidgetItem wrapper could be collected with its holder and destroy these
-    # original buttons even though MainWindow still referenced them.
+    # Keep the action layout on a real, parented holder. QLayout.addItem() does
+    # not reparent a QWidgetItem's widget, so explicitly move these original
+    # buttons before adding their existing layout items to the holder.
     action_holder = QWidget(content)
     action_holder.setProperty("legacyLayoutHolder", True)
     action_layout = QHBoxLayout(action_holder)
     action_layout.setContentsMargins(0, 0, 0, 0)
     action_layout.addStretch(1)
-    action_layout.addItem(save_paths)
-    action_layout.addItem(save_all)
+    for action_item in (save_paths, save_all):
+        action_widget = action_item.widget()
+        if action_widget is None:
+            raise FeatureReflowError("设置保存操作缺少按钮控件")
+        action_widget.setParent(action_holder)
+        action_layout.addItem(action_item)
     action_card = _card(
         content,
         "保存与重新验证",

@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QFrame, QSizePolicy
+from PySide6.QtWidgets import QApplication, QFrame, QLabel, QSizePolicy
 
 from douk_manager.ui.pages.legacy_page import ModernLegacyPage
 from douk_manager.ui.shell.main_window import ModernMainWindow
@@ -98,6 +98,21 @@ class ModernFeatureReflowTests(unittest.TestCase):
                 settings_wrapper.legacy_page.isAncestorOf(
                     window.startup_snapshot_edit
                 )
+            )
+            action_holder = window.path_save_button.parentWidget()
+            self.assertIs(action_holder, window.settings_save_button.parentWidget())
+            self.assertIsNotNone(action_holder)
+            self.assertTrue(action_holder.property("legacyLayoutHolder"))
+            action_card = action_holder.parentWidget()
+            self.assertIsNotNone(action_card)
+            self.assertTrue(action_card.property("legacySectionCard"))
+            self.assertIn(
+                "保存与重新验证",
+                [
+                    label.text()
+                    for label in action_card.findChildren(QLabel)
+                    if label.property("legacySectionTitle")
+                ],
             )
             self._dispose_window(window)
 
