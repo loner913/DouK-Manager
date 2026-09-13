@@ -566,15 +566,25 @@ class WatchlistService:
         payload_digest = _payload_digest(request_fields)
         url_digest = normalized_url_digest(normalized_url)
         with self._lock(locked):
-            document, watermark, control = self.validate_all()
+            # Inspect the receipt before rejecting a gap caused by its own
+            # interrupted body write. All ordinary operations retain the gate.
+            document = self.load_document()
+            watermark = self.load_watermark()
+            control = self.load_control()
             self._require_ready(control)
             receipt = self._receipt(control, request_id)
             if receipt is not None:
                 if receipt["payload_digest"] != payload_digest:
                     raise WatchlistError("REQUEST_CONFLICT", "request_id 已对应另一份请求。")
                 if receipt["outcome"] == "pending":
-                    return self._replay_pending_receipt(receipt, document, control)
+                    return self._replay_pending_receipt(
+                        receipt, document, control, watermark, request_fields
+                    )
+                if document["next_w_id"] < watermark["next_w_id"]:
+                    raise WatchlistError("RECOVERY_REQUIRED", "观察名单计数器低于不可回退高水位。")
                 return self._replay_receipt(receipt, document)
+            if document["next_w_id"] < watermark["next_w_id"]:
+                raise WatchlistError("RECOVERY_REQUIRED", "观察名单计数器低于不可回退高水位。")
             pending = next(
                 (
                     item
@@ -668,25 +678,7 @@ class WatchlistService:
             control["request_receipts"].append(pending_receipt)
             write_json_atomic(self.paths.control, control)
 
-            now = utc_now()
-            record = {
-                "w_id": w_id,
-                "url": normalized_url,
-                "display_name": request_fields["display_name"],
-                "captured_nickname": request_fields["captured_nickname"],
-                "douyin_id": request_fields["douyin_id"],
-                "nickname_blank": request_fields["nickname_blank"],
-                "state": "watching",
-                "reasons": request_fields["reasons"],
-                "note": request_fields["note"],
-                "created_at": now,
-                "updated_at": now,
-                "next_review_at": next_review_at,
-                "review_history": [],
-                "archived_at": None,
-                "promoted_a_number": None,
-                "promotion_recovery": None,
-            }
+            record = self._observation_record(request_fields, w_id, pending_receipt)
             document["next_w_id"] = next_w_id
             document["revision"] += 1
             document["records"].append(record)
@@ -1091,26 +1083,70 @@ class WatchlistService:
         receipt: dict[str, Any],
         document: dict[str, Any],
         control: dict[str, Any],
+        watermark: dict[str, Any],
+        request_fields: dict[str, Any],
     ) -> dict[str, Any]:
-        """Finish only the observable tail of a pending request.
-
-        If the reserved W body is present and matches the receipt identity,
-        the failed final receipt write can be repaired.  A missing body is
-        deliberately not reconstructed from the request or its digest.
-        """
+        """Complete only the original request's proven reservation under lock."""
 
         w_id = receipt.get("w_id")
-        if not _is_int(w_id):
+        if (
+            not _is_int(w_id)
+            or w_id >= watermark["next_w_id"]
+            or receipt["next_review_at"] is None
+            or receipt["a_number"] is not None
+            or normalized_url_digest(request_fields["url"]) != receipt["normalized_url_digest"]
+            or any(item is not receipt and item["w_id"] == w_id for item in control["request_receipts"])
+        ):
             raise WatchlistError("RECOVERY_REQUIRED", "请求收据缺少观察身份。")
-        try:
-            record = self._find_record(document, w_id)
-        except WatchlistError as exc:
-            raise WatchlistError("RECOVERY_REQUIRED", "请求收据引用的观察正文缺失。") from exc
-        if normalized_url_digest(record["url"]) != receipt["normalized_url_digest"]:
-            raise WatchlistError("RECOVERY_REQUIRED", "请求收据与观察正文身份不一致。")
+        record = next((item for item in document["records"] if item["w_id"] == w_id), None)
+        missing = record is None
+        if missing:
+            if (
+                document["next_w_id"] != w_id
+                or watermark["next_w_id"] != w_id + 1
+                or any(normalize_url_for_compare(item["url"]) == request_fields["url"] for item in document["records"])
+                or self._find_formal_account(request_fields["url"]) is not None
+            ):
+                raise WatchlistError("RECOVERY_REQUIRED", "原请求预留编号或主页归属无法确认。")
+            record = self._observation_record(request_fields, w_id, receipt)
+            document["records"].append(record)
+            document["next_w_id"] = watermark["next_w_id"]
+            document["revision"] += 1
+            document = validate_document(document)
+        else:
+            expected = self._observation_record(request_fields, w_id, receipt)
+            if (
+                document["next_w_id"] < watermark["next_w_id"]
+                or any(record[key] != value for key, value in expected.items() if key not in {"created_at", "updated_at"})
+            ):
+                raise WatchlistError("RECOVERY_REQUIRED", "请求收据与观察正文身份或内容不一致。")
         receipt["outcome"] = "committed"
+        if self._has_unresolved(document, control):
+            raise WatchlistError("RECOVERY_REQUIRED", "观察数据仍有其他未解决恢复状态。")
+        if missing:
+            write_json_atomic(self.paths.watchlist, document)
         write_json_atomic(self.paths.control, control)
         return self._replay_receipt(receipt, document)
+
+    @staticmethod
+    def _observation_record(
+        fields: dict[str, Any], w_id: int, receipt: dict[str, Any]
+    ) -> dict[str, Any]:
+        return {
+            **{key: fields[key] for key in (
+                "url", "display_name", "captured_nickname", "douyin_id",
+                "nickname_blank", "reasons", "note",
+            )},
+            "w_id": w_id,
+            "state": "watching",
+            "created_at": receipt["created_at"],
+            "updated_at": receipt["created_at"],
+            "next_review_at": receipt["next_review_at"],
+            "review_history": [],
+            "archived_at": None,
+            "promoted_a_number": None,
+            "promotion_recovery": None,
+        }
 
     def _validate_request(self, payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
         if not isinstance(payload, dict):

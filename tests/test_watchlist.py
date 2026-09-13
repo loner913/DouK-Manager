@@ -4,6 +4,7 @@ import copy
 import tempfile
 import unittest
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -109,7 +110,7 @@ class WatchlistTests(unittest.TestCase):
                 for path, value in before.items():
                     self.assertEqual(read_json(path), value)
 
-    def test_pending_receipt_repairs_only_when_the_reserved_body_exists(self) -> None:
+    def test_pending_receipt_recovers_original_reserved_body_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             paths, service = self._service(directory)
             payload = self._payload()
@@ -126,14 +127,141 @@ class WatchlistTests(unittest.TestCase):
             self.assertEqual(read_json(paths.watchlist_w_watermark)["next_w_id"], 2)
             self.assertEqual(read_json(paths.watchlist)["records"], [])
             self.assertTrue(service.has_unresolved_recovery())
-            with self.assertRaises(WatchlistError) as same_request:
-                service.observe(payload)
-            self.assertEqual(same_request.exception.code, "RECOVERY_REQUIRED")
             other = self._payload()
             other["url"] = payload["url"]
             with self.assertRaises(WatchlistError) as same_url:
                 service.observe(other)
             self.assertEqual(same_url.exception.code, "RECOVERY_REQUIRED")
+            result = service.observe(payload)
+            self.assertEqual(result["w_id"], 1)
+            self.assertEqual(service.snapshot().next_w_id, 2)
+            self.assertEqual(len(service.snapshot().records), 1)
+            self.assertFalse(service.has_unresolved_recovery())
+
+    def _leave_missing_pending(self, service, payload):
+        real_write = watchlist_module.write_json_atomic
+
+        def fail_body(path, value):
+            if path.resolve() == service.paths.watchlist.resolve():
+                raise PermissionError("synthetic body failure")
+            real_write(path, value)
+
+        with patch.object(watchlist_module, "write_json_atomic", side_effect=fail_body):
+            with self.assertRaises(PermissionError):
+                service.observe(payload)
+
+    def test_pending_recovery_preserves_expired_reminder_and_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths, service = self._service(directory)
+            payload = self._payload()
+            payload["next_review_at"] = "2026-01-02T00:00:00Z"
+            payload.pop("review_after_days", None)
+
+            class BeforeReminder(datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+            with patch.object(watchlist_module, "datetime", BeforeReminder):
+                self._leave_missing_pending(service, payload)
+            with patch.object(service, "_resolve_review_time", side_effect=AssertionError("must reuse persisted time")):
+                self.assertEqual(service.observe(payload)["w_id"], 1)
+                before = read_json(paths.watchlist)
+                self.assertEqual(service.observe(payload)["w_id"], 1)
+            self.assertEqual(read_json(paths.watchlist), before)
+            self.assertEqual(before["records"][0]["next_review_at"], payload["next_review_at"])
+
+    def test_pending_recovery_rejects_conflicting_payload_without_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths, service = self._service(directory)
+            payload = self._payload()
+            self._leave_missing_pending(service, payload)
+            files = (paths.watchlist, paths.watchlist_w_watermark, paths.watchlist_control)
+            before = [p.read_bytes() for p in files]
+            for altered in (dict(payload, note="changed"), dict(payload, request_id=str(uuid.uuid4()))):
+                with self.assertRaises(WatchlistError):
+                    service.observe(altered)
+                self.assertEqual([p.read_bytes() for p in files], before)
+
+    def test_pending_recovery_repeated_body_and_receipt_failures_are_retryable(self) -> None:
+        for target in ("body", "receipt"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
+                paths, service = self._service(directory)
+                payload = self._payload()
+                self._leave_missing_pending(service, payload)
+                real_write = watchlist_module.write_json_atomic
+
+                def fail_write(path, value):
+                    failed = paths.watchlist if target == "body" else paths.watchlist_control
+                    if path.resolve() == failed.resolve():
+                        raise PermissionError("synthetic recovery write failure")
+                    real_write(path, value)
+
+                with patch.object(watchlist_module, "write_json_atomic", side_effect=fail_write):
+                    with self.assertRaises(PermissionError):
+                        service.observe(payload)
+                self.assertEqual(service.observe(payload)["w_id"], 1)
+                self.assertEqual(len(service.snapshot().records), 1)
+                self.assertEqual(read_json(paths.watchlist_w_watermark)["next_w_id"], 2)
+
+    def test_pending_recovery_keeps_blocked_gate_and_unproven_gaps_closed(self) -> None:
+        for case in ("blocked", "missing_receipt", "extra_gap", "formal_exists", "other_pending"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                paths, service = self._service(directory)
+                payload = self._payload()
+                self._leave_missing_pending(service, payload)
+                control = read_json(paths.watchlist_control)
+                if case == "blocked":
+                    control["write_gate"] = "blocked"
+                elif case == "missing_receipt":
+                    control["request_receipts"] = []
+                elif case == "other_pending":
+                    other = copy.deepcopy(control["request_receipts"][0])
+                    other["request_id"] = str(uuid.uuid4())
+                    control["request_receipts"].append(other)
+                elif case == "extra_gap":
+                    watermark = read_json(paths.watchlist_w_watermark)
+                    watermark["next_w_id"] = 3
+                    write_json_atomic(paths.watchlist_w_watermark, watermark)
+                elif case == "formal_exists":
+                    master = read_json(paths.master_settings)
+                    master["accounts_urls"][0]["url"] = payload["url"]
+                    write_json_atomic(paths.master_settings, master)
+                write_json_atomic(paths.watchlist_control, control)
+                files = (paths.watchlist, paths.watchlist_w_watermark, paths.watchlist_control)
+                before = [p.read_bytes() for p in files]
+                with self.assertRaises(WatchlistError):
+                    service.observe(payload)
+                self.assertEqual([p.read_bytes() for p in files], before)
+
+    def test_pending_existing_body_must_match_original_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths, service = self._service(directory)
+            payload = self._payload()
+            service.observe(payload)
+            control = read_json(paths.watchlist_control)
+            control["request_receipts"][0]["outcome"] = "pending"
+            write_json_atomic(paths.watchlist_control, control)
+            document = read_json(paths.watchlist)
+            document["records"][0]["note"] = "different body with same URL"
+            write_json_atomic(paths.watchlist, document)
+            with self.assertRaises(WatchlistError) as caught:
+                service.observe(payload)
+            self.assertEqual(caught.exception.code, "RECOVERY_REQUIRED")
+            self.assertEqual(read_json(paths.watchlist_control), control)
+
+    def test_committed_receipt_missing_body_is_not_reconstructed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths, service = self._service(directory)
+            payload = self._payload()
+            service.observe(payload)
+            document = read_json(paths.watchlist)
+            document["records"] = []
+            write_json_atomic(paths.watchlist, document)
+            with self.assertRaises(WatchlistError) as caught:
+                service.observe(payload)
+            self.assertEqual(caught.exception.code, "RECOVERY_REQUIRED")
+            self.assertEqual(read_json(paths.watchlist), document)
 
     def test_pending_receipt_with_body_is_repaired_without_recomputing_review(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
