@@ -316,8 +316,8 @@ def _reflow_collector(page: QWidget, root: QLayout, items: list[QLayoutItem]) ->
 
 
 def _reflow_watchlist(page: QWidget, root: QLayout, items: list[QLayoutItem]) -> None:
-    _require(items, 5, "观察名单")
-    intro, filters, table, actions, output, *tail = items
+    _require(items, 6, "观察名单")
+    intro, filters, reminders, table, actions, output, *tail = items
     root.setAlignment(Qt.AlignmentFlag(0))
     _mark_banner(intro)
     _prepare_table(table, minimum_height=420)
@@ -328,7 +328,7 @@ def _reflow_watchlist(page: QWidget, root: QLayout, items: list[QLayoutItem]) ->
     )
     content = _content_widget(page)
     _add_item(root, intro)
-    root.addWidget(_card(content, "筛选与刷新", (filters,)))
+    root.addWidget(_card(content, "筛选与刷新", (filters, reminders)))
     root.addWidget(_card(content, "观察记录", (table,)), 1)
     root.addWidget(_card(content, "选中记录操作", (actions,)))
     root.addWidget(_card(content, "操作结果", (output,)))

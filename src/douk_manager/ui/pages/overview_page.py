@@ -143,6 +143,16 @@ class ModernOverviewPage(QWidget):
         self.layout.setSpacing(14)
 
         self._build_heading()
+        reminder_row = QHBoxLayout()
+        self.watchlist_reminder_text = QLabel("观察提醒待加载", self.canvas)
+        self.watchlist_reminder_text.setWordWrap(True)
+        reminder_row.addWidget(self.watchlist_reminder_text, 1)
+        self.watchlist_reminder = QPushButton("查看观察名单", self.canvas)
+        self.watchlist_reminder.setObjectName("modernOverviewFilter")
+        self.watchlist_reminder.setMinimumHeight(36)
+        self.watchlist_reminder.clicked.connect(self._open_watchlist_due)
+        reminder_row.addWidget(self.watchlist_reminder)
+        self.layout.addLayout(reminder_row)
         self._build_metrics()
         self._build_analytics()
         self._build_work_area()
@@ -709,8 +719,30 @@ class ModernOverviewPage(QWidget):
         self._dashboard_refresh_requested = True
         host.refresh_result_dashboard(auto_refresh=True)
 
+    def _open_watchlist_due(self) -> None:
+        host = self._host
+        host.watchlist_state_filter.setCurrentIndex(host.watchlist_state_filter.findData("watching"))
+        host.watchlist_due_filter.setCurrentIndex(host.watchlist_due_filter.findData("due"))
+        host.watchlist_search_edit.clear()
+        host.tabs.setCurrentIndex(host.watchlist_tab_index)
+
+    def refresh_watchlist_reminder(self) -> None:
+        model = getattr(self._host, "watchlist_model", None)
+        if model is None or getattr(self._host, "_watchlist_snapshot", None) is None:
+            self.watchlist_reminder_text.setText("观察提醒待加载")
+            return
+        summary = model.reminder_summary()
+        self.watchlist_reminder_text.setText(
+            f"观察名单 · 待处理 {summary['due']} · 超期 {summary['overdue']} · "
+            f"待恢复 {summary['recovery']} · 最早加入 {summary['oldest']}")
+        urgent = summary["overdue"] or summary["recovery"]
+        color = "#e05260" if urgent else "#c77d16" if summary["due"] else "#60809c"
+        self.watchlist_reminder_text.setStyleSheet(
+            f"color: {color}; font-weight: {700 if urgent else 500}; text-align: left; padding: 6px;")
+
     def refresh_from_host(self) -> None:
         host = self._host
+        self.refresh_watchlist_reminder()
         self._refresh_startup(host)
         if self._preview_mock_data:
             self._refresh_preview()

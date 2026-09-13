@@ -313,6 +313,10 @@ class ModernMainWindow(LegacyMainWindow):
 
         if not hasattr(self, "modern_header"):
             return
+        if hasattr(self, "watchlist_model"):
+            summary = self.watchlist_model.reminder_summary()
+            self.modern_sidebar.set_badge("观察名单", summary["due"],
+                                          bool(summary["overdue"] or summary["recovery"]))
         collector = getattr(self, "global_collector_status", None)
         engine = getattr(self, "global_engine_status", None)
         status_labels = getattr(self, "status_labels", {})

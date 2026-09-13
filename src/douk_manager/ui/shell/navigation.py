@@ -54,6 +54,7 @@ class NavigationSidebar(QWidget):
         self.setObjectName("modernSidebar")
         self.setFixedWidth(UiMetrics.SIDEBAR_WIDTH)
         self._collapsed = False
+        self._badges = {}
         self._items = {item.route: item for item in items}
 
         self._buttons: dict[str, QPushButton] = {}
@@ -114,7 +115,9 @@ class NavigationSidebar(QWidget):
         )
         for route, button in self._buttons.items():
             item = self._items[route]
-            button.setText("" if collapsed else item.label)
+            count = self._badges.get(route, 0)
+            button.setText(str(count) if collapsed and count else "" if collapsed
+                           else f"{item.label} ({count})" if count else item.label)
             button.setIconSize(QSize(23 if collapsed else 21, 23 if collapsed else 21))
             button.setProperty("collapsed", collapsed)
             button.style().unpolish(button)
@@ -124,6 +127,18 @@ class NavigationSidebar(QWidget):
         button = self._buttons.get(route)
         if button is not None:
             button.setChecked(True)
+
+    def set_badge(self, label: str, count: int, urgent: bool = False) -> None:
+        for route, item in self._items.items():
+            if item.label != label:
+                continue
+            self._badges[route] = count
+            button = self._buttons[route]
+            button.setText(str(count) if self._collapsed and count else "" if self._collapsed
+                           else f"{label} ({count})" if count else label)
+            button.setToolTip(f"{label} · 待处理 {count}")
+            button.setStyleSheet("color: #e05260; font-weight: 700;" if urgent
+                                else "color: #c77d16;" if count else "")
 
     def route_for_query(self, query: str) -> str | None:
         needle = query.strip().casefold()

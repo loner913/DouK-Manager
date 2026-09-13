@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from html import escape
@@ -21,7 +22,8 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QColor, QDesktopServices, QKeySequence, QShortcut
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QKeySequence, QShortcut
+from douk_manager.core.watchlist_reminders import reminder_kind, reminder_summary
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -114,7 +116,7 @@ from douk_manager.core.result_dashboard import (
 from douk_manager.core.selector import compact_numbers
 from douk_manager.core.settings_tasks import ActivatedTask, EarliestRule
 from douk_manager.core.task_order import move_to_index
-from douk_manager.core.watchlist import WatchlistSnapshot, parse_utc
+from douk_manager.core.watchlist import WatchlistError, WatchlistSnapshot, parse_utc
 from douk_manager.core.watchlist_promotion import PromotionPreview, PromotionResult
 from douk_manager.ui_messages import format_information
 from douk_manager.ui_state import (
@@ -592,23 +594,18 @@ def _watchlist_state_label(record: dict[str, Any]) -> str:
     }.get(str(record.get("state")), str(record.get("state", "未知")))
 
 
-def _watchlist_due_label(record: dict[str, Any]) -> str:
-    if record.get("state") != "watching":
-        return "—"
-    next_review_at = record.get("next_review_at")
-    if not isinstance(next_review_at, str):
-        return "待补时间"
-    try:
-        due = parse_utc(next_review_at) <= datetime.now(timezone.utc)
-    except Exception:
-        return "时间无效"
-    return "已到期" if due else "待复查"
+def _watchlist_due_label(record: dict[str, Any], now=None) -> str:
+    return {"inactive": "—", "missing": "待补时间", "invalid": "时间无效",
+            "due": "已到期", "overdue": "已超期", "upcoming": "待复查"}[reminder_kind(record, now)]
 
 
 def _watchlist_date_label(value: object) -> str:
     if not isinstance(value, str) or not value:
         return "—"
-    return value.replace("T", " ").removesuffix("Z")[:16]
+    try:
+        return parse_utc(value).astimezone().strftime("%Y-%m-%d %H:%M")
+    except (WatchlistError, ValueError, TypeError):
+        return "时间无效"
 
 
 class WatchlistTableModel(QAbstractTableModel):
@@ -623,6 +620,22 @@ class WatchlistTableModel(QAbstractTableModel):
         self._state_filter = "all"
         self._due_filter = "all"
         self._search = ""
+        self.reminder_now = datetime.now(timezone.utc)
+        self._reminder_summary = reminder_summary((), self.reminder_now)
+
+    def refresh_reminders(self, now=None) -> None:
+        self.reminder_now = now or datetime.now(timezone.utc)
+        self._reminder_summary = reminder_summary(self._rows, self.reminder_now)
+        visible = tuple(record for record in self._rows if self._matches(record))
+        if visible != self._visible_rows:
+            self.beginResetModel()
+            self._visible_rows = visible
+            self.endResetModel()
+        elif self.rowCount():
+            self.dataChanged.emit(self.index(0, 4), self.index(self.rowCount() - 1, 5))
+
+    def reminder_summary(self):
+        return dict(self._reminder_summary)
 
     @property
     def total_count(self) -> int:
@@ -635,6 +648,8 @@ class WatchlistTableModel(QAbstractTableModel):
     def set_snapshot(self, snapshot: WatchlistSnapshot) -> None:
         self.beginResetModel()
         self._rows = tuple(dict(record) for record in snapshot.records)
+        self.reminder_now = datetime.now(timezone.utc)
+        self._reminder_summary = reminder_summary(self._rows, self.reminder_now)
         self._rebuild_visible_rows()
         self.endResetModel()
 
@@ -668,6 +683,15 @@ class WatchlistTableModel(QAbstractTableModel):
         if not index.isValid() or index.row() >= len(self._visible_rows):
             return None
         record = self._visible_rows[index.row()]
+        if index.column() in (4, 5):
+            kind = reminder_kind(record, self.reminder_now)
+            urgent = kind == "overdue" or record.get("promotion_recovery") is not None
+            if role == Qt.ItemDataRole.ForegroundRole and (urgent or kind == "due"):
+                return QColor("#e05260" if urgent else "#c77d16")
+            if role == Qt.ItemDataRole.FontRole and urgent:
+                font = QFont()
+                font.setBold(True)
+                return font
         if role == Qt.ItemDataRole.UserRole:
             return int(record["w_id"])
         if role == Qt.ItemDataRole.ToolTipRole:
@@ -688,7 +712,7 @@ class WatchlistTableModel(QAbstractTableModel):
             str(record.get("douyin_id") or "—"),
             _watchlist_state_label(record),
             (
-                f"{_watchlist_due_label(record)} · {_watchlist_date_label(record.get('next_review_at'))}"
+                f"{_watchlist_due_label(record, self.reminder_now)} · {_watchlist_date_label(record.get('next_review_at'))}"
                 if record.get("state") == "watching"
                 else _watchlist_due_label(record)
             ),
@@ -716,8 +740,10 @@ class WatchlistTableModel(QAbstractTableModel):
         if self._state_filter != "all" and state != self._state_filter:
             return False
         if self._due_filter != "all":
-            due_label = _watchlist_due_label(record)
-            if self._due_filter == "due" and due_label != "已到期":
+            due_label = _watchlist_due_label(record, self.reminder_now)
+            if self._due_filter == "due" and due_label not in ("已到期", "已超期"):
+                return False
+            if self._due_filter == "overdue" and due_label != "已超期":
                 return False
             if self._due_filter == "upcoming" and due_label != "待复查":
                 return False
@@ -1262,6 +1288,45 @@ class MainWindow(QMainWindow):
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self._poll_processes)
         self.poll_timer.start(500)
+        self._reminder_tick = time.monotonic()
+        self._reminder_wall = datetime.now(timezone.utc)
+        self._reminder_offset = self._reminder_wall.astimezone().utcoffset()
+        self._reminder_refresh_tick = self._reminder_tick
+        self.watchlist_reminder_timer = QTimer(self)
+        self.watchlist_reminder_timer.timeout.connect(self._tick_watchlist_reminders)
+        self.watchlist_reminder_timer.start(1000)
+
+    def _tick_watchlist_reminders(self) -> None:
+        if self.controller.startup_state is StartupState.CLOSING:
+            return
+        now, tick = datetime.now(timezone.utc), time.monotonic()
+        elapsed = tick - self._reminder_tick
+        wall_elapsed = (now - self._reminder_wall).total_seconds()
+        changed = (abs(wall_elapsed - elapsed) > 2 or elapsed > 3
+                   or now.astimezone().utcoffset() != self._reminder_offset
+                   or now.astimezone().date() != self._reminder_wall.astimezone().date())
+        self._reminder_tick, self._reminder_wall = tick, now
+        self._reminder_offset = now.astimezone().utcoffset()
+        if changed or tick - self._reminder_refresh_tick >= 60:
+            self._reminder_refresh_tick = tick
+            self._refresh_watchlist_reminders(now)
+            self.refresh_watchlist(preserve_output=True, quiet=True)
+
+    def _refresh_watchlist_reminders(self, now=None) -> None:
+        selected = self._selected_watchlist_record()
+        scroll = self.watchlist_table.verticalScrollBar().value()
+        self.watchlist_model.refresh_reminders(now)
+        if selected:
+            for row in range(self.watchlist_model.rowCount()):
+                if self.watchlist_model.record_at(row)["w_id"] == selected["w_id"]:
+                    self.watchlist_table.selectRow(row)
+                    break
+        self.watchlist_table.verticalScrollBar().setValue(scroll)
+        summary = self.watchlist_model.reminder_summary()
+        self.watchlist_reminder_label.setText(
+            f"待处理 {summary['due']} · 超期 {summary['overdue']} · "
+            f"显示 {self.watchlist_model.visible_count} / {self.watchlist_model.total_count}")
+        self._watchlist_selection_changed()
 
     def _read_log_stats_auto_enabled(self) -> bool:
         settings = getattr(self._window_state_store, "_settings", None)
@@ -1957,7 +2022,7 @@ class MainWindow(QMainWindow):
             str(self.watchlist_due_filter.currentData() or "all"),
             self.watchlist_search_edit.text(),
         )
-        self._watchlist_selection_changed()
+        self._refresh_watchlist_reminders()
 
     def _selected_watchlist_record(self) -> dict[str, Any] | None:
         table = getattr(self, "watchlist_table", None)
@@ -2056,7 +2121,7 @@ class MainWindow(QMainWindow):
         elif state == "promoted":
             self.watchlist_open_button.setEnabled(True)
 
-    def refresh_watchlist(self, *, preserve_output: bool = False) -> None:
+    def refresh_watchlist(self, *, preserve_output: bool = False, quiet: bool = False) -> None:
         if self.controller.startup_state is not StartupState.READY:
             return
         spec = TaskSpec(
@@ -2074,7 +2139,7 @@ class MainWindow(QMainWindow):
             output=self.watchlist_output,
             buttons=(self.watchlist_refresh_button,),
             on_success=lambda snapshot: self._apply_watchlist_snapshot(
-                snapshot, preserve_output=preserve_output
+                snapshot, preserve_output=preserve_output, quiet=quiet
             ),
             on_failure=self._watchlist_background_failed,
             generation_key="watchlist_snapshot",
@@ -2083,15 +2148,30 @@ class MainWindow(QMainWindow):
             self._watchlist_refresh_task_id = task_id
 
     def _apply_watchlist_snapshot(
-        self, snapshot: object, *, preserve_output: bool = False
+        self, snapshot: object, *, preserve_output: bool = False, quiet: bool = False
     ) -> None:
         if not isinstance(snapshot, WatchlistSnapshot):
             self._watchlist_background_failed("观察名单刷新结果无效。")
             return
+        if quiet and snapshot == self._watchlist_snapshot:
+            self._refresh_watchlist_reminders()
+            return
         self._watchlist_snapshot = snapshot
+        selected = self._selected_watchlist_record()
+        scroll = self.watchlist_table.verticalScrollBar().value()
         self.watchlist_model.set_snapshot(snapshot)
         self._watchlist_promotion_preview = None
         self._apply_watchlist_filters()
+        if selected:
+            for row in range(self.watchlist_model.rowCount()):
+                if self.watchlist_model.record_at(row)["w_id"] == selected["w_id"]:
+                    self.watchlist_table.selectRow(row)
+                    break
+        self.watchlist_table.verticalScrollBar().setValue(scroll)
+        self._refresh_watchlist_reminders()
+        if quiet:
+            self._update_watchlist_button_states()
+            return
         write_info = self._append_info if preserve_output else self._replace_info
         write_info(
             self.watchlist_output,
@@ -3143,6 +3223,7 @@ class MainWindow(QMainWindow):
         for label, value in (
             ("全部", "all"),
             ("已到期", "due"),
+            ("已超期", "overdue"),
             ("待复查", "upcoming"),
         ):
             self.watchlist_due_filter.addItem(label, value)
@@ -3156,6 +3237,8 @@ class MainWindow(QMainWindow):
         self.watchlist_refresh_button.clicked.connect(self.refresh_watchlist)
         filter_layout.addWidget(self.watchlist_refresh_button)
         layout.addWidget(filters)
+        self.watchlist_reminder_label = QLabel("观察提醒待加载")
+        layout.addWidget(self.watchlist_reminder_label)
 
         self.watchlist_model = WatchlistTableModel(self)
         self.watchlist_table = QTableView()
