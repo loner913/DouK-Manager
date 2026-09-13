@@ -2056,7 +2056,7 @@ class MainWindow(QMainWindow):
         elif state == "promoted":
             self.watchlist_open_button.setEnabled(True)
 
-    def refresh_watchlist(self) -> None:
+    def refresh_watchlist(self, *, preserve_output: bool = False) -> None:
         if self.controller.startup_state is not StartupState.READY:
             return
         spec = TaskSpec(
@@ -2073,14 +2073,18 @@ class MainWindow(QMainWindow):
             lambda context: self.controller.watchlist_snapshot(context=context),
             output=self.watchlist_output,
             buttons=(self.watchlist_refresh_button,),
-            on_success=self._apply_watchlist_snapshot,
+            on_success=lambda snapshot: self._apply_watchlist_snapshot(
+                snapshot, preserve_output=preserve_output
+            ),
             on_failure=self._watchlist_background_failed,
             generation_key="watchlist_snapshot",
         )
         if task_id is not None:
             self._watchlist_refresh_task_id = task_id
 
-    def _apply_watchlist_snapshot(self, snapshot: object) -> None:
+    def _apply_watchlist_snapshot(
+        self, snapshot: object, *, preserve_output: bool = False
+    ) -> None:
         if not isinstance(snapshot, WatchlistSnapshot):
             self._watchlist_background_failed("观察名单刷新结果无效。")
             return
@@ -2088,7 +2092,8 @@ class MainWindow(QMainWindow):
         self.watchlist_model.set_snapshot(snapshot)
         self._watchlist_promotion_preview = None
         self._apply_watchlist_filters()
-        self._replace_info(
+        write_info = self._append_info if preserve_output else self._replace_info
+        write_info(
             self.watchlist_output,
             f"观察名单已刷新：显示 {self.watchlist_model.visible_count} / {self.watchlist_model.total_count} 条。",
             f"W revision={snapshot.revision}；next_w_id={snapshot.next_w_id}。",
@@ -2361,13 +2366,13 @@ class MainWindow(QMainWindow):
             "正在刷新观察名单显示。",
         )
         self.statusBar().showMessage(f"W{result.w_id} 已转正为 A{result.a_number}")
-        self.refresh_watchlist()
+        self.refresh_watchlist(preserve_output=True)
 
     def _watchlist_promotion_failed(self, payload: object) -> None:
         self._watchlist_promotion_preview = None
         self._watchlist_background_failed(payload)
         if self.controller.startup_state is StartupState.READY:
-            self.refresh_watchlist()
+            self.refresh_watchlist(preserve_output=True)
 
     def _watchlist_mutation_succeeded(self, snapshot: object) -> None:
         if not isinstance(snapshot, WatchlistSnapshot):

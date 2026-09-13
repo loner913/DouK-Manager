@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import os
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QTableView, QPushButton
+from PySide6.QtWidgets import QApplication, QTableView, QPushButton, QTextEdit
 
 from douk_manager.core.watchlist import WatchlistSnapshot
-from douk_manager.gui import WatchlistTableModel
+from douk_manager.core.watchlist_promotion import PromotionResult
+from douk_manager.gui import MainWindow, WatchlistTableModel
+from douk_manager.startup import StartupState
 
 
 def _record(
@@ -88,6 +92,81 @@ class WatchlistUiModelTests(unittest.TestCase):
         model.set_filters("all", "all", "synthetic_ui_2")
         self.assertEqual(model.visible_count, 1)
         self.assertEqual(model.record_at(0)["w_id"], 2)
+
+
+class WatchlistPromotionFeedbackTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self.output = QTextEdit()
+        self.button = QPushButton()
+        self.pending = []
+        self.window = SimpleNamespace(
+            controller=SimpleNamespace(startup_state=StartupState.READY),
+            watchlist_output=self.output,
+            watchlist_refresh_button=self.button,
+            watchlist_model=WatchlistTableModel(),
+            _watchlist_promotion_preview=object(),
+            _apply_watchlist_filters=Mock(),
+            _update_watchlist_button_states=Mock(),
+            _append_info=MainWindow._append_info,
+            _replace_info=MainWindow._replace_info,
+            statusBar=Mock(return_value=Mock()),
+        )
+        for name in (
+            "refresh_watchlist", "_apply_watchlist_snapshot",
+            "_watchlist_background_failed", "_watchlist_promotion_succeeded",
+            "_watchlist_promotion_failed",
+        ):
+            setattr(self.window, name, getattr(MainWindow, name).__get__(self.window))
+
+        def submit(spec, action, **callbacks):
+            self.pending.append(callbacks)
+            return "synthetic-refresh"
+
+        self.window._submit_coalesced_background = submit
+        record = _record(1, state="promoted")
+        record["promoted_a_number"] = 1
+        self.snapshot = WatchlistSnapshot(revision=4, next_w_id=2, records=(record,))
+
+    def tearDown(self) -> None:
+        self.output.close()
+        self.button.close()
+
+    def test_promotion_success_survives_deferred_refresh_and_updates_rows(self) -> None:
+        self.window._watchlist_promotion_succeeded(
+            PromotionResult(1, 1, 4, "available", False)
+        )
+        self.assertIn("W1 已完成转正：A1", self.output.toPlainText())
+        self.pending.pop()["on_success"](self.snapshot)
+        text = self.output.toPlainText()
+        self.assertIn("W1 已完成转正：A1", text)
+        self.assertIn("观察名单已刷新", text)
+        self.assertEqual(self.window.watchlist_model.record_at(0)["state"], "promoted")
+        self.assertIsNone(self.window._watchlist_promotion_preview)
+
+    def test_promotion_failure_survives_deferred_refresh(self) -> None:
+        self.window._watchlist_promotion_failed("synthetic transaction failure")
+        self.pending.pop()["on_success"](self.snapshot)
+        self.assertIn("synthetic transaction failure", self.output.toPlainText())
+        self.assertIn("观察名单已刷新", self.output.toPlainText())
+
+    def test_refresh_failure_keeps_success_and_reports_refresh_error(self) -> None:
+        self.window._watchlist_promotion_succeeded(
+            PromotionResult(1, 1, 4, "available", False)
+        )
+        self.pending.pop()["on_failure"]("synthetic refresh failure")
+        self.assertIn("W1 已完成转正：A1", self.output.toPlainText())
+        self.assertIn("synthetic refresh failure", self.output.toPlainText())
+
+    def test_manual_refresh_replaces_previous_operation_output(self) -> None:
+        self.output.setPlainText("previous operation")
+        self.window.refresh_watchlist()
+        self.pending.pop()["on_success"](self.snapshot)
+        self.assertNotIn("previous operation", self.output.toPlainText())
+        self.assertIn("观察名单已刷新", self.output.toPlainText())
 
 
 if __name__ == "__main__":
