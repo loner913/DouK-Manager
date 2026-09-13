@@ -109,6 +109,23 @@ class CollectorWatchlistHttpTests(unittest.TestCase):
                     self.assertEqual(created["status"], "CREATED")
                     self.assertEqual(created["w_id"], 1)
                     self.assertNotIn("url", created)
+                    original_payload = json.loads(body)
+                    watchlist = WatchlistService(paths)
+                    archived = watchlist.archive(1, expected_revision=watchlist.snapshot().revision)
+                    watchlist.delete_archived(1, request_id=str(uuid.uuid4()), expected_revision=archived.revision)
+                    before = [path.read_bytes() for path in (paths.watchlist, paths.watchlist_control, paths.watchlist_w_watermark)]
+                    with patch.object(collector_server, "manager_session_active", return_value=True):
+                        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+                        try:
+                            connection.request("POST", "/watchlist/observe", json.dumps(original_payload),
+                                               {"Content-Type": "application/json", "X-DouK-Token": collector_server.ACCESS_TOKEN})
+                            response = connection.getresponse()
+                            replayed = json.loads(response.read())
+                            self.assertEqual(response.status, 410)
+                            self.assertEqual((replayed["status"], replayed["w_id"]), ("DELETED", 1))
+                        finally:
+                            connection.close()
+                    self.assertEqual(before, [path.read_bytes() for path in (paths.watchlist, paths.watchlist_control, paths.watchlist_w_watermark)])
                 finally:
                     lease.release()
             finally:

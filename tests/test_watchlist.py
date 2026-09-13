@@ -319,10 +319,65 @@ class WatchlistTests(unittest.TestCase):
             self.assertEqual(read_json(paths.watchlist_w_watermark)["next_w_id"], 3)
             validate_control(read_json(paths.watchlist_control))
 
+    def test_deleted_observation_aliases_replay_without_writes(self) -> None:
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy), tempfile.TemporaryDirectory() as directory:
+                paths, service = self._service(directory)
+                original = self._payload()
+                alias = self._payload(original["url"])
+                service.observe(original)
+                service.observe(alias)
+                archived = service.archive(1, expected_revision=service.snapshot().revision)
+                delete_id = str(uuid.uuid4())
+                service.delete_archived(1, request_id=delete_id, expected_revision=archived.revision)
+                control = read_json(paths.watchlist_control)
+                self.assertTrue(all(item["outcome"] == "deleted" for item in control["request_receipts"]))
+                if legacy:
+                    control["request_receipts"][0]["outcome"] = "committed"
+                    control["request_receipts"][1]["outcome"] = "exists"
+                    write_json_atomic(paths.watchlist_control, control)
+                targets = (paths.watchlist, paths.watchlist_control, paths.watchlist_w_watermark)
+                before = [p.read_bytes() for p in targets]
+                for payload in (original, alias):
+                    result = service.observe(payload)
+                    self.assertEqual((result["status"], result["w_id"]), ("DELETED", 1))
+                    with self.assertRaises(WatchlistError) as raised:
+                        service.observe({**payload, "note": "different digest"})
+                    self.assertEqual(raised.exception.code, "REQUEST_CONFLICT")
+                with self.assertRaises(WatchlistError) as raised:
+                    service.delete_archived(2, request_id=delete_id, expected_revision=3)
+                self.assertEqual(raised.exception.code, "REQUEST_CONFLICT")
+                self.assertEqual(before, [p.read_bytes() for p in targets])
+                fresh = service.observe(self._payload(original["url"]))
+                self.assertEqual(fresh["w_id"], 2)
+                self.assertEqual(service.observe(original)["status"], "DELETED")
+
+    def test_interrupted_delete_blocks_original_request_before_body_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths, service = self._service(directory)
+            payload = self._payload()
+            service.observe(payload)
+            archived = service.archive(1, expected_revision=1)
+            real_write = watchlist_module.write_json_atomic
+
+            def fail_body(path, value):
+                if path == paths.watchlist:
+                    raise PermissionError("synthetic body deletion failure")
+                real_write(path, value)
+
+            with patch.object(watchlist_module, "write_json_atomic", side_effect=fail_body):
+                with self.assertRaises(PermissionError):
+                    service.delete_archived(1, request_id=str(uuid.uuid4()), expected_revision=archived.revision)
+            self.assertEqual(service.snapshot().records[0]["state"], "archived")
+            with self.assertRaises(WatchlistError) as raised:
+                service.observe(payload)
+            self.assertEqual(raised.exception.code, "RECOVERY_REQUIRED")
+
     def test_delete_pending_replay_repairs_missing_body_without_repeating_delete(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             paths, service = self._service(directory)
-            created = service.observe(self._payload())
+            payload = self._payload()
+            created = service.observe(payload)
             service.archive(created["w_id"], expected_revision=1)
             request_id = str(uuid.uuid4())
             real_write = watchlist_module.write_json_atomic
@@ -344,7 +399,11 @@ class WatchlistTests(unittest.TestCase):
                 read_json(paths.watchlist_control)["request_receipts"][-1]["outcome"],
                 "delete_pending",
             )
+            with self.assertRaises(WatchlistError) as raised:
+                service.observe(payload)
+            self.assertEqual(raised.exception.code, "RECOVERY_REQUIRED")
             repaired = service.delete_archived(1, request_id=request_id, expected_revision=3)
+            self.assertEqual(service.observe(payload)["status"], "DELETED")
             self.assertEqual(repaired.revision, 3)
             self.assertEqual(
                 read_json(paths.watchlist_control)["request_receipts"][-1]["outcome"],

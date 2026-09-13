@@ -2847,6 +2847,8 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     return
             status = 201 if route == "/watchlist/observe" and result.get("status") == "CREATED" else 200
+            if route == "/watchlist/observe" and result.get("status") == "DELETED":
+                status = 410
             self._send_json(result, status)
         except LockBusyError:
             error = CollectorError(

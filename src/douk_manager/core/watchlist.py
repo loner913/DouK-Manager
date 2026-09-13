@@ -582,7 +582,7 @@ class WatchlistService:
                     )
                 if document["next_w_id"] < watermark["next_w_id"]:
                     raise WatchlistError("RECOVERY_REQUIRED", "观察名单计数器低于不可回退高水位。")
-                return self._replay_receipt(receipt, document)
+                return self._replay_receipt(receipt, document, control)
             if document["next_w_id"] < watermark["next_w_id"]:
                 raise WatchlistError("RECOVERY_REQUIRED", "观察名单计数器低于不可回退高水位。")
             pending = next(
@@ -969,13 +969,15 @@ class WatchlistService:
             self._require_ready(control)
             receipt = self._receipt(control, request_id)
             if receipt is not None:
+                if receipt["payload_digest"] != _payload_digest({"operation": "delete", "w_id": w_id}):
+                    raise WatchlistError("REQUEST_CONFLICT", "request_id 已对应另一份请求。")
                 if receipt["outcome"] == "deleted":
                     return self.snapshot_locked(document)
                 if receipt["outcome"] == "delete_pending":
                     try:
                         self._find_record(document, receipt["w_id"])
                     except WatchlistError:
-                        receipt["outcome"] = "deleted"
+                        self._set_deletion_outcome(control, receipt["w_id"], "deleted")
                         write_json_atomic(self.paths.control, control)
                         return self.snapshot_locked(document)
                     raise WatchlistError("RECOVERY_REQUIRED", "原删除请求尚未完成，需先恢复现场。")
@@ -994,13 +996,13 @@ class WatchlistService:
                 None,
             )
             control["request_receipts"].append(pending)
+            self._set_deletion_outcome(control, w_id, "delete_pending")
             write_json_atomic(self.paths.control, control)
             document["records"] = [item for item in document["records"] if item["w_id"] != w_id]
             document["revision"] += 1
             document = validate_document(document)
             write_json_atomic(self.paths.watchlist, document)
-            pending["outcome"] = "deleted"
-            control["request_receipts"][-1] = pending
+            self._set_deletion_outcome(control, w_id, "deleted")
             write_json_atomic(self.paths.control, control)
             return self.snapshot_locked(document)
 
@@ -1035,8 +1037,25 @@ class WatchlistService:
             None,
         )
 
-    def _replay_receipt(self, receipt: dict[str, Any], document: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _set_deletion_outcome(control: dict[str, Any], w_id: int, outcome: str) -> None:
+        for item in control["request_receipts"]:
+            if item["w_id"] == w_id:
+                item["outcome"] = outcome
+
+    def _replay_receipt(
+        self, receipt: dict[str, Any], document: dict[str, Any],
+        control: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         outcome = receipt["outcome"]
+        # Older deletions only marked the deletion request, not its W aliases.
+        if control is not None and receipt["w_id"] is not None:
+            related = {item["outcome"] for item in control["request_receipts"]
+                       if item["w_id"] == receipt["w_id"]}
+            if "delete_pending" in related:
+                outcome = "delete_pending"
+            elif "deleted" in related:
+                outcome = "deleted"
         if outcome == "pending":
             raise WatchlistError("RECOVERY_REQUIRED", "原观察请求尚未完成，需先恢复现场。")
         if outcome == "delete_pending":
