@@ -1336,7 +1336,7 @@ class MainWindow(QMainWindow):
         self._update_profile_button_states()
 
     def begin_startup_check(self) -> bool:
-        if self.controller.startup_state is StartupState.CLOSING:
+        if self._startup_check_blocked_by_closing():
             return False
         generation = max(
             self.startup_generation,
@@ -1372,6 +1372,12 @@ class MainWindow(QMainWindow):
             )
         except Exception as exc:
             self._startup_task_id = None
+            if self._startup_check_blocked_by_closing():
+                self.controller.logger.info(
+                    "关闭期间跳过启动安全检查排队：%s",
+                    exc,
+                )
+                return False
             self.controller.logger.exception("启动安全检查排队失败：%s", exc)
             self._apply_startup_failure(
                 generation,
@@ -1507,9 +1513,23 @@ class MainWindow(QMainWindow):
     def _open_manager_log(self) -> None:
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.controller.log_path)))
 
+    def _startup_check_blocked_by_closing(self) -> bool:
+        return bool(
+            getattr(self, "_close_pending", False)
+            or getattr(self.coordinator, "is_closing", False)
+            or self.controller.startup_state is StartupState.CLOSING
+        )
+
+    def _stop_startup_recheck_timer(self) -> None:
+        timer = getattr(self, "startup_recheck_timer", None)
+        if timer is not None:
+            timer.stop()
+
     def _run_startup_recheck(self) -> None:
-        if self.isVisible():
-            self.begin_startup_check()
+        if not self.isVisible() or self._startup_check_blocked_by_closing():
+            MainWindow._stop_startup_recheck_timer(self)
+            return
+        self.begin_startup_check()
 
     @Slot()
     def _on_background_tasks_idle(self) -> None:
@@ -1607,7 +1627,8 @@ class MainWindow(QMainWindow):
                 "当前观察写入仍处于 blocked，正在重新执行启动安全检查。",
             )
             self._apply_action_gate()
-            self.startup_recheck_timer.start(0)
+            if not self._startup_check_blocked_by_closing():
+                self.startup_recheck_timer.start(0)
 
         self._submit_background(
             spec,
@@ -7100,6 +7121,7 @@ class MainWindow(QMainWindow):
                     ).values()
                 )
             )
+            MainWindow._stop_startup_recheck_timer(self)
             self._close_pending = True
             self.coordinator.begin_closing()
             self.controller.begin_closing()
@@ -7126,6 +7148,7 @@ class MainWindow(QMainWindow):
             return
         begin_closing = getattr(self.controller, "begin_closing", None)
         if callable(begin_closing):
+            MainWindow._stop_startup_recheck_timer(self)
             self.coordinator.begin_closing()
             begin_closing()
             self._apply_action_gate()

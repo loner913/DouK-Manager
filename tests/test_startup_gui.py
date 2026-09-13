@@ -216,6 +216,55 @@ class StartupGuiTests(unittest.TestCase):
             self.assertIs(window.controller.startup_state, StartupState.SAFETY_CHECKING)
             self._dispose_window(window)
 
+    def test_restore_recheck_is_suppressed_once_close_begins(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window = self._window(Path(directory))
+            try:
+                window.controller.startup_state = StartupState.DEGRADED_READ_ONLY
+                window._close_pending = True
+                window.coordinator.start = Mock(
+                    side_effect=AssertionError("close must not submit startup recheck")
+                )
+                window.startup_recheck_timer.start(60_000)
+
+                window._run_startup_recheck()
+
+                window.coordinator.start.assert_not_called()
+                self.assertIs(
+                    window.controller.startup_state,
+                    StartupState.DEGRADED_READ_ONLY,
+                )
+                self.assertFalse(window.startup_recheck_timer.isActive())
+
+                window.controller.begin_closing()
+                window._close_pending = False
+                window.coordinator._closing = True
+                window._run_startup_recheck()
+
+                window.coordinator.start.assert_not_called()
+                self.assertIs(window.controller.startup_state, StartupState.CLOSING)
+            finally:
+                self._dispose_window(window)
+
+    def test_startup_submission_race_during_close_does_not_enter_degraded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window = self._window(Path(directory))
+            try:
+                window.controller.startup_state = StartupState.DEGRADED_READ_ONLY
+
+                def reject_after_close(*_args, **_kwargs):
+                    window.controller.begin_closing()
+                    raise TaskRejectedError("background task coordinator is closing")
+
+                window.coordinator.start = Mock(side_effect=reject_after_close)
+                self.assertFalse(window.begin_startup_check())
+
+                window.coordinator.start.assert_called_once()
+                self.assertIs(window.controller.startup_state, StartupState.CLOSING)
+                self.assertNotIn("只读保护", window.startup_summary_label.text())
+            finally:
+                self._dispose_window(window)
+
     def test_background_failure_keeps_message_and_traceback_in_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             window = self._window(Path(directory))
