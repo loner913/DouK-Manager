@@ -343,8 +343,8 @@ def _reflow_results(page: QWidget, root: QLayout, items: list[QLayoutItem]) -> N
 
 
 def _reflow_settings(page: QWidget, root: QLayout, items: list[QLayoutItem]) -> None:
-    _require(items, 9, "设置")
-    warning, paths, defaults, note, save_paths, save_all, update, rollback, output, *tail = items
+    _require(items, 10, "设置")
+    warning, paths, startup, defaults, note, save_paths, save_all, update, rollback, output, *tail = items
     _mark_banner(warning, "warning")
     _mark_banner(note)
     _prepare_output(output, placeholder="保存、更新、回退和安全验证结果会显示在这里。", minimum_height=180)
@@ -362,6 +362,7 @@ def _reflow_settings(page: QWidget, root: QLayout, items: list[QLayoutItem]) -> 
         4,
     )
     root.addLayout(config)
+    root.addWidget(_card(content, "Startup 观察数据恢复", (startup,)))
 
     # Keep the action layout on a real, parented holder. The previous temporary
     # QWidgetItem wrapper could be collected with its holder and destroy these

@@ -273,6 +273,7 @@ class BackupService:
     def restore_startup_snapshot(self, snapshot: Path, *, locked: bool = False) -> None:
         """Restore a validated Startup schema-3 snapshot without rollbacking W metadata."""
 
+        snapshot = self._resolve_startup_snapshot(snapshot)
         guard = nullcontext() if locked else critical_section(self.paths.lock_file, timeout=10.0)
         with guard:
             self._restore_startup_snapshot(snapshot)
@@ -335,7 +336,14 @@ class BackupService:
             / datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
         )
         protection.mkdir(parents=True, exist_ok=True)
-        destinations = self._startup_sources()
+        # A Startup snapshot contains a Volume consistency reference, but this
+        # recovery entry is intentionally limited to observation data. Formal
+        # Volume restoration remains a separate, explicitly confirmed action.
+        destinations = {
+            relative: destination
+            for relative, destination in self._startup_sources().items()
+            if relative.startswith("Data/")
+        }
         replaced: list[tuple[Path, Path | None]] = []
         try:
             for relative, destination in destinations.items():
@@ -373,6 +381,22 @@ class BackupService:
             if isinstance(exc, BackupError):
                 raise
             raise BackupError("Startup 恢复失败，已保留当前文件或保护副本。") from exc
+
+    def _resolve_startup_snapshot(self, snapshot: Path) -> Path:
+        startup_root = (self.paths.backups / "Startup").resolve()
+        candidate = Path(snapshot)
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError as exc:
+            raise BackupError("Startup 快照目录无效或不可读取。") from exc
+        if (
+            candidate.is_symlink()
+            or not resolved.is_dir()
+            or resolved.parent != startup_root
+            or resolved.name == "_quarantine"
+        ):
+            raise BackupError("只允许恢复 Backups/Startup 下的有效直接快照目录。")
+        return resolved
 
     def _startup_sources(self) -> dict[str, Path]:
         sources = {

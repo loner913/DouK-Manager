@@ -902,6 +902,34 @@ class ManagerController:
         self.logger.info("手动完整 Volume 备份完成：%s", result)
         return result
 
+    def restore_startup_snapshot(
+        self,
+        snapshot: Path,
+        *,
+        context: OperationContext | None = None,
+    ) -> None:
+        """Restore observation data from one user-selected Startup snapshot."""
+
+        if context is not None:
+            context.raise_if_cancelled()
+        state = self._current_startup_state()
+        if state not in (StartupState.READY, StartupState.DEGRADED_READ_ONLY):
+            raise ControllerError(f"恢复 Startup 观察数据不可用：当前状态为 {state.value}。")
+        if getattr(self, "instance_session_error", "") or not self._manager_session_is_valid():
+            raise ControllerError("当前管理器会话无效，不能恢复 Startup 观察数据。")
+        self.require_download_lifecycle_idle()
+        if self.engine.external_running():
+            raise ControllerError("下载引擎正在运行，禁止恢复 Startup 观察数据。")
+        if self.collector.running or self.collector.health():
+            raise ControllerError("账号采集服务运行时不能恢复 Startup 观察数据。")
+        if context is not None:
+            context.raise_if_cancelled()
+        self.backup.restore_startup_snapshot(Path(snapshot))
+        self.startup_backup = None
+        self.startup_state = StartupState.DEGRADED_READ_ONLY
+        self.read_only_reason = "Startup 观察数据已恢复，等待重新执行启动安全检查。"
+        self.logger.info("Startup 观察数据恢复完成，等待重新执行启动安全检查：%s", snapshot)
+
     def preview_engine_update(
         self,
         archive: Path,

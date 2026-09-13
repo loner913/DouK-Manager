@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -224,6 +225,28 @@ class BackupTests(unittest.TestCase):
             for path, value in before.items():
                 self.assertEqual(read_json(path), value)
 
+    def test_restore_rejects_snapshot_outside_startup_before_live_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths, _ = self._watchlist_service(directory)
+            service = BackupService(paths)
+            snapshot = service.create_startup_snapshot("Startup")
+            outside = Path(directory) / "outside-startup-snapshot"
+            shutil.copytree(snapshot, outside)
+            before = {
+                path: path.read_bytes()
+                for path in (
+                    paths.watchlist,
+                    paths.watchlist_w_watermark,
+                    paths.watchlist_control,
+                )
+            }
+
+            with self.assertRaises(BackupError):
+                service.restore_startup_snapshot(outside)
+
+            for path, value in before.items():
+                self.assertEqual(path.read_bytes(), value)
+
     def test_restore_merges_current_watermark_and_receipts_and_blocks_gate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             paths, watchlist = self._watchlist_service(directory)
@@ -240,6 +263,10 @@ class BackupTests(unittest.TestCase):
             }
             watchlist.observe(first_payload)
             snapshot = service.create_startup_snapshot("Startup")
+            formal_volume_before = {
+                name: (paths.volume / name).read_bytes()
+                for name in service.CRITICAL_FILENAMES
+            }
             second_payload = dict(first_payload)
             second_payload["request_id"] = str(uuid4())
             second_payload["url"] = "https://www.douyin.com/user/43"
@@ -254,6 +281,8 @@ class BackupTests(unittest.TestCase):
             self.assertEqual(restored_control["write_gate"], "blocked")
             self.assertEqual(len(restored_control["request_receipts"]), 2)
             self.assertTrue(watchlist.has_unresolved_recovery())
+            for name, value in formal_volume_before.items():
+                self.assertEqual((paths.volume / name).read_bytes(), value)
 
 
 if __name__ == "__main__":

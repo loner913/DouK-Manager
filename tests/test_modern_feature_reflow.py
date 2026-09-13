@@ -93,6 +93,12 @@ class ModernFeatureReflowTests(unittest.TestCase):
                     wrapper.legacy_page.isAncestorOf(control),
                     f"{label} control was recreated or detached from the original page",
                 )
+            settings_wrapper = window.modern_feature_pages["设置"]
+            self.assertTrue(
+                settings_wrapper.legacy_page.isAncestorOf(
+                    window.startup_snapshot_edit
+                )
+            )
             self._dispose_window(window)
 
     def test_compact_forms_do_not_absorb_tall_window_whitespace(self) -> None:

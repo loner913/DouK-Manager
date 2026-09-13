@@ -13,7 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEventLoop, QTimer
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import QApplication, QPushButton
+from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton
 
 from douk_manager import app as app_module
 from douk_manager.background import TaskFailure, TaskRejectedError, TaskState
@@ -409,6 +409,9 @@ class StartupGuiTests(unittest.TestCase):
             self.assertTrue(window.startup_copy_button.isEnabled())
             self.assertTrue(window.startup_log_button.isEnabled())
             self.assertTrue(window.startup_recheck_button.isEnabled())
+            self.assertTrue(window.startup_snapshot_browse_button.isEnabled())
+            self.assertTrue(window.startup_snapshot_open_button.isEnabled())
+            self.assertFalse(window.startup_snapshot_restore_button.isEnabled())
             buttons = {button.text(): button for button in window.findChildren(QPushButton)}
             for text in (
                 "创建并设为正式 settings.json",
@@ -422,6 +425,75 @@ class StartupGuiTests(unittest.TestCase):
                 self.assertIn(text, buttons)
                 self.assertFalse(buttons[text].isEnabled(), text)
             self._dispose_window(window)
+
+    def test_startup_snapshot_restore_uses_path_repair_gate_and_waiting_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window = self._window(Path(directory))
+            try:
+                window.controller.startup_state = StartupState.DEGRADED_READ_ONLY
+                window._apply_action_gate()
+                self.assertTrue(window.startup_snapshot_browse_button.isEnabled())
+                self.assertTrue(window.startup_snapshot_open_button.isEnabled())
+                self.assertFalse(window.startup_snapshot_restore_button.isEnabled())
+
+                snapshot = (
+                    Path(directory)
+                    / "manager"
+                    / "Backups"
+                    / "Startup"
+                    / "2026-09-13_00-00-00-000000"
+                )
+                window.startup_snapshot_edit.setText(str(snapshot))
+                self.assertTrue(window.startup_snapshot_restore_button.isEnabled())
+                window.controller.restore_startup_snapshot = Mock()
+                window._submit_background = Mock(return_value="restore-task")
+
+                with patch.object(
+                    QMessageBox, "question", return_value=QMessageBox.Yes
+                ):
+                    window._restore_startup_snapshot()
+
+                window._submit_background.assert_called_once()
+                spec = window._submit_background.call_args.args[0]
+                self.assertEqual(spec.task_type, "startup_snapshot_restore")
+                self.assertFalse(spec.cancellable)
+                self.assertEqual(spec.close_policy.value, "WAIT")
+                self.assertEqual(
+                    spec.resource_keys,
+                    frozenset({"startup_safety", "watchlist", "settings", "volume"}),
+                )
+                self.assertEqual(
+                    window._submit_background.call_args.kwargs["buttons"],
+                    (window.startup_snapshot_restore_button,),
+                )
+                on_success = window._submit_background.call_args.kwargs["on_success"]
+                on_success(None)
+                output = window.settings_output.toPlainText()
+                self.assertIn("Startup 观察数据恢复完成", output)
+                self.assertIn("正式 Volume 未执行恢复", output)
+                self.assertIn("blocked", output)
+                self.assertTrue(window.startup_recheck_timer.isActive())
+                window.startup_recheck_timer.stop()
+            finally:
+                self._dispose_window(window)
+
+    def test_startup_snapshot_restore_confirmation_cancel_does_not_submit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window = self._window(Path(directory))
+            try:
+                window.controller.startup_state = StartupState.DEGRADED_READ_ONLY
+                window._apply_action_gate()
+                window.startup_snapshot_edit.setText(
+                    str(Path(directory) / "synthetic-startup")
+                )
+                window._submit_background = Mock()
+                with patch.object(
+                    QMessageBox, "question", return_value=QMessageBox.No
+                ):
+                    window._restore_startup_snapshot()
+                window._submit_background.assert_not_called()
+            finally:
+                self._dispose_window(window)
 
     def test_stale_result_is_ignored_and_recheck_increments_generation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -1089,6 +1089,7 @@ class MainWindow(QMainWindow):
             widget.setEnabled(diagnostic_enabled)
         for widget in self._safe_widgets:
             widget.setEnabled(safe_enabled)
+        self._update_startup_restore_button()
         dashboard_enabled = state is StartupState.READY
         if hasattr(self, "dashboard_refresh_button"):
             self.dashboard_refresh_button.setEnabled(dashboard_enabled)
@@ -1520,6 +1521,78 @@ class MainWindow(QMainWindow):
         )
         self.statusBar().showMessage("路径已保存，等待重新检查")
         self.startup_recheck_timer.start(0)
+
+    def _update_startup_restore_button(self) -> None:
+        button = getattr(self, "startup_snapshot_restore_button", None)
+        edit = getattr(self, "startup_snapshot_edit", None)
+        if button is None or edit is None:
+            return
+        busy = any(
+            binding.generation_key == "startup_snapshot_restore"
+            for binding in self._background_bindings.values()
+        )
+        button.setEnabled(
+            not busy
+            and self.controller.startup_state
+            in (StartupState.READY, StartupState.DEGRADED_READ_ONLY)
+            and bool(edit.text().strip())
+        )
+
+    def _browse_startup_snapshot(self) -> None:
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "选择 Startup 快照目录",
+            str(self.controller.paths.backups / "Startup"),
+        )
+        if selected:
+            self.startup_snapshot_edit.setText(selected)
+
+    def _restore_startup_snapshot(self) -> None:
+        snapshot_text = self.startup_snapshot_edit.text().strip()
+        if not snapshot_text:
+            QMessageBox.information(self, "未选择快照", "请先选择一个有效的 Startup 快照目录。")
+            return
+        snapshot = Path(snapshot_text)
+        answer = QMessageBox.question(
+            self,
+            "确认恢复 Startup 观察数据",
+            "将恢复选定快照中的三个观察 Data 文件；W 高水位和请求收据会按不可回退规则合并。\n"
+            "正式 Volume、Excel、数据库和任务模板不会由此入口恢复。\n"
+            "恢复期间观察写入会被阻止，完成后会自动重新执行启动安全检查。\n\n"
+            f"快照：{snapshot}\n\n仍要继续吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        spec = TaskSpec(
+            task_type="startup_snapshot_restore",
+            display_name="恢复 Startup 观察数据",
+            resource_keys=frozenset({"startup_safety", "watchlist", "settings", "volume"}),
+            deduplicate_key="startup_snapshot_restore",
+            cancellable=False,
+            close_policy=ClosePolicy.WAIT,
+            refresh_targets=("runtime_status",),
+        )
+
+        def show_success(_result: object) -> None:
+            self._replace_info(
+                self.settings_output,
+                "Startup 观察数据恢复完成。",
+                f"来源快照：{snapshot}",
+                "W 高水位和请求收据已按不可回退规则合并；正式 Volume 未执行恢复。",
+                "当前观察写入仍处于 blocked，正在重新执行启动安全检查。",
+            )
+            self._apply_action_gate()
+            self.startup_recheck_timer.start(0)
+
+        self._submit_background(
+            spec,
+            lambda _token: self.controller.restore_startup_snapshot(snapshot),
+            output=self.settings_output,
+            buttons=(self.startup_snapshot_restore_button,),
+            on_success=show_success,
+        )
 
     def _build_ui(self) -> None:
         tabs = QTabWidget()
@@ -2228,7 +2301,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         warning = QLabel(
             "正式 Volume 始终由 main.exe 所在目录推导，不能单独选择另一份数据库或主档。"
-            "自动备份只保存 settings_master.json、settings.json 和 DouK-Downloader.db，并按类别限制保留数量；"
+            "Startup 自动快照保存三个 Volume 文件和三个观察 Data 文件，最多保留 20 份；"
             "只有手动完整备份和下载引擎更新前才复制整个 Volume。"
         )
         warning.setWordWrap(True)
@@ -2260,6 +2333,44 @@ class MainWindow(QMainWindow):
             self._mark_path_widget(button)
             grid.addWidget(button, row, 2)
         layout.addWidget(box)
+
+        startup_box = QGroupBox("Startup 观察数据恢复")
+        startup_layout = QGridLayout(startup_box)
+        startup_note = QLabel(
+            "仅恢复观察名单、高水位和控制收据；正式 Volume 的恢复仍使用独立入口。"
+            "恢复完成后会保持 blocked，并自动重新执行完整启动安全检查。"
+        )
+        startup_note.setWordWrap(True)
+        startup_layout.addWidget(startup_note, 0, 0, 1, 4)
+        self.startup_snapshot_edit = QLineEdit()
+        self.startup_snapshot_edit.setPlaceholderText(
+            "选择 Backups\\Startup\\<timestamp> 快照目录"
+        )
+        self._mark_path_widget(self.startup_snapshot_edit)
+        self.startup_snapshot_edit.textChanged.connect(
+            self._update_startup_restore_button
+        )
+        startup_layout.addWidget(QLabel("Startup 快照"), 1, 0)
+        startup_layout.addWidget(self.startup_snapshot_edit, 1, 1)
+        self.startup_snapshot_browse_button = QPushButton("选择快照目录")
+        self._mark_path_widget(self.startup_snapshot_browse_button)
+        self.startup_snapshot_browse_button.clicked.connect(
+            self._browse_startup_snapshot
+        )
+        startup_layout.addWidget(self.startup_snapshot_browse_button, 1, 2)
+        self.startup_snapshot_open_button = QPushButton("打开 Startup 目录")
+        self._mark_path_widget(self.startup_snapshot_open_button)
+        self.startup_snapshot_open_button.clicked.connect(
+            lambda: self._open_path(self.controller.paths.backups / "Startup")
+        )
+        startup_layout.addWidget(self.startup_snapshot_open_button, 1, 3)
+        self.startup_snapshot_restore_button = QPushButton("恢复观察数据")
+        self._mark_path_widget(self.startup_snapshot_restore_button)
+        self.startup_snapshot_restore_button.clicked.connect(
+            self._restore_startup_snapshot
+        )
+        startup_layout.addWidget(self.startup_snapshot_restore_button, 2, 1)
+        layout.addWidget(startup_box)
 
         task_box = QGroupBox("下载与任务后续动作默认值")
         form = QFormLayout(task_box)
@@ -6013,7 +6124,8 @@ class MainWindow(QMainWindow):
             self,
             "确认完整备份 Volume",
             "此操作会复制整个正式 Volume，可能占用数 GB 空间。\n\n"
-            "日常自动备份已经保存 3 个关键文件，无需频繁执行完整备份。\n\n"
+            "日常 Startup 自动快照已经保存 3 个 Volume 文件和 3 个观察 Data 文件；"
+            "此处仍会复制整个正式 Volume。\n\n"
             "仍要继续吗？",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
