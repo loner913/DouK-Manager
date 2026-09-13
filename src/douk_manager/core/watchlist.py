@@ -744,6 +744,157 @@ class WatchlistService:
             write_json_atomic(self.paths.watchlist, document)
             return self.snapshot_locked(document)
 
+    def begin_promotion(
+        self,
+        w_id: int,
+        *,
+        expected_revision: int,
+        attempt_id: str,
+        normalized_url: str,
+        locked: bool = False,
+    ) -> WatchlistSnapshot:
+        """Persist the durable intent before touching formal JSON/Excel."""
+
+        attempt_id = _uuid(attempt_id, name="attempt_id")
+        try:
+            normalized_url = strict_admit_url(normalized_url)
+        except ProfileUrlError as exc:
+            raise WatchlistError("INVALID", "主页 URL 不符合转正入口的安全格式。") from exc
+        with self._lock(locked):
+            document, _, control = self.validate_all()
+            self._require_ready(control)
+            self._check_revision(document, expected_revision)
+            record = self._find_record(document, w_id)
+            if record["state"] != "watching":
+                raise WatchlistError("STATE_CONFLICT", "当前观察记录不允许转正。")
+            if record["promotion_recovery"] is not None:
+                raise WatchlistError("RECOVERY_REQUIRED", "当前观察记录仍有未完成转正意图，请先处理恢复。")
+            if record["url"] != normalized_url:
+                raise WatchlistError("STATE_CONFLICT", "观察记录身份已变化，请刷新后重试。")
+            now = utc_now()
+            record["promotion_recovery"] = {
+                "phase": "formal_pending",
+                "attempt_id": attempt_id,
+                "normalized_url": normalized_url,
+                "created_at": now,
+                "updated_at": now,
+                "a_number": None,
+            }
+            record["updated_at"] = now
+            document["revision"] += 1
+            document = validate_document(document)
+            write_json_atomic(self.paths.watchlist, document)
+            return self.snapshot_locked(document)
+
+    def mark_promotion_formal_committed(
+        self,
+        w_id: int,
+        *,
+        expected_revision: int,
+        attempt_id: str,
+        a_number: int,
+        locked: bool = False,
+    ) -> WatchlistSnapshot:
+        """Record that both formal files committed before final W promotion."""
+
+        attempt_id = _uuid(attempt_id, name="attempt_id")
+        if not _is_int(a_number) or a_number < 1:
+            raise WatchlistError("REQUEST_INVALID", "正式 A 编号无效。")
+        with self._lock(locked):
+            document, _, control = self.validate_all()
+            self._require_ready(control)
+            self._check_revision(document, expected_revision)
+            record = self._find_record(document, w_id)
+            recovery = record["promotion_recovery"]
+            if record["state"] != "watching" or not isinstance(recovery, dict):
+                raise WatchlistError("RECOVERY_REQUIRED", "当前转正意图不存在或状态不一致。")
+            if recovery["attempt_id"] != attempt_id:
+                raise WatchlistError("RECOVERY_REQUIRED", "转正尝试编号不一致，请先处理恢复。")
+            now = utc_now()
+            recovery["phase"] = "formal_committed_watchlist_pending"
+            recovery["a_number"] = a_number
+            recovery["updated_at"] = now
+            record["updated_at"] = now
+            document["revision"] += 1
+            document = validate_document(document)
+            write_json_atomic(self.paths.watchlist, document)
+            return self.snapshot_locked(document)
+
+    def complete_promotion(
+        self,
+        w_id: int,
+        *,
+        expected_revision: int,
+        attempt_id: str,
+        a_number: int,
+        locked: bool = False,
+    ) -> WatchlistSnapshot:
+        """Publish promoted only after the formal success boundary is known."""
+
+        attempt_id = _uuid(attempt_id, name="attempt_id")
+        if not _is_int(a_number) or a_number < 1:
+            raise WatchlistError("REQUEST_INVALID", "正式 A 编号无效。")
+        with self._lock(locked):
+            document, _, control = self.validate_all()
+            self._require_ready(control)
+            self._check_revision(document, expected_revision)
+            record = self._find_record(document, w_id)
+            recovery = record["promotion_recovery"]
+            if record["state"] != "watching" or not isinstance(recovery, dict):
+                raise WatchlistError("RECOVERY_REQUIRED", "当前转正意图不存在或状态不一致。")
+            if recovery["attempt_id"] != attempt_id:
+                raise WatchlistError("RECOVERY_REQUIRED", "转正尝试编号不一致，请先处理恢复。")
+            if recovery["a_number"] not in (None, a_number):
+                raise WatchlistError("RECOVERY_REQUIRED", "转正 A 编号与恢复意图不一致。")
+            now = utc_now()
+            record["state"] = "promoted"
+            record["promoted_a_number"] = a_number
+            record["promotion_recovery"] = None
+            record["next_review_at"] = None
+            record["archived_at"] = None
+            record["updated_at"] = now
+            record["review_history"].append(
+                {
+                    "reviewed_at": now,
+                    "action": "promote",
+                    "reasons": list(record["reasons"]),
+                    "note": record["note"],
+                    "next_review_at": None,
+                }
+            )
+            document["revision"] += 1
+            document = validate_document(document)
+            write_json_atomic(self.paths.watchlist, document)
+            return self.snapshot_locked(document)
+
+    def reset_promotion_for_retry(
+        self,
+        w_id: int,
+        *,
+        expected_revision: int,
+        attempt_id: str,
+        locked: bool = False,
+    ) -> WatchlistSnapshot:
+        """Clear an explicitly resolved, formal-empty intent for a new try."""
+
+        attempt_id = _uuid(attempt_id, name="attempt_id")
+        with self._lock(locked):
+            document, _, control = self.validate_all()
+            self._require_ready(control)
+            self._check_revision(document, expected_revision)
+            record = self._find_record(document, w_id)
+            recovery = record["promotion_recovery"]
+            if record["state"] != "watching" or not isinstance(recovery, dict):
+                raise WatchlistError("RECOVERY_REQUIRED", "当前转正意图不存在或状态不一致。")
+            if recovery["attempt_id"] != attempt_id:
+                raise WatchlistError("RECOVERY_REQUIRED", "转正尝试编号不一致，请先处理恢复。")
+            record["promotion_recovery"] = None
+            record["updated_at"] = utc_now()
+            document["revision"] += 1
+            document = validate_document(document)
+            write_json_atomic(self.paths.watchlist, document)
+            return self.snapshot_locked(document)
+
     def archive(
         self,
         w_id: int,

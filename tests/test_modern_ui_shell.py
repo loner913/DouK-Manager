@@ -56,7 +56,7 @@ class ModernUiShellTests(unittest.TestCase):
             window = self._window(Path(directory))
             self.assertIsInstance(window, LegacyMainWindow)
             self.assertIsNone(window._modern_shell_install_error)
-            self.assertEqual(window.tabs.count(), 10)
+            self.assertEqual(window.tabs.count(), 11)
 
             audit_wrapper = window.tabs.widget(window.audit_tab_index)
             result_wrapper = window.tabs.widget(window.result_tab_index)
@@ -74,6 +74,7 @@ class ModernUiShellTests(unittest.TestCase):
                 "批次生成",
                 "下载队列",
                 "账号采集",
+                "观察名单",
                 "截图与索引",
                 "下载结果",
                 "结果看板",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -8,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from douk_manager.config import AppConfig, ManagedPaths, application_root, update_config
 from douk_manager.core.backup import BackupService
+from douk_manager.core.collector_service import FormalCollectorService
 from douk_manager.core.account_audit import (
     AccountAuditReport,
     AccountAuditService,
@@ -45,10 +47,17 @@ from douk_manager.core.profile_url import (
     FormalAccountRef,
     ProfileUrlResolution,
     ProfileUrlResolver,
+    ProfileUrlError,
+    strict_admit_url,
 )
 from douk_manager.core.result_history import RecentPrivateMatch, ResultHistoryService
-from douk_manager.core.watchlist import WatchlistService
+from douk_manager.core.watchlist import WatchlistService, WatchlistSnapshot
 from douk_manager.core.watchlist_session import ManagerInstanceLease
+from douk_manager.core.watchlist_promotion import (
+    PromotionPreview,
+    PromotionResult,
+    WatchlistPromotionService,
+)
 from douk_manager.core.result_dashboard import (
     DashboardFileFingerprint,
     ResultDashboardService,
@@ -128,6 +137,13 @@ class ManagerController:
             self.config,
             self.paths,
             instance_lease=getattr(self, "instance_lease", None),
+        )
+        self.watchlist = WatchlistService(self.paths)
+        self.formal_collector = FormalCollectorService(self.paths)
+        self.watchlist_promotion = WatchlistPromotionService(
+            self.paths,
+            watchlist=self.watchlist,
+            formal=self.formal_collector,
         )
         self.screenshots = ScreenshotService()
         self.indexer = IndexService()
@@ -416,6 +432,158 @@ class ManagerController:
         if self.engine.external_running():
             return
         self.require_safe_write()
+
+    def watchlist_snapshot(
+        self,
+        *,
+        context: OperationContext | None = None,
+    ) -> WatchlistSnapshot:
+        self._require_operational_ready_with_context("刷新观察名单", context=context)
+        snapshot = self.watchlist.snapshot()
+        if context is not None:
+            context.raise_if_cancelled()
+        return snapshot
+
+    def watchlist_profile_url(
+        self,
+        w_id: int,
+        *,
+        context: OperationContext | None = None,
+    ) -> str:
+        """Return one W homepage only after the strict open-entry check."""
+
+        self._require_operational_ready_with_context("读取观察账号主页地址", context=context)
+        record = next(
+            (item for item in self.watchlist.snapshot().records if item["w_id"] == w_id),
+            None,
+        )
+        if record is None:
+            raise ControllerError("观察记录不存在。")
+        try:
+            normalized = strict_admit_url(record["url"])
+        except (ProfileUrlError, TypeError) as exc:
+            raise ControllerError("观察记录主页 URL 无法通过打开安全校验。") from exc
+        if normalized != record["url"]:
+            raise ControllerError("观察记录主页 URL 未规范化，已拒绝打开。")
+        if context is not None:
+            context.raise_if_cancelled()
+        return normalized
+
+    def preview_watchlist_promotion(
+        self,
+        w_id: int,
+        *,
+        expected_revision: int | None = None,
+        context: OperationContext | None = None,
+    ) -> PromotionPreview:
+        self._require_operational_ready_with_context("预览观察账号转正", context=context)
+        result = self.watchlist_promotion.preview(
+            w_id,
+            expected_revision=expected_revision,
+        )
+        if context is not None:
+            context.raise_if_cancelled()
+        return result
+
+    def promote_watchlist(
+        self,
+        w_id: int,
+        *,
+        expected_revision: int,
+        context: OperationContext | None = None,
+    ) -> PromotionResult:
+        self._require_operational_ready_with_context("确认观察账号转正", context=context)
+        self.require_safe_write()
+        return self.watchlist_promotion.promote(
+            w_id,
+            expected_revision=expected_revision,
+            context=context,
+        )
+
+    def retry_watchlist_promotion(
+        self,
+        w_id: int,
+        *,
+        expected_revision: int,
+        attempt_id: str,
+        context: OperationContext | None = None,
+    ) -> PromotionResult:
+        self._require_operational_ready_with_context("明确重试观察账号转正", context=context)
+        self.require_safe_write()
+        return self.watchlist_promotion.retry(
+            w_id,
+            expected_revision=expected_revision,
+            attempt_id=attempt_id,
+            context=context,
+        )
+
+    def review_watchlist(
+        self,
+        w_id: int,
+        *,
+        expected_revision: int,
+        reasons: list[str],
+        note: str,
+        next_review_at: str,
+        action: str = "review",
+        context: OperationContext | None = None,
+    ) -> WatchlistSnapshot:
+        self._require_operational_ready_with_context("保存观察复查", context=context)
+        self.require_safe_write()
+        result = self.watchlist.record_review(
+            w_id,
+            expected_revision=expected_revision,
+            reasons=reasons,
+            note=note,
+            next_review_at=next_review_at,
+            action=action,
+        )
+        if context is not None:
+            context.raise_if_cancelled()
+        return result
+
+    def archive_watchlist(
+        self,
+        w_id: int,
+        *,
+        expected_revision: int,
+        context: OperationContext | None = None,
+    ) -> WatchlistSnapshot:
+        self._require_operational_ready_with_context("归档观察账号", context=context)
+        self.require_safe_write()
+        return self.watchlist.archive(w_id, expected_revision=expected_revision)
+
+    def restore_watchlist(
+        self,
+        w_id: int,
+        *,
+        expected_revision: int,
+        next_review_at: str,
+        context: OperationContext | None = None,
+    ) -> WatchlistSnapshot:
+        self._require_operational_ready_with_context("恢复观察账号", context=context)
+        self.require_safe_write()
+        return self.watchlist.restore(
+            w_id,
+            expected_revision=expected_revision,
+            next_review_at=next_review_at,
+        )
+
+    def delete_archived_watchlist(
+        self,
+        w_id: int,
+        *,
+        expected_revision: int,
+        request_id: str | None = None,
+        context: OperationContext | None = None,
+    ) -> WatchlistSnapshot:
+        self._require_operational_ready_with_context("永久删除观察账号", context=context)
+        self.require_safe_write()
+        return self.watchlist.delete_archived(
+            w_id,
+            request_id=request_id or str(uuid.uuid4()),
+            expected_revision=expected_revision,
+        )
 
     def reconfigure(self, values: dict[str, Any]) -> str:
         has_startup_state = hasattr(self, "startup_state")

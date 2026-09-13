@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
 from typing import Any, Callable, TypeVar
@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHeaderView,
+    QInputDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -113,6 +114,8 @@ from douk_manager.core.result_dashboard import (
 from douk_manager.core.selector import compact_numbers
 from douk_manager.core.settings_tasks import ActivatedTask, EarliestRule
 from douk_manager.core.task_order import move_to_index
+from douk_manager.core.watchlist import WatchlistSnapshot, parse_utc
+from douk_manager.core.watchlist_promotion import PromotionPreview, PromotionResult
 from douk_manager.ui_messages import format_information
 from douk_manager.ui_state import (
     WindowGeometryState,
@@ -570,6 +573,246 @@ class LogStatsOutput(QTextEdit):
         self._render_stats()
 
 
+WATCHLIST_REASON_LABELS = {
+    "few_works": "作品较少",
+    "unknown_updates": "更新不确定",
+    "content_pending": "内容待核对",
+    "suspected_private": "疑似私密",
+    "other": "其他",
+}
+
+
+def _watchlist_state_label(record: dict[str, Any]) -> str:
+    if record.get("promotion_recovery") is not None:
+        return "转正待恢复"
+    return {
+        "watching": "观察中",
+        "promoted": "已转正",
+        "archived": "已归档",
+    }.get(str(record.get("state")), str(record.get("state", "未知")))
+
+
+def _watchlist_due_label(record: dict[str, Any]) -> str:
+    if record.get("state") != "watching":
+        return "—"
+    next_review_at = record.get("next_review_at")
+    if not isinstance(next_review_at, str):
+        return "待补时间"
+    try:
+        due = parse_utc(next_review_at) <= datetime.now(timezone.utc)
+    except Exception:
+        return "时间无效"
+    return "已到期" if due else "待复查"
+
+
+def _watchlist_date_label(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        return "—"
+    return value.replace("T", " ").removesuffix("Z")[:16]
+
+
+class WatchlistTableModel(QAbstractTableModel):
+    """Model/View table for W records; no per-row widgets are created."""
+
+    HEADERS = ("W编号", "名称", "采集昵称", "抖音号", "状态", "复查", "原因", "历史", "A编号")
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._rows: tuple[dict[str, Any], ...] = ()
+        self._visible_rows: tuple[dict[str, Any], ...] = ()
+        self._state_filter = "all"
+        self._due_filter = "all"
+        self._search = ""
+
+    @property
+    def total_count(self) -> int:
+        return len(self._rows)
+
+    @property
+    def visible_count(self) -> int:
+        return len(self._visible_rows)
+
+    def set_snapshot(self, snapshot: WatchlistSnapshot) -> None:
+        self.beginResetModel()
+        self._rows = tuple(dict(record) for record in snapshot.records)
+        self._rebuild_visible_rows()
+        self.endResetModel()
+
+    def set_filters(self, state_filter: str, due_filter: str, search: str) -> None:
+        normalized_search = search.strip().casefold()
+        if (
+            state_filter == self._state_filter
+            and due_filter == self._due_filter
+            and normalized_search == self._search
+        ):
+            return
+        self.beginResetModel()
+        self._state_filter = state_filter
+        self._due_filter = due_filter
+        self._search = normalized_search
+        self._rebuild_visible_rows()
+        self.endResetModel()
+
+    def record_at(self, row: int) -> dict[str, Any] | None:
+        if row < 0 or row >= len(self._visible_rows):
+            return None
+        return dict(self._visible_rows[row])
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._visible_rows)
+
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self.HEADERS)
+
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> object:
+        if not index.isValid() or index.row() >= len(self._visible_rows):
+            return None
+        record = self._visible_rows[index.row()]
+        if role == Qt.ItemDataRole.UserRole:
+            return int(record["w_id"])
+        if role == Qt.ItemDataRole.ToolTipRole:
+            note = str(record.get("note") or "").strip()
+            return note or "无备注"
+        if role != Qt.ItemDataRole.DisplayRole:
+            return None
+        captured = str(record.get("captured_nickname") or "")
+        reasons = "、".join(
+            WATCHLIST_REASON_LABELS.get(str(reason), str(reason))
+            for reason in record.get("reasons", ())
+        )
+        promoted = record.get("promoted_a_number")
+        values = (
+            f"W{record['w_id']}",
+            str(record.get("display_name") or "（未命名）"),
+            captured or "（空白已确认）",
+            str(record.get("douyin_id") or "—"),
+            _watchlist_state_label(record),
+            (
+                f"{_watchlist_due_label(record)} · {_watchlist_date_label(record.get('next_review_at'))}"
+                if record.get("state") == "watching"
+                else _watchlist_due_label(record)
+            ),
+            reasons or "—",
+            str(len(record.get("review_history", ()))),
+            f"A{promoted}" if promoted is not None else "—",
+        )
+        return values[index.column()]
+
+    def headerData(
+        self,
+        section: int,
+        orientation: Qt.Orientation,
+        role: int = Qt.ItemDataRole.DisplayRole,
+    ) -> object:
+        if role == Qt.ItemDataRole.DisplayRole and orientation == Qt.Orientation.Horizontal:
+            return self.HEADERS[section]
+        return super().headerData(section, orientation, role)
+
+    def _rebuild_visible_rows(self) -> None:
+        self._visible_rows = tuple(record for record in self._rows if self._matches(record))
+
+    def _matches(self, record: dict[str, Any]) -> bool:
+        state = str(record.get("state"))
+        if self._state_filter != "all" and state != self._state_filter:
+            return False
+        if self._due_filter != "all":
+            due_label = _watchlist_due_label(record)
+            if self._due_filter == "due" and due_label != "已到期":
+                return False
+            if self._due_filter == "upcoming" and due_label != "待复查":
+                return False
+        if not self._search:
+            return True
+        haystack = " ".join(
+            (
+                str(record.get("w_id", "")),
+                str(record.get("display_name", "")),
+                str(record.get("captured_nickname", "")),
+                str(record.get("douyin_id", "")),
+                str(record.get("note", "")),
+                " ".join(str(item) for item in record.get("reasons", ())),
+            )
+        ).casefold()
+        return self._search in haystack
+
+
+class WatchlistReviewDialog(QDialog):
+    """Small editor for the review fields; the immutable captured identity is absent."""
+
+    REASONS = tuple(WATCHLIST_REASON_LABELS.items())
+
+    def __init__(self, record: dict[str, Any], *, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"复查观察记录 W{record['w_id']}")
+        self.setModal(True)
+        self._result: tuple[list[str], str, str] | None = None
+        root = QVBoxLayout(self)
+
+        identity = QLabel(
+            f"{record.get('display_name') or '（未命名）'} · "
+            f"{record.get('captured_nickname') or '（空白已确认）'} · "
+            f"{record.get('douyin_id') or '—'}"
+        )
+        identity.setWordWrap(True)
+        root.addWidget(identity)
+
+        reasons_box = QGroupBox("观察原因")
+        reasons_layout = QGridLayout(reasons_box)
+        self.reason_checks: dict[str, QCheckBox] = {}
+        current_reasons = set(record.get("reasons", ()))
+        for index, (value, label) in enumerate(self.REASONS):
+            checkbox = QCheckBox(label)
+            checkbox.setChecked(value in current_reasons)
+            self.reason_checks[value] = checkbox
+            reasons_layout.addWidget(checkbox, index // 3, index % 3)
+        root.addWidget(reasons_box)
+
+        form = QFormLayout()
+        self.note_edit = QTextEdit()
+        self.note_edit.setPlainText(str(record.get("note") or ""))
+        self.note_edit.setMinimumHeight(90)
+        form.addRow("备注", self.note_edit)
+        default_review = record.get("next_review_at")
+        if not isinstance(default_review, str) or not default_review:
+            default_review = (
+                datetime.now(timezone.utc) + timedelta(days=7)
+            ).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.next_review_edit = QLineEdit(default_review)
+        self.next_review_edit.setPlaceholderText("UTC，例如 2026-09-20T00:00:00Z")
+        form.addRow("下次复查（UTC）", self.next_review_edit)
+        root.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+        self.resize(560, 420)
+
+    @property
+    def result(self) -> tuple[list[str], str, str] | None:
+        return self._result
+
+    def _accept(self) -> None:
+        reasons = [value for value, checkbox in self.reason_checks.items() if checkbox.isChecked()]
+        note = self.note_edit.toPlainText()
+        next_review_at = self.next_review_edit.text().strip()
+        if not reasons:
+            QMessageBox.warning(self, "缺少观察原因", "至少选择一个观察原因。")
+            return
+        if "other" in reasons and not note.strip():
+            QMessageBox.warning(self, "需要备注", "选择“其他”时必须填写备注。")
+            return
+        try:
+            parse_utc(next_review_at)
+        except Exception:
+            QMessageBox.warning(self, "时间格式无效", "下次复查时间必须是 UTC RFC3339 格式。")
+            return
+        self._result = (reasons, note, next_review_at)
+        self.accept()
+
+
 class DashboardAccountTableModel(QAbstractTableModel):
     HEADERS = ("账号", "主状态", "异常附加", "证据来源")
 
@@ -963,6 +1206,10 @@ class MainWindow(QMainWindow):
         self._account_audit_refresh_after_apply = False
         self._profile_open_task_id: str | None = None
         self._homepage_buttons: list[QPushButton] = []
+        self._watchlist_snapshot: WatchlistSnapshot | None = None
+        self._watchlist_refresh_task_id: str | None = None
+        self._watchlist_promotion_preview: PromotionPreview | None = None
+        self._watchlist_promotion_task_id: str | None = None
         self._queue_start_waiting_for_log_stats = False
         self._log_stats_auto_enabled = self._read_log_stats_auto_enabled()
         self._collector_stop_task_id: str | None = None
@@ -1142,6 +1389,7 @@ class MainWindow(QMainWindow):
             self.account_audit_clear_button.setEnabled(decision_ready)
             for button in self.account_audit_decision_buttons:
                 button.setEnabled(decision_ready)
+        self._update_watchlist_button_states()
         self._update_profile_button_states()
 
     def _selected_result_a_number(self) -> int | None:
@@ -1499,6 +1747,8 @@ class MainWindow(QMainWindow):
         self.refresh_tasks()
         if hasattr(self, "result_table"):
             self.refresh_results()
+        if hasattr(self, "watchlist_page"):
+            self.refresh_watchlist()
 
     def _refresh_results_if_startup_applied(self) -> None:
         if self.isVisible() and self.controller.startup_state is StartupState.READY:
@@ -1650,6 +1900,9 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._batch_tab(), "批次生成")
         tabs.addTab(self._queue_tab(), "下载队列")
         tabs.addTab(self._collector_tab(), "账号采集")
+        self.watchlist_page = self._watchlist_tab()
+        tabs.addTab(self.watchlist_page, "观察名单")
+        self.watchlist_tab_index = tabs.indexOf(self.watchlist_page)
         tabs.addTab(self._post_tab(), "截图与索引")
         tabs.addTab(self._settings_tab(), "路径与安全设置")
         self.result_page = self._result_tab()
@@ -1690,6 +1943,570 @@ class MainWindow(QMainWindow):
             and self.controller.startup_state is StartupState.READY
         ):
             self.refresh_result_dashboard()
+        if (
+            index == getattr(self, "watchlist_tab_index", -1)
+            and self.controller.startup_state is StartupState.READY
+        ):
+            self.refresh_watchlist()
+
+    def _apply_watchlist_filters(self) -> None:
+        if not hasattr(self, "watchlist_model"):
+            return
+        self.watchlist_model.set_filters(
+            str(self.watchlist_state_filter.currentData() or "all"),
+            str(self.watchlist_due_filter.currentData() or "all"),
+            self.watchlist_search_edit.text(),
+        )
+        self._watchlist_selection_changed()
+
+    def _selected_watchlist_record(self) -> dict[str, Any] | None:
+        table = getattr(self, "watchlist_table", None)
+        model = getattr(self, "watchlist_model", None)
+        if table is None or model is None or table.selectionModel() is None:
+            return None
+        rows = table.selectionModel().selectedRows()
+        if len(rows) != 1:
+            return None
+        return model.record_at(rows[0].row())
+
+    def _watchlist_selection_changed(self) -> None:
+        record = self._selected_watchlist_record()
+        preview = getattr(self, "_watchlist_promotion_preview", None)
+        if (
+            preview is not None
+            and (
+                record is None
+                or int(record.get("w_id", -1)) != preview.w_id
+                or self._watchlist_snapshot is None
+                or self._watchlist_snapshot.revision != preview.revision
+            )
+        ):
+            self._watchlist_promotion_preview = None
+        self._update_watchlist_button_states()
+
+    def _watchlist_task_is_active(self) -> bool:
+        active_keys = {
+            "watchlist_snapshot",
+            "watchlist_profile_url",
+            "watchlist_review",
+            "watchlist_promotion_preview",
+            "watchlist_promotion",
+            "watchlist_promotion_retry",
+            "watchlist_promotion_write",
+            "watchlist_archive",
+            "watchlist_restore",
+            "watchlist_delete",
+        }
+        return any(
+            binding.generation_key in active_keys
+            for binding in getattr(self, "_background_bindings", {}).values()
+        )
+
+    def _update_watchlist_button_states(self) -> None:
+        buttons = tuple(
+            getattr(self, name, None)
+            for name in (
+                "watchlist_open_button",
+                "watchlist_review_button",
+                "watchlist_preview_button",
+                "watchlist_confirm_button",
+                "watchlist_retry_button",
+                "watchlist_archive_button",
+                "watchlist_restore_button",
+                "watchlist_delete_button",
+            )
+        )
+        buttons = tuple(button for button in buttons if button is not None)
+        if not buttons:
+            return
+        for button in buttons:
+            button.setEnabled(False)
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        if self._watchlist_task_is_active():
+            return
+        record = self._selected_watchlist_record()
+        if record is None:
+            return
+        state = str(record.get("state"))
+        if state == "watching":
+            self.watchlist_open_button.setEnabled(True)
+            self.watchlist_review_button.setEnabled(True)
+            self.watchlist_preview_button.setEnabled(True)
+            self.watchlist_archive_button.setEnabled(True)
+            recovery = record.get("promotion_recovery")
+            preview = getattr(self, "_watchlist_promotion_preview", None)
+            if (
+                isinstance(recovery, dict)
+                and isinstance(preview, PromotionPreview)
+                and preview.w_id == int(record["w_id"])
+                and preview.formal_status == "retry_required"
+            ):
+                self.watchlist_retry_button.setEnabled(True)
+            elif (
+                isinstance(preview, PromotionPreview)
+                and preview.w_id == int(record["w_id"])
+                and preview.formal_status in {"available", "formal_exists", "recovery_ready"}
+            ):
+                self.watchlist_confirm_button.setEnabled(True)
+        elif state == "archived":
+            self.watchlist_open_button.setEnabled(True)
+            self.watchlist_restore_button.setEnabled(True)
+            self.watchlist_delete_button.setEnabled(True)
+        elif state == "promoted":
+            self.watchlist_open_button.setEnabled(True)
+
+    def refresh_watchlist(self) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        spec = TaskSpec(
+            task_type="watchlist_snapshot",
+            display_name="刷新观察名单",
+            resource_keys=frozenset({"watchlist"}),
+            deduplicate_key="watchlist_snapshot",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            dynamic_cancellation=True,
+        )
+        task_id = self._submit_coalesced_background(
+            spec,
+            lambda context: self.controller.watchlist_snapshot(context=context),
+            output=self.watchlist_output,
+            buttons=(self.watchlist_refresh_button,),
+            on_success=self._apply_watchlist_snapshot,
+            on_failure=self._watchlist_background_failed,
+            generation_key="watchlist_snapshot",
+        )
+        if task_id is not None:
+            self._watchlist_refresh_task_id = task_id
+
+    def _apply_watchlist_snapshot(self, snapshot: object) -> None:
+        if not isinstance(snapshot, WatchlistSnapshot):
+            self._watchlist_background_failed("观察名单刷新结果无效。")
+            return
+        self._watchlist_snapshot = snapshot
+        self.watchlist_model.set_snapshot(snapshot)
+        self._watchlist_promotion_preview = None
+        self._apply_watchlist_filters()
+        self._replace_info(
+            self.watchlist_output,
+            f"观察名单已刷新：显示 {self.watchlist_model.visible_count} / {self.watchlist_model.total_count} 条。",
+            f"W revision={snapshot.revision}；next_w_id={snapshot.next_w_id}。",
+            "页面未显示完整主页 URL；转正预览与正式写入结果会在此处说明。",
+        )
+        self._update_watchlist_button_states()
+
+    def _watchlist_background_failed(self, payload: object) -> None:
+        if self.controller.startup_state is StartupState.CLOSING:
+            return
+        message = payload.message if isinstance(payload, TaskFailure) else str(payload)
+        self._append_info(self.watchlist_output, f"【失败】{message}")
+        self.statusBar().showMessage("观察名单操作失败")
+        self._update_watchlist_button_states()
+
+    def _open_watchlist_profile(self) -> None:
+        record = self._selected_watchlist_record()
+        if record is None:
+            QMessageBox.information(self, "打开主页", "请先选择一个观察记录。")
+            return
+        w_id = int(record["w_id"])
+        spec = TaskSpec(
+            task_type="watchlist_profile_url",
+            display_name="读取观察账号主页地址",
+            resource_keys=frozenset({"watchlist"}),
+            deduplicate_key="watchlist_profile_url",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            dynamic_cancellation=True,
+        )
+
+        def show_result(url: object) -> None:
+            if not isinstance(url, str):
+                self._watchlist_background_failed("观察记录主页地址结果无效。")
+                return
+            try:
+                admitted_url = strict_admit_url(url)
+            except (ProfileUrlError, TypeError):
+                self._watchlist_background_failed("观察记录主页 URL 无法通过打开安全校验。")
+                return
+            if not QDesktopServices.openUrl(QUrl(admitted_url)):
+                self._watchlist_background_failed("默认浏览器打开观察账号主页失败。")
+                return
+            self._append_info(self.watchlist_output, f"已请求默认浏览器打开 W{w_id} 主页。")
+            self.statusBar().showMessage(f"已请求默认浏览器打开 W{w_id} 主页")
+
+        self._submit_coalesced_background(
+            spec,
+            lambda context: self.controller.watchlist_profile_url(w_id, context=context),
+            output=self.watchlist_output,
+            buttons=(self.watchlist_open_button,),
+            on_success=show_result,
+            on_failure=self._watchlist_background_failed,
+            generation_key="watchlist_profile_url",
+        )
+
+    def _review_watchlist(self) -> None:
+        record = self._selected_watchlist_record()
+        if record is None:
+            QMessageBox.information(self, "复查观察记录", "请先选择一个观察中的记录。")
+            return
+        if record.get("state") != "watching":
+            QMessageBox.information(self, "复查观察记录", "只有观察中的记录可以复查或编辑。")
+            return
+        dialog = WatchlistReviewDialog(record, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted or dialog.result is None:
+            return
+        if self._watchlist_snapshot is None:
+            self.refresh_watchlist()
+            return
+        reasons, note, next_review_at = dialog.result
+        w_id = int(record["w_id"])
+        revision = self._watchlist_snapshot.revision
+        spec = TaskSpec(
+            task_type="watchlist_review",
+            display_name="保存观察复查",
+            resource_keys=frozenset({"watchlist"}),
+            deduplicate_key="watchlist_review",
+            cancellable=False,
+            close_policy=ClosePolicy.WAIT,
+        )
+        self._submit_background(
+            spec,
+            lambda _token: self.controller.review_watchlist(
+                w_id,
+                expected_revision=revision,
+                reasons=reasons,
+                note=note,
+                next_review_at=next_review_at,
+            ),
+            output=self.watchlist_output,
+            buttons=(self.watchlist_review_button,),
+            on_success=self._watchlist_mutation_succeeded,
+            on_failure=self._watchlist_background_failed,
+        )
+
+    def _preview_watchlist_promotion(self) -> None:
+        record = self._selected_watchlist_record()
+        if record is None or record.get("state") != "watching":
+            QMessageBox.information(self, "预览转正", "请先选择一个观察中的记录。")
+            return
+        if self._watchlist_snapshot is None:
+            self.refresh_watchlist()
+            return
+        w_id = int(record["w_id"])
+        revision = self._watchlist_snapshot.revision
+        spec = TaskSpec(
+            task_type="watchlist_promotion_preview",
+            display_name="预览观察账号转正",
+            resource_keys=frozenset({"watchlist", "settings", "volume", "collector_data"}),
+            deduplicate_key="watchlist_promotion_preview",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            dynamic_cancellation=True,
+        )
+        self._submit_coalesced_background(
+            spec,
+            lambda context: self.controller.preview_watchlist_promotion(
+                w_id,
+                expected_revision=revision,
+                context=context,
+            ),
+            output=self.watchlist_output,
+            buttons=(self.watchlist_preview_button,),
+            on_success=self._apply_watchlist_promotion_preview,
+            on_failure=self._watchlist_background_failed,
+            generation_key="watchlist_promotion_preview",
+        )
+
+    def _apply_watchlist_promotion_preview(self, preview: object) -> None:
+        if not isinstance(preview, PromotionPreview):
+            self._watchlist_background_failed("转正预览结果无效。")
+            return
+        self._watchlist_promotion_preview = preview
+        if preview.formal_status in {"available", "formal_exists", "recovery_ready"}:
+            if preview.formal_status == "available":
+                target = f"预览目标：A{preview.next_a_number}；mark 将使用已采集身份。"
+            else:
+                target = f"正式目标已存在：A{preview.existing_a_number}；确认后只完成 W 恢复。"
+            self._replace_info(
+                self.watchlist_output,
+                f"W{preview.w_id} 转正预览通过。",
+                target,
+                f"captured_nickname：{preview.captured_nickname or '（空白已确认）'}；抖音号：{preview.douyin_id}。",
+                "未显示完整主页 URL；确认后必须先完成正式 JSON＋Excel 写入并复读，再将 W 标为已转正。",
+            )
+        elif preview.formal_status == "retry_required":
+            self._replace_info(
+                self.watchlist_output,
+                f"W{preview.w_id} 存在未完成转正意图。",
+                "只读联合检查未发现正式目标；不会自动重试。",
+                "请确认正式 JSON 与 Excel 均未出现目标后，点击“明确重试转正”。",
+            )
+        else:
+            self._replace_info(
+                self.watchlist_output,
+                f"W{preview.w_id} 转正预览状态：{preview.formal_status}。",
+                f"消息代码：{preview.message_code}。",
+            )
+        self._update_watchlist_button_states()
+
+    def _confirm_watchlist_promotion(self) -> None:
+        record = self._selected_watchlist_record()
+        preview = self._watchlist_promotion_preview
+        if (
+            record is None
+            or not isinstance(preview, PromotionPreview)
+            or self._watchlist_snapshot is None
+            or preview.w_id != int(record["w_id"])
+            or preview.revision != self._watchlist_snapshot.revision
+            or preview.formal_status not in {"available", "formal_exists", "recovery_ready"}
+        ):
+            QMessageBox.information(self, "确认转正", "请先刷新并完成当前记录的转正预览。")
+            return
+        answer = QMessageBox.question(
+            self,
+            "确认观察账号转正",
+            f"将把 W{preview.w_id} 转为正式账号。\n"
+            "正式 settings_master.json 与录制名单.xlsx 必须一起写入并复读成功，"
+            "之后才会更新观察状态。\n\n仍要继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._submit_watchlist_promotion(
+            w_id=preview.w_id,
+            revision=preview.revision,
+            retry_attempt_id=None,
+        )
+
+    def _retry_watchlist_promotion(self) -> None:
+        record = self._selected_watchlist_record()
+        preview = self._watchlist_promotion_preview
+        if (
+            record is None
+            or not isinstance(preview, PromotionPreview)
+            or self._watchlist_snapshot is None
+            or preview.w_id != int(record["w_id"])
+            or preview.revision != self._watchlist_snapshot.revision
+            or preview.formal_status != "retry_required"
+            or not isinstance(record.get("promotion_recovery"), dict)
+        ):
+            QMessageBox.information(self, "明确重试转正", "请先刷新并确认当前记录处于可明确重试状态。")
+            return
+        answer = QMessageBox.question(
+            self,
+            "明确重试观察账号转正",
+            f"只在你已确认正式 JSON 与 Excel 均未出现 W{preview.w_id} 目标时继续。\n"
+            "本操作会重新执行一次正式双文件事务，不会自动循环重试。\n\n仍要继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._submit_watchlist_promotion(
+            w_id=preview.w_id,
+            revision=preview.revision,
+            retry_attempt_id=str(record["promotion_recovery"]["attempt_id"]),
+        )
+
+    def _submit_watchlist_promotion(
+        self,
+        *,
+        w_id: int,
+        revision: int,
+        retry_attempt_id: str | None,
+    ) -> None:
+        retrying = retry_attempt_id is not None
+        spec = TaskSpec(
+            task_type="watchlist_promotion_retry" if retrying else "watchlist_promotion",
+            display_name="明确重试观察账号转正" if retrying else "确认观察账号转正",
+            resource_keys=frozenset(
+                {"startup_safety", "watchlist", "settings", "volume", "collector_data"}
+            ),
+            deduplicate_key="watchlist_promotion_write",
+            cancellable=False,
+            close_policy=ClosePolicy.WAIT,
+            critical_write_started=True,
+        )
+        if retrying:
+            action = lambda _token: self.controller.retry_watchlist_promotion(
+                w_id,
+                expected_revision=revision,
+                attempt_id=str(retry_attempt_id),
+            )
+        else:
+            action = lambda _token: self.controller.promote_watchlist(
+                w_id,
+                expected_revision=revision,
+            )
+        self._submit_background(
+            spec,
+            action,
+            output=self.watchlist_output,
+            buttons=(self.watchlist_confirm_button, self.watchlist_retry_button),
+            on_success=self._watchlist_promotion_succeeded,
+            on_failure=self._watchlist_promotion_failed,
+        )
+
+    def _watchlist_promotion_succeeded(self, result: object) -> None:
+        if not isinstance(result, PromotionResult):
+            self._watchlist_background_failed("转正结果无效。")
+            return
+        self._watchlist_promotion_preview = None
+        self._replace_info(
+            self.watchlist_output,
+            f"W{result.w_id} 已完成转正：A{result.a_number}。",
+            "正式 JSON＋Excel 已完成事务写入并通过复读；观察记录已更新为 promoted。",
+            "正在刷新观察名单显示。",
+        )
+        self.statusBar().showMessage(f"W{result.w_id} 已转正为 A{result.a_number}")
+        self.refresh_watchlist()
+
+    def _watchlist_promotion_failed(self, payload: object) -> None:
+        self._watchlist_promotion_preview = None
+        self._watchlist_background_failed(payload)
+        if self.controller.startup_state is StartupState.READY:
+            self.refresh_watchlist()
+
+    def _watchlist_mutation_succeeded(self, snapshot: object) -> None:
+        if not isinstance(snapshot, WatchlistSnapshot):
+            self._watchlist_background_failed("观察名单写入结果无效。")
+            return
+        self._watchlist_snapshot = snapshot
+        self.watchlist_model.set_snapshot(snapshot)
+        self._watchlist_promotion_preview = None
+        self._apply_watchlist_filters()
+        self._replace_info(
+            self.watchlist_output,
+            f"观察名单写入完成；当前 revision={snapshot.revision}。",
+            f"当前记录数：{self.watchlist_model.total_count}。",
+        )
+        self._update_watchlist_button_states()
+
+    def _archive_watchlist(self) -> None:
+        record = self._selected_watchlist_record()
+        if record is None or record.get("state") != "watching":
+            QMessageBox.information(self, "归档观察账号", "请先选择一个观察中的记录。")
+            return
+        if self._watchlist_snapshot is None:
+            self.refresh_watchlist()
+            return
+        w_id = int(record["w_id"])
+        answer = QMessageBox.question(
+            self,
+            "归档观察账号",
+            f"将归档 W{w_id}，保留其高水位与历史记录。仍要继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        revision = self._watchlist_snapshot.revision
+        spec = TaskSpec(
+            task_type="watchlist_archive",
+            display_name="归档观察账号",
+            resource_keys=frozenset({"watchlist"}),
+            deduplicate_key="watchlist_archive",
+            cancellable=False,
+            close_policy=ClosePolicy.WAIT,
+        )
+        self._submit_background(
+            spec,
+            lambda _token: self.controller.archive_watchlist(
+                w_id, expected_revision=revision
+            ),
+            output=self.watchlist_output,
+            buttons=(self.watchlist_archive_button,),
+            on_success=self._watchlist_mutation_succeeded,
+            on_failure=self._watchlist_background_failed,
+        )
+
+    def _restore_watchlist(self) -> None:
+        record = self._selected_watchlist_record()
+        if record is None or record.get("state") != "archived":
+            QMessageBox.information(self, "恢复观察账号", "请先选择一个已归档的记录。")
+            return
+        if self._watchlist_snapshot is None:
+            self.refresh_watchlist()
+            return
+        default_review = (
+            datetime.now(timezone.utc) + timedelta(days=7)
+        ).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+        next_review_at, accepted = QInputDialog.getText(
+            self,
+            "恢复观察账号",
+            "下一次复查时间（UTC RFC3339）",
+            QLineEdit.EchoMode.Normal,
+            default_review,
+        )
+        if not accepted:
+            return
+        try:
+            parse_utc(next_review_at.strip())
+        except Exception:
+            QMessageBox.warning(self, "时间格式无效", "下一次复查时间必须是 UTC RFC3339 格式。")
+            return
+        w_id = int(record["w_id"])
+        revision = self._watchlist_snapshot.revision
+        spec = TaskSpec(
+            task_type="watchlist_restore",
+            display_name="恢复观察账号",
+            resource_keys=frozenset({"watchlist"}),
+            deduplicate_key="watchlist_restore",
+            cancellable=False,
+            close_policy=ClosePolicy.WAIT,
+        )
+        self._submit_background(
+            spec,
+            lambda _token: self.controller.restore_watchlist(
+                w_id,
+                expected_revision=revision,
+                next_review_at=next_review_at.strip(),
+            ),
+            output=self.watchlist_output,
+            buttons=(self.watchlist_restore_button,),
+            on_success=self._watchlist_mutation_succeeded,
+            on_failure=self._watchlist_background_failed,
+        )
+
+    def _delete_archived_watchlist(self) -> None:
+        record = self._selected_watchlist_record()
+        if record is None or record.get("state") != "archived":
+            QMessageBox.information(self, "永久删除观察账号", "请先选择一个已归档的记录。")
+            return
+        if self._watchlist_snapshot is None:
+            self.refresh_watchlist()
+            return
+        w_id = int(record["w_id"])
+        answer = QMessageBox.question(
+            self,
+            "永久删除归档观察账号",
+            f"将永久删除已归档的 W{w_id}。高水位不会回退，且此操作不可撤销。\n\n仍要继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        revision = self._watchlist_snapshot.revision
+        spec = TaskSpec(
+            task_type="watchlist_delete",
+            display_name="永久删除归档观察账号",
+            resource_keys=frozenset({"watchlist"}),
+            deduplicate_key="watchlist_delete",
+            cancellable=False,
+            close_policy=ClosePolicy.WAIT,
+        )
+        self._submit_background(
+            spec,
+            lambda _token: self.controller.delete_archived_watchlist(
+                w_id, expected_revision=revision
+            ),
+            output=self.watchlist_output,
+            buttons=(self.watchlist_delete_button,),
+            on_success=self._watchlist_mutation_succeeded,
+            on_failure=self._watchlist_background_failed,
+        )
 
     def _overview_tab(self) -> QWidget:
         page = QWidget()
@@ -2289,6 +3106,126 @@ class MainWindow(QMainWindow):
         self.collector_output = QTextEdit()
         self.collector_output.setReadOnly(True)
         layout.addWidget(self.collector_output, 1)
+        return page
+
+    def _watchlist_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        intro = QLabel(
+            "观察名单保存需要后续复查的合成账号意图。页面不显示完整主页 URL；"
+            "主页打开、复查、归档和 W→A 转正都经过当前管理器安全闸门。"
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        filters = QWidget(page)
+        filter_layout = QHBoxLayout(filters)
+        filter_layout.setContentsMargins(0, 0, 0, 0)
+        filter_layout.addWidget(QLabel("状态"))
+        self.watchlist_state_filter = QComboBox()
+        for label, value in (
+            ("全部", "all"),
+            ("观察中", "watching"),
+            ("已转正", "promoted"),
+            ("已归档", "archived"),
+        ):
+            self.watchlist_state_filter.addItem(label, value)
+        self._mark_safe_widget(self.watchlist_state_filter)
+        filter_layout.addWidget(self.watchlist_state_filter)
+        filter_layout.addWidget(QLabel("复查"))
+        self.watchlist_due_filter = QComboBox()
+        for label, value in (
+            ("全部", "all"),
+            ("已到期", "due"),
+            ("待复查", "upcoming"),
+        ):
+            self.watchlist_due_filter.addItem(label, value)
+        self._mark_safe_widget(self.watchlist_due_filter)
+        filter_layout.addWidget(self.watchlist_due_filter)
+        self.watchlist_search_edit = QLineEdit()
+        self.watchlist_search_edit.setPlaceholderText("搜索 W 编号、名称、采集昵称、抖音号、备注或原因")
+        self._mark_safe_widget(self.watchlist_search_edit)
+        filter_layout.addWidget(self.watchlist_search_edit, 1)
+        self.watchlist_refresh_button = self._mark_safe_widget(QPushButton("刷新观察名单"))
+        self.watchlist_refresh_button.clicked.connect(self.refresh_watchlist)
+        filter_layout.addWidget(self.watchlist_refresh_button)
+        layout.addWidget(filters)
+
+        self.watchlist_model = WatchlistTableModel(self)
+        self.watchlist_table = QTableView()
+        self.watchlist_table.setObjectName("watchlistTable")
+        self.watchlist_table.setModel(self.watchlist_model)
+        self.watchlist_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.watchlist_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.watchlist_table.setAlternatingRowColors(True)
+        self.watchlist_table.setSortingEnabled(False)
+        self.watchlist_table.verticalHeader().setVisible(False)
+        self.watchlist_table.horizontalHeader().setStretchLastSection(True)
+        self.watchlist_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.watchlist_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
+        )
+        self.watchlist_table.horizontalHeader().setSectionResizeMode(
+            6, QHeaderView.ResizeMode.Stretch
+        )
+        self.watchlist_table.selectionModel().selectionChanged.connect(
+            lambda *_args: self._watchlist_selection_changed()
+        )
+        layout.addWidget(self.watchlist_table, 1)
+
+        actions = QWidget(page)
+        actions_layout = QHBoxLayout(actions)
+        actions_layout.setContentsMargins(0, 0, 0, 0)
+        self.watchlist_open_button = QPushButton("打开主页")
+        self.watchlist_open_button.clicked.connect(self._open_watchlist_profile)
+        self.watchlist_review_button = QPushButton("复查/编辑")
+        self.watchlist_review_button.clicked.connect(self._review_watchlist)
+        self.watchlist_preview_button = QPushButton("预览转正")
+        self.watchlist_preview_button.clicked.connect(self._preview_watchlist_promotion)
+        self.watchlist_confirm_button = QPushButton("确认转正")
+        self.watchlist_confirm_button.clicked.connect(self._confirm_watchlist_promotion)
+        self.watchlist_retry_button = QPushButton("明确重试转正")
+        self.watchlist_retry_button.clicked.connect(self._retry_watchlist_promotion)
+        self.watchlist_archive_button = QPushButton("归档")
+        self.watchlist_archive_button.clicked.connect(self._archive_watchlist)
+        self.watchlist_restore_button = QPushButton("恢复观察")
+        self.watchlist_restore_button.clicked.connect(self._restore_watchlist)
+        self.watchlist_delete_button = QPushButton("永久删除归档")
+        self.watchlist_delete_button.clicked.connect(self._delete_archived_watchlist)
+        for button in (
+            self.watchlist_open_button,
+            self.watchlist_review_button,
+            self.watchlist_preview_button,
+            self.watchlist_confirm_button,
+            self.watchlist_retry_button,
+            self.watchlist_archive_button,
+            self.watchlist_restore_button,
+            self.watchlist_delete_button,
+        ):
+            actions_layout.addWidget(button)
+        actions_layout.addStretch()
+        layout.addWidget(actions)
+
+        self.watchlist_output = QTextEdit()
+        self.watchlist_output.setReadOnly(True)
+        self.watchlist_output.setPlaceholderText(
+            "刷新、预览与写入结果会显示在这里；不会输出完整主页 URL。"
+        )
+        layout.addWidget(self.watchlist_output, 0)
+
+        self.watchlist_state_filter.currentIndexChanged.connect(
+            lambda _index: self._apply_watchlist_filters()
+        )
+        self.watchlist_due_filter.currentIndexChanged.connect(
+            lambda _index: self._apply_watchlist_filters()
+        )
+        self.watchlist_search_edit.textChanged.connect(
+            lambda _text: self._apply_watchlist_filters()
+        )
+        self._watchlist_selection_changed()
         return page
 
     def _post_tab(self) -> QWidget:
@@ -4151,6 +5088,8 @@ class MainWindow(QMainWindow):
             self.refresh_results()
         if "result_dashboard" in targets and hasattr(self, "dashboard_task_selector"):
             self.refresh_result_dashboard(auto_refresh=True)
+        if "watchlist" in targets and hasattr(self, "watchlist_page"):
+            self.refresh_watchlist()
         if "runtime_status" in targets:
             self._refresh_status()
 

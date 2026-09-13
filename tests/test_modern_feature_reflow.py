@@ -82,6 +82,7 @@ class ModernFeatureReflowTests(unittest.TestCase):
                 "批次生成": window.batch_start,
                 "下载队列": window.task_list,
                 "账号采集": window.collector_output,
+                "观察名单": window.watchlist_table,
                 "截图与索引": window.post_output,
                 "下载结果": window.result_table,
                 "结果看板": window.dashboard_account_table,

@@ -45,6 +45,7 @@ import tempfile
 import threading
 import traceback
 import unicodedata
+from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -131,6 +132,90 @@ CATEGORY_STARTUP_ERROR: "CollectorError | None" = None
 SCREENSHOT_DIR = Path(
     os.environ.get("DOUK_SCREENSHOT_DIR", str(BASE_DIR / "账号页面截图"))
 ).resolve()
+
+# The manager reuses the formal collector transaction in-process.  The vendor
+# worker remains a separate process, so this small runtime scope is sufficient
+# to keep the legacy module-level paths isolated while a manager operation is
+# running.  The HTTP worker never enters this scope and keeps its environment
+# derived defaults unchanged.
+_RUNTIME_CONFIG_LOCK = threading.RLock()
+
+
+@contextmanager
+def configured_runtime(
+    *,
+    base_dir: Path,
+    settings_path: Path,
+    excel_path: Path,
+    global_lock_path: Path,
+    watchlist_path: Path,
+    watchlist_watermark_path: Path,
+    watchlist_control_path: Path,
+    manager_instance_lock_path: Path,
+    screenshot_dir: Path | None = None,
+):
+    """Temporarily bind formal collector paths to an explicit managed home.
+
+    The existing vendor functions intentionally retain their public signatures
+    and transaction implementation.  This scope is the narrow adapter used by
+    the manager's in-process W promotion service; it never changes process or
+    user environment variables and restores every module-level path on exit.
+    """
+
+    names = (
+        "BASE_DIR",
+        "SETTINGS_PATH",
+        "EXCEL_PATH",
+        "TRANSACTION_PATH",
+        "BACKUP_STATE_PATH",
+        "GLOBAL_LOCK_PATH",
+        "WATCHLIST_PATH",
+        "WATCHLIST_WATERMARK_PATH",
+        "WATCHLIST_CONTROL_PATH",
+        "MANAGER_INSTANCE_LOCK_PATH",
+        "SETTINGS_SIMPLE_BACKUP_PATH",
+        "EXCEL_SIMPLE_BACKUP_PATH",
+        "SETTINGS_BACKUP_DIR",
+        "EXCEL_BACKUP_DIR",
+        "CATEGORY_PATHS",
+        "CATEGORY_BACKUP_DIR",
+        "SCREENSHOT_DIR",
+    )
+    values = {
+        "BASE_DIR": Path(base_dir).resolve(),
+        "SETTINGS_PATH": Path(settings_path).resolve(),
+        "EXCEL_PATH": Path(excel_path).resolve(),
+        "GLOBAL_LOCK_PATH": Path(global_lock_path).resolve(),
+        "WATCHLIST_PATH": Path(watchlist_path).resolve(),
+        "WATCHLIST_WATERMARK_PATH": Path(watchlist_watermark_path).resolve(),
+        "WATCHLIST_CONTROL_PATH": Path(watchlist_control_path).resolve(),
+        "MANAGER_INSTANCE_LOCK_PATH": Path(manager_instance_lock_path).resolve(),
+    }
+    values["TRANSACTION_PATH"] = values["BASE_DIR"] / ".douk_collector_transaction.json"
+    values["BACKUP_STATE_PATH"] = values["BASE_DIR"] / ".douk_backup_state.json"
+    values["SETTINGS_SIMPLE_BACKUP_PATH"] = values["SETTINGS_PATH"].with_name(
+        values["SETTINGS_PATH"].name + ".bak"
+    )
+    values["EXCEL_SIMPLE_BACKUP_PATH"] = values["EXCEL_PATH"].with_name(
+        values["EXCEL_PATH"].name + ".bak"
+    )
+    values["SETTINGS_BACKUP_DIR"] = values["BASE_DIR"] / "settings_backups"
+    values["EXCEL_BACKUP_DIR"] = values["BASE_DIR"] / "excel_backups"
+    values["CATEGORY_PATHS"] = {
+        name: values["BASE_DIR"] / f"{name}.txt" for name in CATEGORY_NAMES
+    }
+    values["CATEGORY_BACKUP_DIR"] = values["BASE_DIR"] / "category_backups"
+    values["SCREENSHOT_DIR"] = Path(screenshot_dir).resolve() if screenshot_dir else (
+        values["BASE_DIR"] / "账号页面截图"
+    )
+
+    with _RUNTIME_CONFIG_LOCK:
+        previous = {name: globals()[name] for name in names}
+        try:
+            globals().update(values)
+            yield
+        finally:
+            globals().update(previous)
 # Chrome at 100% UI scale: remove the tab strip while retaining the address bar.
 # After capture, remove the bookmarks bar between the address bar and page, then
 # join those two retained regions. These calibrated values are DPI-scaled at runtime.
@@ -1228,7 +1313,8 @@ def initialize_category_files_after_bind() -> None:
         format_error_for_console(exc)
 
 
-def read_json_document(path: Path = SETTINGS_PATH) -> dict[str, Any]:
+def read_json_document(path: Path | None = None) -> dict[str, Any]:
+    path = SETTINGS_PATH if path is None else Path(path)
     if not path.exists():
         raise CollectorError(
             "SETTINGS_NOT_FOUND",
@@ -1483,7 +1569,8 @@ def hyperlink_target(cell: Any) -> str:
     return text(getattr(link, "target", "") or getattr(link, "location", ""))
 
 
-def load_excel(path: Path = EXCEL_PATH) -> Any:
+def load_excel(path: Path | None = None) -> Any:
+    path = EXCEL_PATH if path is None else Path(path)
     if not path.exists():
         raise CollectorError(
             "EXCEL_NOT_FOUND",

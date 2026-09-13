@@ -315,6 +315,26 @@ def _reflow_collector(page: QWidget, root: QLayout, items: list[QLayoutItem]) ->
     _restore(root, tail)
 
 
+def _reflow_watchlist(page: QWidget, root: QLayout, items: list[QLayoutItem]) -> None:
+    _require(items, 5, "观察名单")
+    intro, filters, table, actions, output, *tail = items
+    root.setAlignment(Qt.AlignmentFlag(0))
+    _mark_banner(intro)
+    _prepare_table(table, minimum_height=420)
+    _prepare_output(
+        output,
+        placeholder="观察名单刷新、复查、转正预览与写入结果会显示在这里。",
+        minimum_height=180,
+    )
+    content = _content_widget(page)
+    _add_item(root, intro)
+    root.addWidget(_card(content, "筛选与刷新", (filters,)))
+    root.addWidget(_card(content, "观察记录", (table,)), 1)
+    root.addWidget(_card(content, "选中记录操作", (actions,)))
+    root.addWidget(_card(content, "操作结果", (output,)))
+    _restore(root, tail)
+
+
 def _reflow_post(page: QWidget, root: QLayout, items: list[QLayoutItem]) -> None:
     _require(items, 3, "截图与索引")
     paths, actions, output, *tail = items
@@ -448,6 +468,7 @@ _REFLOWERS = {
     "批次生成": _reflow_batch,
     "下载队列": _reflow_queue,
     "账号采集": _reflow_collector,
+    "观察名单": _reflow_watchlist,
     "截图与索引": _reflow_post,
     "下载结果": _reflow_results,
     "结果看板": _reflow_dashboard,
