@@ -135,7 +135,7 @@ class CollectorWatchlistHttpTests(unittest.TestCase):
                 for name, value in old_values.items():
                     setattr(collector_server, name, value)
 
-    def test_real_worker_pipe_eof_revokes_observation_but_keeps_health_process_alive(self) -> None:
+    def test_real_worker_pipe_eof_exits_without_further_observation_writes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             paths = make_test_paths(root, account_count=2)
@@ -186,21 +186,18 @@ class CollectorWatchlistHttpTests(unittest.TestCase):
                 # This explicit close simulates the manager process exiting;
                 # production CollectorService never closes its write end
                 # during normal operation.
+                before = {
+                    path: path.read_bytes()
+                    for path in (paths.watchlist, paths.watchlist_control, paths.watchlist_w_watermark)
+                }
                 process.stdin.close()
-                deadline = time.monotonic() + 3
-                while time.monotonic() < deadline:
-                    try:
-                        blocked = post_observe(port, "synthetic-token", self._payload())
-                    except (ConnectionError, OSError):
-                        time.sleep(0.05)
-                        continue
-                    if blocked.get("code") == "MANAGER_SESSION_REQUIRED":
-                        break
-                    time.sleep(0.05)
-                else:
-                    self.fail("worker did not revoke observation after stdin EOF")
-                self.assertEqual(blocked["code"], "MANAGER_SESSION_REQUIRED")
-                self.assertIsNone(process.poll())
+                process.stdin = None
+                output, _ = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 0, output.decode("utf-8", errors="replace"))
+                for path, content in before.items():
+                    self.assertEqual(path.read_bytes(), content)
+                with self.assertRaises((ConnectionError, OSError)):
+                    post_observe(port, "synthetic-token", self._payload())
             finally:
                 try:
                     if process is not None and process.stdin is not None:
