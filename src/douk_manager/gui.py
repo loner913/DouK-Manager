@@ -10,6 +10,7 @@ from typing import Any, Callable, TypeVar
 
 from PySide6.QtCore import (
     QAbstractTableModel,
+    QDate,
     QEvent,
     QMargins,
     QModelIndex,
@@ -31,6 +32,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDateEdit,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -763,7 +765,7 @@ class WatchlistTableModel(QAbstractTableModel):
 
 
 class WatchlistReviewDialog(QDialog):
-    """Small editor for the review fields; the immutable captured identity is absent."""
+    """Review editor with local dates and read-only captured identity."""
 
     REASONS = tuple(WATCHLIST_REASON_LABELS.items())
 
@@ -773,17 +775,25 @@ class WatchlistReviewDialog(QDialog):
         self.setModal(True)
         self._result: tuple[list[str], str, str, str] | None = None
         root = QVBoxLayout(self)
+        root.setContentsMargins(24, 20, 24, 20)
+        root.setSpacing(16)
+        title = QLabel(f"复查记录 · W{record['w_id']}")
+        title.setObjectName("modernSectionTitle")
+        root.addWidget(title)
+        identity = QFormLayout()
+        identity.setVerticalSpacing(8)
+        for label, value in (("采集昵称", record.get("captured_nickname") or "（空白已确认）"),
+                             ("抖音号", record.get("douyin_id") or "—")):
+            text = QLabel(str(value))
+            text.setWordWrap(True)
+            text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            identity.addRow(label, text)
+        root.addLayout(identity)
 
-        identity = QLabel(
-            f"{record.get('display_name') or '（未命名）'} · "
-            f"{record.get('captured_nickname') or '（空白已确认）'} · "
-            f"{record.get('douyin_id') or '—'}"
-        )
-        identity.setWordWrap(True)
-        root.addWidget(identity)
-
-        reasons_box = QGroupBox("观察原因")
+        reasons_box = QWidget()
         reasons_layout = QGridLayout(reasons_box)
+        reasons_layout.setContentsMargins(0, 0, 0, 0)
+        reasons_layout.setVerticalSpacing(12)
         self.reason_checks: dict[str, QCheckBox] = {}
         current_reasons = set(record.get("reasons", ()))
         for index, (value, label) in enumerate(self.REASONS):
@@ -791,24 +801,42 @@ class WatchlistReviewDialog(QDialog):
             checkbox.setChecked(value in current_reasons)
             self.reason_checks[value] = checkbox
             reasons_layout.addWidget(checkbox, index // 3, index % 3)
-        root.addWidget(reasons_box)
-
         form = QFormLayout()
+        form.setVerticalSpacing(12)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self.display_name_edit = QLineEdit(str(record.get("display_name") or ""))
         self.display_name_edit.setMaxLength(256)
         form.addRow("观察名称", self.display_name_edit)
+        form.addRow("观察原因", reasons_box)
         self.note_edit = QTextEdit()
         self.note_edit.setPlainText(str(record.get("note") or ""))
-        self.note_edit.setMinimumHeight(90)
+        self.note_edit.setFixedHeight(112)
         form.addRow("备注", self.note_edit)
         default_review = record.get("next_review_at")
         if not isinstance(default_review, str) or not default_review:
             default_review = (
                 datetime.now(timezone.utc) + timedelta(days=7)
             ).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
-        self.next_review_edit = QLineEdit(default_review)
-        self.next_review_edit.setPlaceholderText("UTC，例如 2026-09-20T00:00:00Z")
-        form.addRow("下次复查（UTC）", self.next_review_edit)
+        self._original_review = default_review
+        self.review_mode = QComboBox()
+        for label, value in (("保留原提醒", "keep"), ("7天后", 7), ("30天后", 30),
+                             ("90天后", 90), ("自定义日期", "custom")):
+            self.review_mode.addItem(label, value)
+        self.review_date = QDateEdit()
+        self.review_date.setDisplayFormat("yyyy-MM-dd")
+        self.review_date.setCalendarPopup(True)
+        local_review = parse_utc(default_review).astimezone()
+        self.review_date.setDate(QDate(local_review.year, local_review.month, local_review.day))
+        self.review_date.setEnabled(False)
+        reminder_row = QHBoxLayout()
+        reminder_row.addWidget(self.review_mode)
+        reminder_row.addWidget(self.review_date, 1)
+        form.addRow("下次复查", reminder_row)
+        self.review_time_label = QLabel(local_review.strftime("本地时间 %Y-%m-%d %H:%M"))
+        self.review_time_label.setWordWrap(True)
+        form.addRow("", self.review_time_label)
+        self.review_mode.currentIndexChanged.connect(self._review_mode_changed)
+        self.review_date.dateChanged.connect(self._review_date_changed)
         root.addLayout(form)
 
         buttons = QDialogButtonBox(
@@ -816,8 +844,57 @@ class WatchlistReviewDialog(QDialog):
         )
         buttons.accepted.connect(self._accept)
         buttons.rejected.connect(self.reject)
+        self.save_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.cancel_button = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        self.save_button.setText("保存复查")
+        self.cancel_button.setText("取消")
         root.addWidget(buttons)
-        self.resize(560, 420)
+        from douk_manager.ui.pages.legacy_page import mark_legacy_descendants
+        self.setProperty("legacyRoot", True)
+        self.setProperty("modernUi", True)
+        mark_legacy_descendants(self)
+        self.save_button.setProperty("legacyRole", "primary")
+        self.cancel_button.setProperty("legacyRole", "secondary")
+        from douk_manager.ui.theme.theme_manager import ThemeManager
+        self._review_theme = getattr(parent, "_modern_theme", None) or ThemeManager(parent=self)
+        self._review_theme.theme_changed.connect(self._apply_review_theme)
+        self._apply_review_theme()
+        self.resize(620, 530)
+
+    def _apply_review_theme(self, *_args) -> None:
+        p = self._review_theme.palette
+        self.setObjectName("watchlistReviewDialog")
+        self.setStyleSheet(self._review_theme.stylesheet() + f"""
+QDialog#watchlistReviewDialog {{ background: {p.surface}; color: {p.text_primary}; }}
+QDialog#watchlistReviewDialog QLabel {{ color: {p.text_primary}; font-size: 13px; }}
+QDialog#watchlistReviewDialog QLabel#modernSectionTitle {{ font-size: 18px; font-weight: 700; }}
+QDialog#watchlistReviewDialog QCheckBox {{ color: {p.text_primary}; spacing: 6px; }}
+QDialog#watchlistReviewDialog QCalendarWidget QWidget {{ background: {p.surface}; color: {p.text_primary}; }}
+""")
+
+    def _review_mode_changed(self) -> None:
+        mode = self.review_mode.currentData()
+        self.review_date.setEnabled(mode == "custom")
+        if mode == "keep":
+            local = parse_utc(self._original_review).astimezone()
+            self.review_date.setDate(QDate(local.year, local.month, local.day))
+        elif isinstance(mode, int):
+            self.review_date.setDate(QDate.currentDate().addDays(mode))
+        self._review_date_changed()
+
+    def _review_date_changed(self) -> None:
+        if self.review_mode.currentData() == "keep":
+            local = parse_utc(self._original_review).astimezone()
+            self.review_time_label.setText(local.strftime("本地时间 %Y-%m-%d %H:%M"))
+        else:
+            self.review_time_label.setText(f"本地时间 {self.review_date.date().toString('yyyy-MM-dd')} 09:00")
+
+    def _selected_review_time(self) -> str:
+        if self.review_mode.currentData() == "keep":
+            return self._original_review
+        day = self.review_date.date()
+        local = datetime(day.year(), day.month(), day.day(), 9)
+        return local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     @property
     def result(self) -> tuple[list[str], str, str, str] | None:
@@ -826,7 +903,7 @@ class WatchlistReviewDialog(QDialog):
     def _accept(self) -> None:
         reasons = [value for value, checkbox in self.reason_checks.items() if checkbox.isChecked()]
         note = self.note_edit.toPlainText()
-        next_review_at = self.next_review_edit.text().strip()
+        next_review_at = self._selected_review_time()
         if not reasons:
             QMessageBox.warning(self, "缺少观察原因", "至少选择一个观察原因。")
             return
@@ -834,7 +911,10 @@ class WatchlistReviewDialog(QDialog):
             QMessageBox.warning(self, "需要备注", "选择“其他”时必须填写备注。")
             return
         try:
-            parse_utc(next_review_at)
+            selected_time = parse_utc(next_review_at)
+            if self.review_mode.currentData() != "keep" and selected_time <= datetime.now(timezone.utc):
+                QMessageBox.warning(self, "提醒日期已过", "请选择尚未到达的本地日期，提醒时间为当天09:00。")
+                return
         except Exception:
             QMessageBox.warning(self, "时间格式无效", "下次复查时间必须是 UTC RFC3339 格式。")
             return
