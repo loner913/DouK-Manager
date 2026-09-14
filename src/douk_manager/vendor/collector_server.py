@@ -281,6 +281,21 @@ def _session_line(stream: Any) -> str:
     return str(value).strip()
 
 
+class _ManagerSessionEnded(Exception):
+    """Stop accepting requests after the owning manager has gone away."""
+
+
+class CollectorHTTPServer(ThreadingHTTPServer):
+    # server_close must wait for accepted requests, including paired writes.
+    daemon_threads = False
+    block_on_close = True
+    manager_bound = False
+
+    def service_actions(self) -> None:
+        if self.manager_bound and not manager_session_active():
+            raise _ManagerSessionEnded
+
+
 def _revoke_manager_session_on_eof(stream: Any) -> None:
     global MANAGER_SESSION_ACTIVE
     try:
@@ -2925,15 +2940,16 @@ def main() -> int:
     if args.check:
         return 0
 
-    if not configure_manager_session_channel() and os.environ.get(
-        "DOUK_MANAGER_SESSION_CHANNEL"
-    ) == "1":
+    manager_bound = os.environ.get("DOUK_MANAGER_SESSION_CHANNEL") == "1"
+    if not configure_manager_session_channel() and manager_bound:
         safe_console_print(
-            "[SESSION] 管理器会话通道未建立；观察写入保持禁用，正式采集入口仍可用。"
+            "[SESSION] 管理器会话通道未建立；采集子进程退出。"
         )
+        return 4
 
     try:
-        server = ThreadingHTTPServer((HOST, PORT), Handler)
+        server = CollectorHTTPServer((HOST, PORT), Handler)
+        server.manager_bound = manager_bound
     except OSError as exc:
         print(f"[ERROR] Cannot listen on http://{HOST}:{PORT} - {exc}")
         return 3
@@ -2947,6 +2963,8 @@ def main() -> int:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:
         print("\n[STOPPED]")
+    except _ManagerSessionEnded:
+        safe_console_print("[SESSION] 管理器会话已结束；等待已接收请求完成后退出。")
     finally:
         server.server_close()
     return 0
