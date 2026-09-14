@@ -14,6 +14,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QBoxLayout,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLayout,
@@ -372,25 +373,29 @@ def _reflow_settings(page: QWidget, root: QLayout, items: list[QLayoutItem]) -> 
     content = _content_widget(page)
     _add_item(root, warning)
 
-    # Independent columns avoid forcing short forms to match tall neighbours.
-    columns = QHBoxLayout()
+    # Equal-width grid cells align both card edges; surplus height stays below
+    # each form rather than being distributed between its heading and fields.
+    columns = QGridLayout()
     columns.setSpacing(18)
-    primary = QVBoxLayout()
-    secondary = QVBoxLayout()
-    primary.setSpacing(14)
-    secondary.setSpacing(14)
+    columns.setColumnStretch(0, 1)
+    columns.setColumnStretch(1, 1)
     for item in (paths, startup, defaults, update, rollback):
         item.widget().setTitle("")
         item.widget().setProperty("compactSettingsGroup", True)
         item.widget().layout().setAlignment(Qt.AlignmentFlag.AlignTop)
-    primary.addWidget(_card(content, "正式路径", (paths,)))
-    primary.addWidget(_card(content, "观察数据恢复", (startup,)))
-    primary.addStretch(1)
-    secondary.addWidget(_card(content, "任务默认值", (defaults, note)))
-    secondary.addWidget(_card(content, "下载引擎更新", (update,)))
-    secondary.addStretch(1)
-    columns.addLayout(primary, 6)
-    columns.addLayout(secondary, 5)
+    for row, column, title, contents in (
+        (0, 0, "正式路径", (paths,)),
+        (0, 1, "任务默认值", (defaults, note)),
+        (1, 0, "观察数据恢复", (startup,)),
+        (1, 1, "下载引擎更新", (update,)),
+    ):
+        card = _card(content, title, contents, match_row_height=True)
+        card.layout().setAlignment(Qt.AlignmentFlag.AlignTop)
+        for item in contents:
+            widget = item.widget()
+            if widget is not None:
+                widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        columns.addWidget(card, row, column)
     root.addLayout(columns)
 
     # Keep the action layout on a real, parented holder. QLayout.addItem() does
