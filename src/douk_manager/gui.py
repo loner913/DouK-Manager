@@ -685,7 +685,7 @@ class WatchlistTableModel(QAbstractTableModel):
         if not index.isValid() or index.row() >= len(self._visible_rows):
             return None
         record = self._visible_rows[index.row()]
-        if index.column() in (4, 5):
+        if index.column() in (4, 5) and role in (Qt.ItemDataRole.ForegroundRole, Qt.ItemDataRole.FontRole):
             kind = reminder_kind(record, self.reminder_now)
             urgent = kind == "overdue" or record.get("promotion_recovery") is not None
             if role == Qt.ItemDataRole.ForegroundRole and (urgent or kind == "due"):
@@ -701,28 +701,31 @@ class WatchlistTableModel(QAbstractTableModel):
             return note or "无备注"
         if role != Qt.ItemDataRole.DisplayRole:
             return None
-        captured = str(record.get("captured_nickname") or "")
-        reasons = "、".join(
-            WATCHLIST_REASON_LABELS.get(str(reason), str(reason))
-            for reason in record.get("reasons", ())
-        )
-        promoted = record.get("promoted_a_number")
-        values = (
-            f"W{record['w_id']}",
-            str(record.get("display_name") or "（未命名）"),
-            captured or "（空白已确认）",
-            str(record.get("douyin_id") or "—"),
-            _watchlist_state_label(record),
-            (
+        column = index.column()
+        if column == 0:
+            return f"W{record['w_id']}"
+        if column == 1:
+            return str(record.get("display_name") or "（未命名）")
+        if column == 2:
+            return str(record.get("captured_nickname") or "（空白已确认）")
+        if column == 3:
+            return str(record.get("douyin_id") or "—")
+        if column == 4:
+            return _watchlist_state_label(record)
+        if column == 7:
+            return str(len(record.get("review_history", ())))
+        if column == 8:
+            number = record.get("promoted_a_number")
+            return f"A{number}" if number is not None else "—"
+        if column == 6:
+            return "、".join(WATCHLIST_REASON_LABELS.get(str(reason), str(reason))
+                            for reason in record.get("reasons", ())) or "—"
+        if column == 5:
+            return (
                 f"{_watchlist_due_label(record, self.reminder_now)} · {_watchlist_date_label(record.get('next_review_at'))}"
-                if record.get("state") == "watching"
-                else _watchlist_due_label(record)
-            ),
-            reasons or "—",
-            str(len(record.get("review_history", ()))),
-            f"A{promoted}" if promoted is not None else "—",
-        )
-        return values[index.column()]
+                if record.get("state") == "watching" else _watchlist_due_label(record)
+            )
+        return None
 
     def headerData(
         self,
@@ -3335,6 +3338,8 @@ class MainWindow(QMainWindow):
         self.watchlist_table.setSortingEnabled(False)
         self.watchlist_table.verticalHeader().setVisible(False)
         self.watchlist_table.horizontalHeader().setStretchLastSection(True)
+        # Qt's default scans up to 1000 rows repeatedly on stylesheet changes.
+        self.watchlist_table.horizontalHeader().setResizeContentsPrecision(0)
         self.watchlist_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.ResizeToContents
         )
