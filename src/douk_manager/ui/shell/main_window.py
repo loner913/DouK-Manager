@@ -12,7 +12,7 @@ import os
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QPalette
-from PySide6.QtWidgets import QHBoxLayout, QTabWidget, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QComboBox, QGroupBox, QLabel, QHBoxLayout, QTabWidget, QVBoxLayout, QWidget
 
 from douk_manager.gui import MainWindow as LegacyMainWindow
 
@@ -62,14 +62,45 @@ class ModernMainWindow(LegacyMainWindow):
         super().__init__(window_state_store=window_state_store)
         self._modern_shell_install_error: Exception | None = None
         self._modern_status_timer: QTimer | None = None
-        self._modern_theme = ThemeManager(ThemeMode.LIGHT, self)
+        self._modern_theme = ThemeManager(parent=self, store=self._window_state_store,
+                                          style_hints=QApplication.instance().styleHints())
+        self.theme_strategy_combo.setCurrentIndex(self.theme_strategy_combo.findData(self._modern_theme.strategy))
+        self.theme_strategy_combo.currentIndexChanged.connect(
+            lambda: self._modern_theme.set_strategy(self.theme_strategy_combo.currentData()))
+        self._modern_theme.strategy_changed.connect(self._sync_theme_strategy)
+        self._modern_theme.save_failed.connect(
+            lambda: self.theme_save_status.setText("主题已应用，但偏好保存失败；重启后可能无法保留。"))
         try:
             self._install_modern_shell()
+            self._theme_settings_page.layout().insertWidget(0, self._theme_settings_box)
         except Exception as exc:  # pragma: no cover - defensive fallback.
             self._modern_shell_install_error = exc
             self.controller.logger.exception(
                 "现代 UI 外壳安装失败，已保留 V0.1.6 原界面：%s", exc
             )
+
+    def _settings_tab(self) -> QWidget:
+        page = super()._settings_tab()
+        box = QGroupBox("外观")
+        layout = QHBoxLayout(box)
+        layout.addWidget(QLabel("主题"))
+        self.theme_strategy_combo = QComboBox()
+        for label, value in (("跟随系统", "system"), ("浅色", "light"), ("深色", "dark")):
+            self.theme_strategy_combo.addItem(label, value)
+        layout.addWidget(self.theme_strategy_combo)
+        self.theme_save_status = QLabel("更改后立即生效并保存。")
+        self.theme_save_status.setWordWrap(True)
+        layout.addWidget(self.theme_save_status, 1)
+        box.setParent(page)
+        self._theme_settings_page = page
+        self._theme_settings_box = box
+        return page
+
+    def _sync_theme_strategy(self, strategy: str) -> None:
+        self.theme_strategy_combo.blockSignals(True)
+        self.theme_strategy_combo.setCurrentIndex(self.theme_strategy_combo.findData(strategy))
+        self.theme_strategy_combo.blockSignals(False)
+        self.theme_save_status.setText("更改后立即生效并保存。")
 
     def _apply_modern_theme(self, *_args) -> None:
         theme = self._modern_theme

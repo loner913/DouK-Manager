@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from enum import Enum
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, Signal, Qt
 from PySide6.QtWidgets import QApplication
 
 from .tokens import DARK_THEME, LIGHT_THEME, ThemePalette, UiMetrics
@@ -19,14 +19,46 @@ class ThemeManager(QObject):
     """Own the active palette and apply the scoped modern stylesheet."""
 
     theme_changed = Signal(str)
+    strategy_changed = Signal(str)
+    save_failed = Signal()
 
     def __init__(
         self,
         mode: ThemeMode = ThemeMode.LIGHT,
         parent: QObject | None = None,
+        *, store=None, style_hints=None,
     ) -> None:
         super().__init__(parent)
         self._mode = mode
+        self._store = store
+        self._style_hints = style_hints
+        self.strategy = store.load_theme_strategy() if store else mode.value
+        if style_hints is not None:
+            style_hints.colorSchemeChanged.connect(self._system_changed)
+        self._mode = self._resolved_mode()
+
+    def _resolved_mode(self) -> ThemeMode:
+        if self.strategy != "system":
+            return ThemeMode(self.strategy)
+        if self._style_hints is not None and self._style_hints.colorScheme() == Qt.ColorScheme.Dark:
+            return ThemeMode.DARK
+        return ThemeMode.LIGHT
+
+    def _system_changed(self, *_args) -> None:
+        controller = getattr(self.parent(), "controller", None)
+        if getattr(getattr(controller, "startup_state", None), "name", "") == "CLOSING":
+            return
+        if self.strategy == "system":
+            self._apply_mode(self._resolved_mode())
+
+    def set_strategy(self, strategy: str) -> None:
+        if strategy not in ("system", "light", "dark"):
+            raise ValueError("Unknown theme strategy")
+        self.strategy = strategy
+        self._apply_mode(self._resolved_mode())
+        self.strategy_changed.emit(strategy)
+        if self._store is not None and not self._store.save_theme_strategy(strategy):
+            self.save_failed.emit()
 
     @property
     def mode(self) -> ThemeMode:
@@ -37,6 +69,9 @@ class ThemeManager(QObject):
         return DARK_THEME if self._mode is ThemeMode.DARK else LIGHT_THEME
 
     def set_mode(self, mode: ThemeMode) -> None:
+        self.set_strategy(mode.value)
+
+    def _apply_mode(self, mode: ThemeMode) -> None:
         if mode is self._mode:
             return
         self._mode = mode
