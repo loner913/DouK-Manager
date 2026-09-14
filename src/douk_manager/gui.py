@@ -3035,6 +3035,8 @@ class MainWindow(QMainWindow):
         self.batch_start = self._spin(1, 100000, 1)
         self.batch_end = self._spin(1, 100000, 1392)
         self.batch_size = self._spin(1, 100000, 250)
+        for spin in (self.batch_start, self.batch_end, self.batch_size):
+            spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
         self.batch_earliest_mode = self._earliest_combo()
         self.batch_earliest_value = QLineEdit()
         self.batch_earliest_value.setPlaceholderText("可为所有生成任务设置同一个 earliest")
@@ -3211,12 +3213,14 @@ class MainWindow(QMainWindow):
         self.task_refresh_button = refresh
         refresh.clicked.connect(self.refresh_tasks)
         activate = QPushButton("应用为正式 setting")
+        self.queue_activate_button = activate
         activate.setToolTip("只能勾选一个模板；将模板复制为下载器唯一读取的正式 setting。")
         activate.clicked.connect(self._activate_selected_task)
         run_current = QPushButton("运行当前 setting")
         run_current.setToolTip("直接运行当前正式 setting，不重新选择模板。")
         run_current.clicked.connect(self._start_current)
         run_queue = QPushButton("按顺序运行已选")
+        self.queue_run_button = run_queue
         run_queue.setToolTip("按列表当前顺序逐个激活并运行已勾选模板。")
         run_queue.clicked.connect(self._start_queue)
         native_logs = QPushButton("打开下载器日志")
@@ -6109,7 +6113,11 @@ class MainWindow(QMainWindow):
                 self, "请勾选一个任务", "设为正式 settings.json 时必须且只能勾选一个任务。"
             )
             return
-        result = self._run(lambda: self.controller.activate_task(paths[0]), self.queue_output)
+        self._set_queue_action_active(self.queue_activate_button, True)
+        try:
+            result = self._run(lambda: self.controller.activate_task(paths[0]), self.queue_output)
+        finally:
+            self._set_queue_action_active(self.queue_activate_button, False)
         if result:
             self._append_info(
                 self.queue_output,
@@ -6123,6 +6131,15 @@ class MainWindow(QMainWindow):
                     f"{len(result.vetoed_numbers)} 个账号："
                     f"{compact_numbers(result.vetoed_numbers)}。",
                 )
+
+    @staticmethod
+    def _set_queue_action_active(button: QPushButton, active: bool) -> None:
+        if bool(button.property("queueActionActive")) == active:
+            return
+        button.setProperty("queueActionActive", active)
+        button.style().unpolish(button)
+        button.style().polish(button)
+        button.repaint()
 
     def _apply_queue_options(self) -> bool:
         values = {

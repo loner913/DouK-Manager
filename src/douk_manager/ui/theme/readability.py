@@ -102,6 +102,12 @@ QWidget[legacyRoot="true"][legacyReflowed="true"] QGroupBox[legacyCard="true"] {
     border: none;
     border-radius: 0px;
 }}
+QWidget[legacyRoot="true"] QPushButton[legacyModernized="true"][queueActionActive="true"],
+QWidget[legacyRoot="true"] QPushButton[legacyModernized="true"][queueActionActive="true"]:disabled {{
+    background: {p.primary};
+    border-color: {p.primary};
+    color: white;
+}}
 QWidget[legacyRoot="true"][legacyReflowed="true"] QGroupBox[compactSettingsGroup="true"] {{
     margin-top: 0px;
     padding-top: 0px;

@@ -73,6 +73,8 @@ _DANGER_HINTS = (
 
 def _button_role(text: str) -> str:
     normalised = "".join(text.split())
+    if normalised in ("应用为正式setting", "按顺序运行已选"):
+        return "secondary"
     if any(hint in normalised for hint in _DANGER_HINTS):
         return "danger"
     if any(hint in normalised for hint in _PRIMARY_HINTS):

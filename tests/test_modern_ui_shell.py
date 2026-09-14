@@ -51,6 +51,43 @@ class ModernUiShellTests(unittest.TestCase):
                 handler.close()
         self._home_patch.stop()
 
+    def test_queue_action_highlight_tracks_operation_and_not_click_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window = self._window(Path(directory))
+            try:
+                self.assertEqual(window.queue_activate_button.property("legacyRole"), "secondary")
+                self.assertEqual(window.queue_run_button.property("legacyRole"), "secondary")
+                window.queue_active = True
+                window.queue_run_source = "queue"
+                window._sync_modern_status()
+                self.assertTrue(window.queue_run_button.property("queueActionActive"))
+                window.queue_active = False
+                window._sync_modern_status()
+                self.assertFalse(window.queue_run_button.property("queueActionActive"))
+                window.queue_active = True
+                window.queue_run_source = "current"
+                window._sync_modern_status()
+                self.assertFalse(window.queue_run_button.property("queueActionActive"))
+                window.queue_active = False
+
+                def apply(_path):
+                    self.assertTrue(window.queue_activate_button.property("queueActionActive"))
+                    return True
+
+                with patch.object(window, "_queue_state_locked", return_value=False), patch.object(
+                    window, "_selected_task_paths", return_value=[Path("synthetic.json")]
+                ), patch.object(window.controller, "activate_task", side_effect=apply):
+                    window._activate_selected_task()
+                self.assertFalse(window.queue_activate_button.property("queueActionActive"))
+                with patch.object(window, "_queue_state_locked", return_value=False), patch.object(
+                    window, "_selected_task_paths", return_value=[Path("synthetic.json")]
+                ), patch.object(window, "_run", return_value=None):
+                    window._activate_selected_task()
+                self.assertFalse(window.queue_activate_button.property("queueActionActive"))
+            finally:
+                window.queue_active = False
+                self._dispose_window(window)
+
     def test_shell_wraps_every_existing_v016_page_without_recreating_it(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             window = self._window(Path(directory))

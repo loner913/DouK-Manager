@@ -340,6 +340,10 @@ class ModernMainWindow(LegacyMainWindow):
             self._sync_responsive_shell()
 
     def _sync_modern_status(self) -> None:
+        self._set_queue_action_active(
+            self.queue_run_button,
+            bool(self.queue_active and self.queue_run_source == "queue"),
+        )
         """Mirror existing V0.1.6 status labels without querying backends again."""
 
         if not hasattr(self, "modern_header"):
