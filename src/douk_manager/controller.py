@@ -526,6 +526,7 @@ class ManagerController:
         note: str,
         next_review_at: str,
         action: str = "review",
+        display_name: str | None = None,
         context: OperationContext | None = None,
     ) -> WatchlistSnapshot:
         self._require_operational_ready_with_context("保存观察复查", context=context)
@@ -537,6 +538,7 @@ class ManagerController:
             note=note,
             next_review_at=next_review_at,
             action=action,
+            display_name=display_name,
         )
         if context is not None:
             context.raise_if_cancelled()

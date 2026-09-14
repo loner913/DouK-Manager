@@ -16,6 +16,32 @@ from tests.helpers import make_test_paths
 
 
 class WatchlistTests(unittest.TestCase):
+    def test_review_name_preserves_identity_and_appends_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths, service = self._service(directory)
+            service.observe(self._payload())
+            before = service.snapshot()
+            after = service.record_review(1, expected_revision=before.revision,
+                reasons=["few_works"], note="reviewed", next_review_at="2099-01-01T00:00:00Z",
+                display_name="Edited name")
+            self.assertEqual(after.records[0]["display_name"], "Edited name")
+            for key in ("w_id", "url", "captured_nickname", "douyin_id", "nickname_blank"):
+                self.assertEqual(before.records[0][key], after.records[0][key])
+            self.assertEqual(len(after.records[0]["review_history"]), 1)
+            self.assertEqual(after.revision, before.revision + 1)
+            saved = paths.watchlist.read_bytes()
+            for name in ("x" * 257, "bad\x00name"):
+                with self.assertRaises(WatchlistError):
+                    service.record_review(1, expected_revision=after.revision,
+                        reasons=["few_works"], note="invalid", next_review_at="2099-01-01T00:00:00Z",
+                        display_name=name)
+                self.assertEqual(paths.watchlist.read_bytes(), saved)
+            with self.assertRaises(WatchlistError):
+                service.record_review(1, expected_revision=before.revision,
+                    reasons=["few_works"], note="stale", next_review_at="2099-01-01T00:00:00Z",
+                    display_name="Stale name")
+            self.assertEqual(paths.watchlist.read_bytes(), saved)
+
     def _service(self, directory: str) -> tuple[ManagedPaths, WatchlistService]:
         paths = make_test_paths(Path(directory), account_count=2)
         service = WatchlistService(paths)

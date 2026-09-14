@@ -706,6 +706,7 @@ class WatchlistService:
         note: str,
         next_review_at: str,
         action: str = "review",
+        display_name: str | None = None,
         locked: bool = False,
     ) -> WatchlistSnapshot:
         if action not in {"review", "reschedule", "reidentify"}:
@@ -718,6 +719,10 @@ class WatchlistService:
             record = self._find_record(document, w_id)
             if record["state"] != "watching":
                 raise WatchlistError("STATE_CONFLICT", "当前观察记录不允许复查。")
+            if display_name is not None:
+                if record.get("promotion_recovery") is not None:
+                    raise WatchlistError("RECOVERY_REQUIRED", "转正待恢复时不能修改观察名称。")
+                record["display_name"] = _string(display_name, name="display_name", max_length=256)
             record["reasons"] = _validate_reasons(reasons, note)
             record["note"] = _string(note, name="note", max_length=4000)
             record["next_review_at"] = next_review_at

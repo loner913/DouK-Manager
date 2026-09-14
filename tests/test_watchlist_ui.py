@@ -12,7 +12,7 @@ from PySide6.QtWidgets import QApplication, QTableView, QPushButton, QTextEdit
 
 from douk_manager.core.watchlist import WatchlistSnapshot
 from douk_manager.core.watchlist_promotion import PromotionResult
-from douk_manager.gui import MainWindow, WatchlistTableModel
+from douk_manager.gui import MainWindow, WatchlistTableModel, WatchlistReviewDialog
 from douk_manager.startup import StartupState
 
 
@@ -43,6 +43,20 @@ def _record(
 
 
 class WatchlistUiModelTests(unittest.TestCase):
+    def test_review_dialog_name_cancel_and_accept(self):
+        record = _record(1)
+        dialog = WatchlistReviewDialog(record)
+        self.assertEqual(dialog.display_name_edit.text(), record["display_name"])
+        dialog.display_name_edit.setText("Edited name")
+        dialog.reject()
+        self.assertIsNone(dialog.result)
+        self.assertNotEqual(record["display_name"], "Edited name")
+        dialog = WatchlistReviewDialog(record)
+        dialog.display_name_edit.setText("Edited name")
+        dialog._accept()
+        self.assertEqual(dialog.result[3], "Edited name")
+        self.assertNotEqual(record["display_name"], "Edited name")
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])

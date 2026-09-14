@@ -771,7 +771,7 @@ class WatchlistReviewDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(f"复查观察记录 W{record['w_id']}")
         self.setModal(True)
-        self._result: tuple[list[str], str, str] | None = None
+        self._result: tuple[list[str], str, str, str] | None = None
         root = QVBoxLayout(self)
 
         identity = QLabel(
@@ -794,6 +794,9 @@ class WatchlistReviewDialog(QDialog):
         root.addWidget(reasons_box)
 
         form = QFormLayout()
+        self.display_name_edit = QLineEdit(str(record.get("display_name") or ""))
+        self.display_name_edit.setMaxLength(256)
+        form.addRow("观察名称", self.display_name_edit)
         self.note_edit = QTextEdit()
         self.note_edit.setPlainText(str(record.get("note") or ""))
         self.note_edit.setMinimumHeight(90)
@@ -817,7 +820,7 @@ class WatchlistReviewDialog(QDialog):
         self.resize(560, 420)
 
     @property
-    def result(self) -> tuple[list[str], str, str] | None:
+    def result(self) -> tuple[list[str], str, str, str] | None:
         return self._result
 
     def _accept(self) -> None:
@@ -835,7 +838,8 @@ class WatchlistReviewDialog(QDialog):
         except Exception:
             QMessageBox.warning(self, "时间格式无效", "下次复查时间必须是 UTC RFC3339 格式。")
             return
-        self._result = (reasons, note, next_review_at)
+        display_name = self.display_name_edit.text()
+        self._result = (reasons, note, next_review_at, display_name)
         self.accept()
 
 
@@ -2238,15 +2242,15 @@ class MainWindow(QMainWindow):
         if record.get("state") != "watching":
             QMessageBox.information(self, "复查观察记录", "只有观察中的记录可以复查或编辑。")
             return
-        dialog = WatchlistReviewDialog(record, parent=self)
-        if dialog.exec() != QDialog.DialogCode.Accepted or dialog.result is None:
-            return
         if self._watchlist_snapshot is None:
             self.refresh_watchlist()
             return
-        reasons, note, next_review_at = dialog.result
-        w_id = int(record["w_id"])
         revision = self._watchlist_snapshot.revision
+        dialog = WatchlistReviewDialog(record, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted or dialog.result is None:
+            return
+        reasons, note, next_review_at, display_name = dialog.result
+        w_id = int(record["w_id"])
         spec = TaskSpec(
             task_type="watchlist_review",
             display_name="保存观察复查",
@@ -2263,6 +2267,7 @@ class MainWindow(QMainWindow):
                 reasons=reasons,
                 note=note,
                 next_review_at=next_review_at,
+                display_name=display_name,
             ),
             output=self.watchlist_output,
             buttons=(self.watchlist_review_button,),
