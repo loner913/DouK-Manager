@@ -222,6 +222,8 @@ class ModernLegacyPage(QWidget):
             self.layout_reflow_error = exc
             legacy_page.setProperty("legacyReflowed", False)
         surface_layout.addWidget(legacy_page, 1)
+        if title == "设置":
+            self.surface.setMaximumWidth(1380)
 
         # QTabWidget hides inactive pages explicitly. That hidden flag survives
         # setParent(), so every page except the tab that happened to be current at

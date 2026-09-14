@@ -372,18 +372,26 @@ def _reflow_settings(page: QWidget, root: QLayout, items: list[QLayoutItem]) -> 
     content = _content_widget(page)
     _add_item(root, warning)
 
-    config = QHBoxLayout()
-    config.setSpacing(14)
-    paths.widget().setTitle("")
-    paths.widget().setProperty("compactSettingsGroup", True)
-    paths.widget().layout().setAlignment(Qt.AlignmentFlag.AlignTop)
-    config.addWidget(_card(content, "正式路径", (paths,)), 6, Qt.AlignmentFlag.AlignTop)
-    config.addWidget(
-        _card(content, "任务默认值", (defaults, note), match_row_height=True),
-        4,
-    )
-    root.addLayout(config)
-    root.addWidget(_card(content, "Startup 观察数据恢复", (startup,)))
+    # Independent columns avoid forcing short forms to match tall neighbours.
+    columns = QHBoxLayout()
+    columns.setSpacing(18)
+    primary = QVBoxLayout()
+    secondary = QVBoxLayout()
+    primary.setSpacing(14)
+    secondary.setSpacing(14)
+    for item in (paths, startup, defaults, update, rollback):
+        item.widget().setTitle("")
+        item.widget().setProperty("compactSettingsGroup", True)
+        item.widget().layout().setAlignment(Qt.AlignmentFlag.AlignTop)
+    primary.addWidget(_card(content, "正式路径", (paths,)))
+    primary.addWidget(_card(content, "观察数据恢复", (startup,)))
+    primary.addStretch(1)
+    secondary.addWidget(_card(content, "任务默认值", (defaults, note)))
+    secondary.addWidget(_card(content, "下载引擎更新", (update,)))
+    secondary.addStretch(1)
+    columns.addLayout(primary, 6)
+    columns.addLayout(secondary, 5)
+    root.addLayout(columns)
 
     # Keep the action layout on a real, parented holder. QLayout.addItem() does
     # not reparent a QWidgetItem's widget, so explicitly move these original
@@ -415,23 +423,12 @@ def _reflow_settings(page: QWidget, root: QLayout, items: list[QLayoutItem]) -> 
         if item.widget() is not None:
             item.widget().setParent(description)
         description_layout.addItem(item)
-    old_layout.addWidget(description)
+    old_layout.addWidget(description, 1)
     old_layout.setDirection(QBoxLayout.Direction.LeftToRight)
-    old_layout.addStretch(1)
     old_layout.addWidget(action_holder)
     root.addWidget(action_card)
 
-    maintenance = QHBoxLayout()
-    maintenance.setSpacing(14)
-    update.widget().setTitle("")
-    update.widget().setProperty("compactSettingsGroup", True)
-    update.widget().layout().setAlignment(Qt.AlignmentFlag.AlignTop)
-    maintenance.addWidget(_card(content, "下载引擎更新", (update,)), 4, Qt.AlignmentFlag.AlignTop)
-    maintenance.addWidget(
-        _card(content, "历史引擎回退", (rollback,), match_row_height=True),
-        7,
-    )
-    root.addLayout(maintenance, 1)
+    root.addWidget(_card(content, "历史引擎回退", (rollback,)))
     root.addWidget(_card(content, "操作结果", (output,)))
     _restore(root, tail)
 
