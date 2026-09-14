@@ -872,6 +872,16 @@ QDialog#watchlistReviewDialog {{ background: {p.surface}; color: {p.text_primary
 QDialog#watchlistReviewDialog QLabel {{ color: {p.text_primary}; font-size: 13px; }}
 QDialog#watchlistReviewDialog QLabel#modernSectionTitle {{ font-size: 18px; font-weight: 700; }}
 QDialog#watchlistReviewDialog QCheckBox {{ color: {p.text_primary}; spacing: 6px; }}
+QDialog#watchlistReviewDialog QCheckBox::indicator:unchecked {{
+    width: 14px; height: 14px;
+    border: 2px solid {p.text_secondary};
+    border-radius: 3px;
+    background: {p.surface};
+}}
+QDialog#watchlistReviewDialog QCheckBox::indicator:unchecked:hover,
+QDialog#watchlistReviewDialog QCheckBox::indicator:unchecked:focus {{
+    border-color: {p.primary};
+}}
 QDialog#watchlistReviewDialog QCalendarWidget QWidget {{ background: {p.surface}; color: {p.text_primary}; }}
 """)
 
