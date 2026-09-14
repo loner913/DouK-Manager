@@ -102,6 +102,10 @@ QWidget[legacyRoot="true"][legacyReflowed="true"] QGroupBox[legacyCard="true"] {
     border: none;
     border-radius: 0px;
 }}
+QWidget[legacyRoot="true"][legacyReflowed="true"] QGroupBox[compactSettingsGroup="true"] {{
+    margin-top: 0px;
+    padding-top: 0px;
+}}
 QWidget[legacyRoot="true"][legacyReflowed="true"] QGroupBox[legacyCard="true"]::title {{
     subcontrol-origin: margin;
     left: 0px;

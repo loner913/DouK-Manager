@@ -12,6 +12,7 @@ from collections.abc import Iterable
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
+    QBoxLayout,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -373,10 +374,10 @@ def _reflow_settings(page: QWidget, root: QLayout, items: list[QLayoutItem]) -> 
 
     config = QHBoxLayout()
     config.setSpacing(14)
-    config.addWidget(
-        _card(content, "正式路径", (paths,), match_row_height=True),
-        6,
-    )
+    paths.widget().setTitle("")
+    paths.widget().setProperty("compactSettingsGroup", True)
+    paths.widget().layout().setAlignment(Qt.AlignmentFlag.AlignTop)
+    config.addWidget(_card(content, "正式路径", (paths,)), 6, Qt.AlignmentFlag.AlignTop)
     config.addWidget(
         _card(content, "任务默认值", (defaults, note), match_row_height=True),
         4,
@@ -391,7 +392,6 @@ def _reflow_settings(page: QWidget, root: QLayout, items: list[QLayoutItem]) -> 
     action_holder.setProperty("legacyLayoutHolder", True)
     action_layout = QHBoxLayout(action_holder)
     action_layout.setContentsMargins(0, 0, 0, 0)
-    action_layout.addStretch(1)
     for action_item in (save_paths, save_all):
         action_widget = action_item.widget()
         if action_widget is None:
@@ -404,15 +404,29 @@ def _reflow_settings(page: QWidget, root: QLayout, items: list[QLayoutItem]) -> 
         (),
         note="保存后重新检查路径与运行环境。",
     )
-    action_card.layout().addWidget(action_holder)
+    # Keep the description and actions on one compact row.
+    description = QWidget(action_card)
+    description.setProperty("legacyLayoutHolder", True)
+    description_layout = QVBoxLayout(description)
+    description_layout.setContentsMargins(0, 0, 0, 0)
+    old_layout = action_card.layout()
+    while old_layout.count():
+        item = old_layout.takeAt(0)
+        if item.widget() is not None:
+            item.widget().setParent(description)
+        description_layout.addItem(item)
+    old_layout.addWidget(description)
+    old_layout.setDirection(QBoxLayout.Direction.LeftToRight)
+    old_layout.addStretch(1)
+    old_layout.addWidget(action_holder)
     root.addWidget(action_card)
 
     maintenance = QHBoxLayout()
     maintenance.setSpacing(14)
-    maintenance.addWidget(
-        _card(content, "下载引擎更新", (update,), match_row_height=True),
-        4,
-    )
+    update.widget().setTitle("")
+    update.widget().setProperty("compactSettingsGroup", True)
+    update.widget().layout().setAlignment(Qt.AlignmentFlag.AlignTop)
+    maintenance.addWidget(_card(content, "下载引擎更新", (update,)), 4, Qt.AlignmentFlag.AlignTop)
     maintenance.addWidget(
         _card(content, "历史引擎回退", (rollback,), match_row_height=True),
         7,
