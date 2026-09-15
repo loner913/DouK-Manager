@@ -16,11 +16,12 @@
 
 ## 版本历史
 
-仓库使用 `v0.1.0` 表示首个正式稳定版；后续 `v0.1.1` 至 `v0.1.5` 在
-`develop` 上持续验收。当前 `v0.1.6` 已完成阶段 D 验收，并通过
-`feature/v0.1.6-final` 和 PR #9 进入 `develop` 集成流程；E-0/E-0.1 发布准备也已完成。
-本流程不创建或移动 Tag、不创建 GitHub Release，`main` 保持不变。
-既有 `v0.1.0` Tag/Release 和 v0.1.5 历史保持不变。
+仓库使用 `v0.1.0` 表示首个正式稳定版；后续版本在 `develop` 上持续验收。
+当前 `v0.1.7` 本地候选已完成各功能项 C/D、固定部署环境的全程序 UI 排查和问题修复，
+现已统一源码、运行时与 Windows 构建身份，本轮完整隔离回归和源码候选前台版本确认通过。版本级 E 尚未完成；
+没有 push、PR、正式构建、Tag 或 GitHub Release。最终进入 GitHub 的分支固定为
+`feature/v0.1.7-final`；当前 `feature/v0.1.7-homepage` 仅是本地整合候选。既有 V0.1.6 集成历史、`v0.1.0`
+Tag/Release 和 `main` 均保持不变。
 
 | 版本 | 定位 | 主要新增与修复 |
 | --- | --- | --- |
@@ -31,8 +32,30 @@
 | [v0.1.4](RELEASE-NOTES-v0.1.4.md) | 队列控制、监听与结果追溯 | 模板批量选择/删除、暂停与取消队列、后台剪贴板监听、下载结果页、私密账号智能跳过、动态结果查看、完成后安全关机和全局运行状态 |
 | [v0.1.5](RELEASE-NOTES-v0.1.5.md) | 后台安全、结果看板与稳定化 | 三阶段后台生命周期与只读结果看板；大账号智能跳过预览可滚动；主窗口安全记忆尺寸、位置和最大化状态 |
 | [v0.1.6](RELEASE-NOTES-v0.1.6.md) | 账号、日志与引擎安全 | mark 归类修复、日志安全统计与脱敏、下载引擎回退、账号健康审计与生命周期管理 |
+| [v0.1.7](RELEASE-NOTES-v0.1.7.md) | 主页、观察名单与统一界面 | 账号主页入口、独立 W 身份与安全转正、Startup 六文件保护、三策略主题、11 页统一界面和完整使用手册 |
 
 完整的逐版本新增、修复、安全边界和升级说明见 [CHANGELOG.md](CHANGELOG.md)。
+
+## v0.1.7 主页、观察名单与统一界面
+
+v0.1.7 在 v0.1.6 基础上完成日常操作效率、候选账号管理、启动保护和界面一致性升级：
+
+- 下载结果、结果看板、账号审计和观察名单可通过受控入口打开账号主页，正式 A 编号仍以主档数组位置为准；
+- 新增独立 W 身份观察名单、复查提醒、归档/恢复/永久删除，以及复用正式采集事务的安全转正流程；
+- 油猴脚本增加“加入观察”入口，观察写入与正式账号采集保持隔离；
+- Startup 扩展为正式三个 Volume 关键文件与三个观察 Data 文件的联合快照、对账、恢复和只读保护；
+- 建立 DouK Fluent Dashboard 公共 UI，统一 11 页导航与布局，并支持 `system`、`light`、`dark` 三种主题策略；
+- 完成固定 27 英寸、2560×1440、Windows 100% 环境的全程序 UI/功能排查和首轮修复；
+- 提供与当前界面、数据影响和恢复边界对应的 V0.1.7 完整使用手册。
+
+当前仅为本地候选：既有功能项的隔离自动验证和前台验收已完成；版本身份已统一为 `0.1.7`，
+本轮完整隔离回归为 722 项、720 项通过、2 项条件跳过、0 失败；源码候选前台显示 V0.1.7、到达 READY 并正常退出。
+正式包尚未构建，版本级 E 尚未执行。
+顶部搜索目前只支持页面/功能导航，
+账号与任务搜索或占位文案收窄已登记为后续版本优化 `V017-OPT-SEARCH-001`，不属于本次发布阻塞项。
+
+详细发布说明见 [RELEASE-NOTES-v0.1.7.md](RELEASE-NOTES-v0.1.7.md)，问题状态见
+[V0.1.7 UI 与功能问题清单](docs/designs/v0.1.7/UI-ISSUES.md)。
 
 ## 下载引擎提速阶段状态
 
@@ -219,16 +242,17 @@ python -m unittest discover -s tests -v
 
 ## Windows 便携版构建
 
-仓库包含 `.github/workflows/build-windows.yml`。V0.1.6 发布集成使用
-`feature/v0.1.6-final` 向 `develop` 发起的 PR 流程：
+仓库包含 `.github/workflows/build-windows.yml`。当前 V0.1.7 候选沿用已验证的 `develop` 集成流程：
 
 1. PR 事件只运行 `Test` 作业，在 Windows + Python 3.12 上运行全量 unittest；
 2. PR 合并后的 `develop` push 才运行 `Windows portable package` 正式打包；
 3. 正式打包同时生成 ZIP 和 SHA-256 校验文件的 Artifact；
 4. 核验 ZIP 后解压到隔离目录，再双击 `DouKManager.exe`。
 
-Artifact 名称格式为 `DouK-Manager_Windows_X64-v0.1.6-<ref>-run-<run>-<sha>`。
-本次发布流程不手动触发 portable package，不创建 Tag 或 GitHub Release，`main` 和 `develop` 的发布边界按上述流程保持不变。
+Artifact 名称格式为 `DouK-Manager_Windows_X64-v0.1.7-<ref>-run-<run>-<sha>`。
+当前只完成本地身份和文档收口，未触发 portable package。是否 push、创建 PR、运行正式构建、创建 Tag 或 GitHub Release，
+必须等最终完整回归和前台整体验收通过后由版本级 E 单独授权；`main` 和 `develop` 当前保持不变。
+最终 GitHub 分支名称必须为 `feature/v0.1.7-final`；不得以当前本地候选分支名代替。
 编译产物、运行数据和正式账号资料都不会写入源码仓库。
 
 ## v0.1.0 稳定版
