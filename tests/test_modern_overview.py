@@ -131,6 +131,61 @@ class ModernOverviewTests(unittest.TestCase):
             self.assertEqual(spec.resource_keys, frozenset({"result_logs"}))
             self._dispose_window(window)
 
+    def test_startup_refreshes_only_the_visible_result_consumer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window = self._window(Path(directory))
+            try:
+                overview = window.modern_overview
+                overview._timer.stop()
+                window.controller.startup_state = StartupState.READY
+                window.refresh_tasks = Mock()
+                result_refreshes = []
+                window.refresh_results = lambda: result_refreshes.append(True)
+                window.refresh_watchlist = Mock()
+
+                window._refresh_noncritical_after_startup()
+
+                window.refresh_tasks.assert_called_once_with()
+                window.refresh_watchlist.assert_called_once_with()
+                self.assertEqual(result_refreshes, [])
+
+                window.controller.startup_state = StartupState.SAFETY_CHECKING
+                window.tabs.setCurrentIndex(window.result_tab_index)
+                window.controller.startup_state = StartupState.READY
+
+                window._refresh_noncritical_after_startup()
+
+                self.assertEqual(result_refreshes, [True])
+            finally:
+                self._dispose_window(window)
+
+    def test_hidden_completed_overview_waits_until_activated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window = self._window(Path(directory))
+            try:
+                overview = window.modern_overview
+                overview._timer.stop()
+                window.controller.startup_state = StartupState.SAFETY_CHECKING
+                window.tabs.setCurrentIndex(window.result_tab_index)
+                window.controller.startup_state = StartupState.READY
+                overview._initial_refresh_requested = False
+
+                with patch.object(
+                    window,
+                    "_submit_coalesced_background",
+                    return_value="synthetic-completed-overview",
+                ) as submit:
+                    overview.refresh_from_host()
+                    self.app.processEvents()
+                    submit.assert_not_called()
+
+                    window.tabs.setCurrentIndex(0)
+
+                submit.assert_called_once()
+                self.assertEqual(submit.call_args.args[0].task_type, "completed_overview")
+            finally:
+                self._dispose_window(window)
+
     def test_watchlist_reminder_is_a_prominent_primary_action(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             window = self._window(Path(directory))

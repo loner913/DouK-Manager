@@ -620,7 +620,9 @@ class MainWindowBackgroundBindingTests(unittest.TestCase):
 
     def test_rejection_does_not_disable_or_replace_current_generation(self) -> None:
         window = self._window()
-        window.coordinator.error = TaskRejectedError("synthetic conflict")
+        window.coordinator.error = TaskRejectedError(
+            "background task resource conflict: result_logs"
+        )
         button = SimpleNamespace(setEnabled=Mock())
 
         task_id = MainWindow._submit_background(
@@ -636,6 +638,13 @@ class MainWindowBackgroundBindingTests(unittest.TestCase):
         self.assertEqual(window._background_generations, {})
         button.setEnabled.assert_not_called()
         window._append_info.assert_called_once()
+        output_message = window._append_info.call_args.args[-1]
+        status_message = window.statusBar.return_value.showMessage.call_args.args[0]
+        self.assertIn("相关数据正在由其他后台任务使用", output_message)
+        self.assertEqual(status_message, "conflict暂未启动：相关数据正在由其他后台任务使用，请稍后重试。")
+        self.assertNotIn("result_logs", output_message)
+        self.assertNotIn("result_logs", status_message)
+        window.controller.logger.info.assert_called_once()
 
     def test_stale_or_closing_progress_and_terminal_callbacks_are_dropped(self) -> None:
         window = self._window()

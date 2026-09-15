@@ -127,10 +127,21 @@ class CompletedOverviewPage(ModernOverviewPage):
         self._refresh_startup(self._host)
         if (
             self._host.controller.startup_state is StartupState.READY
+            and self._host.tabs.currentWidget() is self
             and not self._initial_refresh_requested
         ):
             self._initial_refresh_requested = True
             QTimer.singleShot(0, self.request_real_dashboard_refresh)
+
+    def activate(self):
+        self.refresh_watchlist_reminder()
+        self._refresh_startup(self._host)
+        if (
+            self._host.controller.startup_state is StartupState.READY
+            and self._host.tabs.currentWidget() is self
+        ):
+            self._initial_refresh_requested = True
+            self.request_real_dashboard_refresh()
 
     def _refresh_preview(self):
         pass

@@ -1938,7 +1938,14 @@ class MainWindow(QMainWindow):
             self.refresh_results()
             return
         self.refresh_tasks()
-        if hasattr(self, "result_table"):
+        result_page_is_current = (
+            not hasattr(self, "modern_overview")
+            or (
+                hasattr(self, "tabs")
+                and self.tabs.currentIndex() == getattr(self, "result_tab_index", -1)
+            )
+        )
+        if hasattr(self, "result_table") and result_page_is_current:
             self.refresh_results()
         if hasattr(self, "watchlist_page"):
             self.refresh_watchlist()
@@ -4824,9 +4831,23 @@ class MainWindow(QMainWindow):
         try:
             task_id = self.coordinator.start(spec, generation, action)
         except TaskRejectedError as exc:
+            technical_message = str(exc)
+            if technical_message.startswith("background task resource conflict:"):
+                message = f"{spec.display_name}暂未启动：相关数据正在由其他后台任务使用，请稍后重试。"
+            elif technical_message.startswith("duplicate background task:"):
+                message = f"{spec.display_name}正在进行，无需重复启动。"
+            elif technical_message == "background task coordinator is closing":
+                message = f"{spec.display_name}未启动：程序正在关闭。"
+            else:
+                message = f"{spec.display_name}暂未启动，请稍后重试。"
+            self.controller.logger.info(
+                "后台任务未启动：task_type=%s；原因=%s",
+                spec.task_type,
+                technical_message,
+            )
             if output is not None:
-                self._append_info(output, f"【未启动】{exc}")
-            self.statusBar().showMessage(str(exc))
+                self._append_info(output, f"【未启动】{message}")
+            self.statusBar().showMessage(message)
             return None
         self._background_generations[key] = generation
         self._background_bindings[task_id] = BackgroundTaskBinding(
