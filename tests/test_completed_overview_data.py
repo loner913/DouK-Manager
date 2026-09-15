@@ -2,16 +2,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import tempfile
 import unittest
-import importlib.util
 from unittest.mock import patch
 
 from douk_manager.core.result_dashboard import ResultDashboardService
 from douk_manager.ui.pages.completed_data import read_completed
-_fixture_path = Path(__file__).resolve().parents[2] / "ui-modernization-preview-runtime" / "seed_overview_logs.py"
-_spec = importlib.util.spec_from_file_location("completed_fixture", _fixture_path)
-_fixture = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_fixture)
-write_task = _fixture.write_task
+from tests.completed_overview_helpers import write_task
 
 
 class CompletedDataTests(unittest.TestCase):

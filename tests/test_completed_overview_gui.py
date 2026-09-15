@@ -12,7 +12,7 @@ from douk_manager.background import TaskSpec
 from douk_manager.config import AppConfig
 from douk_manager.startup import StartupState
 from douk_manager.ui.shell.main_window import ModernMainWindow
-from test_completed_overview_data import write_task
+from tests.completed_overview_helpers import write_task
 
 
 class CompletedOverviewGuiTests(unittest.TestCase):
@@ -29,8 +29,7 @@ class CompletedOverviewGuiTests(unittest.TestCase):
         self.fail("background did not settle")
 
     def test_log_updates_empty_state_and_bound_detail(self):
-        runtime = Path(__file__).resolve().parents[2] / "ui-modernization-preview-runtime"
-        with tempfile.TemporaryDirectory(dir=runtime) as directory:
+        with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             logs = home / "Logs" / "DownloadTasks"
             end = datetime.now().replace(microsecond=0)
