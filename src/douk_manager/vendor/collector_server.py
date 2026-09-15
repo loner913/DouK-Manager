@@ -45,13 +45,18 @@ import tempfile
 import threading
 import traceback
 import unicodedata
+from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlsplit, urlunsplit
 
-from douk_manager.core.locks import LockBusyError, critical_section
+from douk_manager.core.locks import LockBusyError, ProcessFileLock, critical_section
+from douk_manager.core.profile_url import (
+    normalize_url_for_compare as shared_normalize_url_for_compare,
+)
+from douk_manager.core.watchlist import WatchlistError, WatchlistPaths, WatchlistService
 
 try:
     from openpyxl import load_workbook
@@ -89,6 +94,27 @@ BACKUP_STATE_PATH = BASE_DIR / ".douk_backup_state.json"
 GLOBAL_LOCK_PATH = Path(
     os.environ.get("DOUK_GLOBAL_LOCK_PATH", str(BASE_DIR / ".douk_manager.lock"))
 ).resolve()
+WATCHLIST_PATH = Path(
+    os.environ.get("DOUK_WATCHLIST_PATH", str(BASE_DIR.parent / "watchlist.json"))
+).resolve()
+WATCHLIST_WATERMARK_PATH = Path(
+    os.environ.get(
+        "DOUK_WATCHLIST_WATERMARK_PATH",
+        str(BASE_DIR.parent / "watchlist_w_watermark.json"),
+    )
+).resolve()
+WATCHLIST_CONTROL_PATH = Path(
+    os.environ.get(
+        "DOUK_WATCHLIST_CONTROL_PATH",
+        str(BASE_DIR.parent / "watchlist_control.json"),
+    )
+).resolve()
+MANAGER_INSTANCE_LOCK_PATH = Path(
+    os.environ.get(
+        "DOUK_MANAGER_INSTANCE_LOCK_PATH",
+        str(BASE_DIR.parent / ".douk_manager.instance.lock"),
+    )
+).resolve()
 
 SETTINGS_SIMPLE_BACKUP_PATH = SETTINGS_PATH.with_name(SETTINGS_PATH.name + ".bak")
 EXCEL_SIMPLE_BACKUP_PATH = EXCEL_PATH.with_name(EXCEL_PATH.name + ".bak")
@@ -106,6 +132,90 @@ CATEGORY_STARTUP_ERROR: "CollectorError | None" = None
 SCREENSHOT_DIR = Path(
     os.environ.get("DOUK_SCREENSHOT_DIR", str(BASE_DIR / "账号页面截图"))
 ).resolve()
+
+# The manager reuses the formal collector transaction in-process.  The vendor
+# worker remains a separate process, so this small runtime scope is sufficient
+# to keep the legacy module-level paths isolated while a manager operation is
+# running.  The HTTP worker never enters this scope and keeps its environment
+# derived defaults unchanged.
+_RUNTIME_CONFIG_LOCK = threading.RLock()
+
+
+@contextmanager
+def configured_runtime(
+    *,
+    base_dir: Path,
+    settings_path: Path,
+    excel_path: Path,
+    global_lock_path: Path,
+    watchlist_path: Path,
+    watchlist_watermark_path: Path,
+    watchlist_control_path: Path,
+    manager_instance_lock_path: Path,
+    screenshot_dir: Path | None = None,
+):
+    """Temporarily bind formal collector paths to an explicit managed home.
+
+    The existing vendor functions intentionally retain their public signatures
+    and transaction implementation.  This scope is the narrow adapter used by
+    the manager's in-process W promotion service; it never changes process or
+    user environment variables and restores every module-level path on exit.
+    """
+
+    names = (
+        "BASE_DIR",
+        "SETTINGS_PATH",
+        "EXCEL_PATH",
+        "TRANSACTION_PATH",
+        "BACKUP_STATE_PATH",
+        "GLOBAL_LOCK_PATH",
+        "WATCHLIST_PATH",
+        "WATCHLIST_WATERMARK_PATH",
+        "WATCHLIST_CONTROL_PATH",
+        "MANAGER_INSTANCE_LOCK_PATH",
+        "SETTINGS_SIMPLE_BACKUP_PATH",
+        "EXCEL_SIMPLE_BACKUP_PATH",
+        "SETTINGS_BACKUP_DIR",
+        "EXCEL_BACKUP_DIR",
+        "CATEGORY_PATHS",
+        "CATEGORY_BACKUP_DIR",
+        "SCREENSHOT_DIR",
+    )
+    values = {
+        "BASE_DIR": Path(base_dir).resolve(),
+        "SETTINGS_PATH": Path(settings_path).resolve(),
+        "EXCEL_PATH": Path(excel_path).resolve(),
+        "GLOBAL_LOCK_PATH": Path(global_lock_path).resolve(),
+        "WATCHLIST_PATH": Path(watchlist_path).resolve(),
+        "WATCHLIST_WATERMARK_PATH": Path(watchlist_watermark_path).resolve(),
+        "WATCHLIST_CONTROL_PATH": Path(watchlist_control_path).resolve(),
+        "MANAGER_INSTANCE_LOCK_PATH": Path(manager_instance_lock_path).resolve(),
+    }
+    values["TRANSACTION_PATH"] = values["BASE_DIR"] / ".douk_collector_transaction.json"
+    values["BACKUP_STATE_PATH"] = values["BASE_DIR"] / ".douk_backup_state.json"
+    values["SETTINGS_SIMPLE_BACKUP_PATH"] = values["SETTINGS_PATH"].with_name(
+        values["SETTINGS_PATH"].name + ".bak"
+    )
+    values["EXCEL_SIMPLE_BACKUP_PATH"] = values["EXCEL_PATH"].with_name(
+        values["EXCEL_PATH"].name + ".bak"
+    )
+    values["SETTINGS_BACKUP_DIR"] = values["BASE_DIR"] / "settings_backups"
+    values["EXCEL_BACKUP_DIR"] = values["BASE_DIR"] / "excel_backups"
+    values["CATEGORY_PATHS"] = {
+        name: values["BASE_DIR"] / f"{name}.txt" for name in CATEGORY_NAMES
+    }
+    values["CATEGORY_BACKUP_DIR"] = values["BASE_DIR"] / "category_backups"
+    values["SCREENSHOT_DIR"] = Path(screenshot_dir).resolve() if screenshot_dir else (
+        values["BASE_DIR"] / "账号页面截图"
+    )
+
+    with _RUNTIME_CONFIG_LOCK:
+        previous = {name: globals()[name] for name in names}
+        try:
+            globals().update(values)
+            yield
+        finally:
+            globals().update(previous)
 # Chrome at 100% UI scale: remove the tab strip while retaining the address bar.
 # After capture, remove the bookmarks bar between the address bar and page, then
 # join those two retained regions. These calibrated values are DPI-scaled at runtime.
@@ -128,6 +238,9 @@ WHITESPACE_RE = re.compile(r"\s+")
 
 FILE_LOCK = threading.RLock()
 SCREENSHOT_LOCK = threading.Lock()
+MANAGER_SESSION_LOCK = threading.Lock()
+MANAGER_SESSION_ACTIVE = False
+MANAGER_SESSION_THREAD: threading.Thread | None = None
 
 
 class CollectorError(Exception):
@@ -156,6 +269,86 @@ class CollectorError(Exception):
             "details": self.details,
             "version": VERSION,
         }
+
+
+def _session_line(stream: Any) -> str:
+    try:
+        value = stream.readline()
+    except (OSError, ValueError):
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="ignore").strip()
+    return str(value).strip()
+
+
+class _ManagerSessionEnded(Exception):
+    """Stop accepting requests after the owning manager has gone away."""
+
+
+class CollectorHTTPServer(ThreadingHTTPServer):
+    # server_close must wait for accepted requests, including paired writes.
+    daemon_threads = False
+    block_on_close = True
+    manager_bound = False
+
+    def service_actions(self) -> None:
+        if self.manager_bound and not manager_session_active():
+            raise _ManagerSessionEnded
+
+
+def _revoke_manager_session_on_eof(stream: Any) -> None:
+    global MANAGER_SESSION_ACTIVE
+    try:
+        while True:
+            if not stream.readline():
+                break
+    except (OSError, ValueError):
+        pass
+    finally:
+        with MANAGER_SESSION_LOCK:
+            MANAGER_SESSION_ACTIVE = False
+
+
+def configure_manager_session_channel(stream: Any | None = None) -> bool:
+    """Bind observation permission to the manager parent's open stdin pipe."""
+
+    global MANAGER_SESSION_ACTIVE, MANAGER_SESSION_THREAD
+    if os.environ.get("DOUK_MANAGER_SESSION_CHANNEL") != "1":
+        return False
+    if stream is None:
+        stdin = getattr(sys, "stdin", None)
+        stream = getattr(stdin, "buffer", stdin)
+    if stream is None or not _session_line(stream):
+        return False
+    with MANAGER_SESSION_LOCK:
+        MANAGER_SESSION_ACTIVE = True
+    thread = threading.Thread(
+        target=_revoke_manager_session_on_eof,
+        args=(stream,),
+        name="douk-manager-session-watch",
+        daemon=True,
+    )
+    MANAGER_SESSION_THREAD = thread
+    thread.start()
+    return True
+
+
+def manager_session_active() -> bool:
+    with MANAGER_SESSION_LOCK:
+        return MANAGER_SESSION_ACTIVE
+
+
+def manager_instance_owner_present() -> bool:
+    """Non-blockingly verify the manager's separate long-lived instance lock."""
+
+    probe = ProcessFileLock(MANAGER_INSTANCE_LOCK_PATH, timeout=0.0)
+    try:
+        probe.acquire()
+    except LockBusyError:
+        return True
+    else:
+        probe.release()
+        return False
 
 
 def foreground_chrome_capture_box() -> tuple[tuple[int, int, int, int], dict[str, Any]]:
@@ -746,11 +939,10 @@ def clean_profile_url(raw_url: str) -> str:
 
 
 def normalize_url_for_compare(raw_url: str) -> str:
-    try:
-        return clean_profile_url(raw_url)
-    except CollectorError:
-        # Existing malformed URLs still participate in duplicate comparison as trimmed text.
-        return text(raw_url).split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    # Formal duplicate/reconciliation semantics are shared with the manager's
+    # pure URL module.  ``clean_profile_url`` remains the legacy formal-entry
+    # admission function and is intentionally not tightened here.
+    return shared_normalize_url_for_compare(raw_url)
 
 
 def format_category_numbers(numbers: Iterable[int]) -> str:
@@ -1136,7 +1328,8 @@ def initialize_category_files_after_bind() -> None:
         format_error_for_console(exc)
 
 
-def read_json_document(path: Path = SETTINGS_PATH) -> dict[str, Any]:
+def read_json_document(path: Path | None = None) -> dict[str, Any]:
+    path = SETTINGS_PATH if path is None else Path(path)
     if not path.exists():
         raise CollectorError(
             "SETTINGS_NOT_FOUND",
@@ -1391,7 +1584,8 @@ def hyperlink_target(cell: Any) -> str:
     return text(getattr(link, "target", "") or getattr(link, "location", ""))
 
 
-def load_excel(path: Path = EXCEL_PATH) -> Any:
+def load_excel(path: Path | None = None) -> Any:
+    path = EXCEL_PATH if path is None else Path(path)
     if not path.exists():
         raise CollectorError(
             "EXCEL_NOT_FOUND",
@@ -2452,6 +2646,59 @@ def validate_files_only() -> StrictState:
         workbook.close()
 
 
+def _watchlist_paths() -> WatchlistPaths:
+    data_dir = WATCHLIST_PATH.parent
+    return WatchlistPaths(
+        root=data_dir.parent,
+        data=data_dir,
+        watchlist=WATCHLIST_PATH,
+        watermark=WATCHLIST_WATERMARK_PATH,
+        control=WATCHLIST_CONTROL_PATH,
+        lock_file=GLOBAL_LOCK_PATH,
+        master_settings=SETTINGS_PATH,
+    )
+
+
+def observe_watchlist(payload: dict[str, Any]) -> dict[str, Any]:
+    """Handle the manager-bound observation write without touching formal files."""
+
+    if not manager_session_active() or not manager_instance_owner_present():
+        raise CollectorError(
+            "MANAGER_SESSION_REQUIRED",
+            "当前管理器会话未授权观察写入。",
+            stage="precheck",
+        )
+    try:
+        result = WatchlistService(_watchlist_paths()).observe(payload, locked=True)
+    except WatchlistError as exc:
+        raise CollectorError(
+            exc.code,
+            exc.public_message,
+            details={"message_code": exc.code},
+            stage="precheck",
+        ) from exc
+    return {"ok": True, **result, "version": VERSION}
+
+
+def _watchlist_http_status(code: str) -> int:
+    if code in {"INVALID", "REQUEST_INVALID"}:
+        return 400
+    if code == "DELETED":
+        return 410
+    if code in {"READ_ONLY", "RECOVERY_REQUIRED", "SCHEMA_INVALID"}:
+        return 503
+    if code in {
+        "REQUEST_CONFLICT",
+        "BUSY",
+        "REVISION_CONFLICT",
+        "STATE_CONFLICT",
+        "INITIALIZATION_CONFLICT",
+        "MANAGER_SESSION_REQUIRED",
+    }:
+        return 409 if code != "MANAGER_SESSION_REQUIRED" else 503
+    return 400
+
+
 def safe_console_print(message: str) -> None:
     """Diagnostic output must never abort an HTTP response on Windows consoles."""
     try:
@@ -2531,6 +2778,7 @@ class Handler(BaseHTTPRequestHandler):
         # rejected silently and never read settings_master.json / Excel.  The token
         # remains compatible with the previous release so users can upgrade
         # the three files together without a separate secret change.
+        route = self.path.rstrip("/")
         if not self._authorized():
             self._suppress_log = True
             self._send_json(
@@ -2579,33 +2827,62 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
 
-            with critical_section(GLOBAL_LOCK_PATH, timeout=3.0):
-                if self.path.rstrip("/") == "/preview":
+            if route == "/watchlist/observe" and (
+                not manager_session_active() or not manager_instance_owner_present()
+            ):
+                self._suppress_log = True
+                self._send_json(
+                    {
+                        "ok": False,
+                        "code": "MANAGER_SESSION_REQUIRED",
+                        "message_code": "MANAGER_SESSION_REQUIRED",
+                        "message": "当前管理器会话未授权观察写入。",
+                        "version": VERSION,
+                    },
+                    503,
+                )
+                return
+
+            observing = route == "/watchlist/observe"
+            with critical_section(
+                GLOBAL_LOCK_PATH,
+                timeout=0.0 if observing else 3.0,
+                thread_timeout=0.0 if observing else -1,
+            ):
+                if route == "/preview":
                     result = preview(payload)
-                elif self.path.rstrip("/") == "/add":
+                elif route == "/add":
                     result = add_record(payload)
-                elif self.path.rstrip("/") == "/classify":
+                elif route == "/classify":
                     result = classify_record(payload)
-                elif self.path.rstrip("/") == "/account-screenshot-check":
+                elif route == "/watchlist/observe":
+                    result = observe_watchlist(payload)
+                elif route == "/account-screenshot-check":
                     result = check_account_screenshot(payload)
-                elif self.path.rstrip("/") == "/account-screenshot":
+                elif route == "/account-screenshot":
                     result = capture_account_screenshot(payload)
                 else:
                     self._send_json(
                         {"ok": False, "code": "NOT_FOUND", "message": "Not found."}, 404
                     )
                     return
-            self._send_json(result)
+            status = 201 if route == "/watchlist/observe" and result.get("status") == "CREATED" else 200
+            if route == "/watchlist/observe" and result.get("status") == "DELETED":
+                status = 410
+            self._send_json(result, status)
         except LockBusyError:
+            observing = route == "/watchlist/observe"
             error = CollectorError(
-                "MANAGER_BUSY",
+                "BUSY" if observing else "MANAGER_BUSY",
                 "DouK 管理器正在备份或修改正式配置，请稍后重试。",
+                details={"message_code": "BUSY"} if observing else None,
                 stage="precheck",
             )
             self._send_json(error.response(), 409)
         except CollectorError as exc:
             format_error_for_console(exc)
-            self._send_json(exc.response())
+            status = _watchlist_http_status(exc.code) if route == "/watchlist/observe" else 200
+            self._send_json(exc.response(), status)
         except json.JSONDecodeError as exc:
             error = CollectorError(
                 "INVALID_REQUEST_JSON",
@@ -2613,7 +2890,7 @@ class Handler(BaseHTTPRequestHandler):
                 details={"error": str(exc)},
             )
             format_error_for_console(error)
-            self._send_json(error.response())
+            self._send_json(error.response(), 400 if route == "/watchlist/observe" else 200)
         except Exception as exc:  # pragma: no cover - last-resort diagnostics
             traceback.print_exc()
             self._send_json(
@@ -2670,8 +2947,16 @@ def main() -> int:
     if args.check:
         return 0
 
+    manager_bound = os.environ.get("DOUK_MANAGER_SESSION_CHANNEL") == "1"
+    if not configure_manager_session_channel() and manager_bound:
+        safe_console_print(
+            "[SESSION] 管理器会话通道未建立；采集子进程退出。"
+        )
+        return 4
+
     try:
-        server = ThreadingHTTPServer((HOST, PORT), Handler)
+        server = CollectorHTTPServer((HOST, PORT), Handler)
+        server.manager_bound = manager_bound
     except OSError as exc:
         print(f"[ERROR] Cannot listen on http://{HOST}:{PORT} - {exc}")
         return 3
@@ -2685,6 +2970,8 @@ def main() -> int:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:
         print("\n[STOPPED]")
+    except _ManagerSessionEnded:
+        safe_console_print("[SESSION] 管理器会话已结束；等待已接收请求完成后退出。")
     finally:
         server.server_close()
     return 0

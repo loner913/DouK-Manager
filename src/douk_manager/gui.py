@@ -1,27 +1,31 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
 from PySide6.QtCore import (
     QAbstractTableModel,
+    QDate,
     QEvent,
     QMargins,
     QModelIndex,
     QObject,
     QRect,
     QThread,
+    QTime,
     Qt,
     QTimer,
     QUrl,
     Signal,
     Slot,
 )
-from PySide6.QtGui import QColor, QDesktopServices, QKeySequence, QShortcut
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QKeySequence, QShortcut
+from douk_manager.core.watchlist_reminders import reminder_kind, reminder_summary
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -29,12 +33,14 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDateEdit,
     QFileDialog,
     QFormLayout,
     QFrame,
     QGridLayout,
     QGroupBox,
     QHeaderView,
+    QInputDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -45,11 +51,13 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QTableView,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
+    QTimeEdit,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -96,6 +104,12 @@ from douk_manager.core.log_stats import (
     truncate_reason_zh,
 )
 from douk_manager.core.power import request_normal_shutdown
+from douk_manager.core.profile_url import (
+    ProfileUrlError,
+    ProfileUrlResolution,
+    ProfileUrlStatus,
+    strict_admit_url,
+)
 from douk_manager.core.result_history import ResultPageSnapshot
 from douk_manager.core.result_dashboard import (
     DashboardAccountRow,
@@ -107,6 +121,8 @@ from douk_manager.core.result_dashboard import (
 from douk_manager.core.selector import compact_numbers
 from douk_manager.core.settings_tasks import ActivatedTask, EarliestRule
 from douk_manager.core.task_order import move_to_index
+from douk_manager.core.watchlist import WatchlistError, WatchlistSnapshot, parse_utc
+from douk_manager.core.watchlist_promotion import PromotionPreview, PromotionResult
 from douk_manager.ui_messages import format_information
 from douk_manager.ui_state import (
     WindowGeometryState,
@@ -564,6 +580,392 @@ class LogStatsOutput(QTextEdit):
         self._render_stats()
 
 
+WATCHLIST_REASON_LABELS = {
+    "few_works": "作品较少",
+    "unknown_updates": "更新不确定",
+    "content_pending": "内容待核对",
+    "suspected_private": "疑似私密",
+    "other": "其他",
+}
+
+
+def _watchlist_state_label(record: dict[str, Any]) -> str:
+    if record.get("promotion_recovery") is not None:
+        return "转正待恢复"
+    return {
+        "watching": "观察中",
+        "promoted": "已转正",
+        "archived": "已归档",
+    }.get(str(record.get("state")), str(record.get("state", "未知")))
+
+
+def _watchlist_due_label(record: dict[str, Any], now=None) -> str:
+    return {"inactive": "—", "missing": "待补时间", "invalid": "时间无效",
+            "due": "已到期", "overdue": "已超期", "upcoming": "待复查"}[reminder_kind(record, now)]
+
+
+def _watchlist_date_label(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        return "—"
+    try:
+        return parse_utc(value).astimezone().strftime("%Y-%m-%d %H:%M")
+    except (WatchlistError, ValueError, TypeError):
+        return "时间无效"
+
+
+class WatchlistTableModel(QAbstractTableModel):
+    """Model/View table for W records; no per-row widgets are created."""
+
+    HEADERS = ("W编号", "名称", "采集昵称", "抖音号", "状态", "复查", "原因", "历史", "A编号")
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._rows: tuple[dict[str, Any], ...] = ()
+        self._visible_rows: tuple[dict[str, Any], ...] = ()
+        self._state_filter = "all"
+        self._due_filter = "all"
+        self._search = ""
+        self.reminder_now = datetime.now(timezone.utc)
+        self._reminder_summary = reminder_summary((), self.reminder_now)
+
+    def refresh_reminders(self, now=None) -> None:
+        self.reminder_now = now or datetime.now(timezone.utc)
+        self._reminder_summary = reminder_summary(self._rows, self.reminder_now)
+        visible = tuple(record for record in self._rows if self._matches(record))
+        if visible != self._visible_rows:
+            self.beginResetModel()
+            self._visible_rows = visible
+            self.endResetModel()
+        elif self.rowCount():
+            self.dataChanged.emit(self.index(0, 4), self.index(self.rowCount() - 1, 5))
+
+    def reminder_summary(self):
+        return dict(self._reminder_summary)
+
+    @property
+    def total_count(self) -> int:
+        return len(self._rows)
+
+    @property
+    def visible_count(self) -> int:
+        return len(self._visible_rows)
+
+    def set_snapshot(self, snapshot: WatchlistSnapshot) -> None:
+        self.beginResetModel()
+        self._rows = tuple(dict(record) for record in snapshot.records)
+        self.reminder_now = datetime.now(timezone.utc)
+        self._reminder_summary = reminder_summary(self._rows, self.reminder_now)
+        self._rebuild_visible_rows()
+        self.endResetModel()
+
+    def set_filters(self, state_filter: str, due_filter: str, search: str) -> None:
+        normalized_search = search.strip().casefold()
+        if (
+            state_filter == self._state_filter
+            and due_filter == self._due_filter
+            and normalized_search == self._search
+        ):
+            return
+        self.beginResetModel()
+        self._state_filter = state_filter
+        self._due_filter = due_filter
+        self._search = normalized_search
+        self._rebuild_visible_rows()
+        self.endResetModel()
+
+    def record_at(self, row: int) -> dict[str, Any] | None:
+        if row < 0 or row >= len(self._visible_rows):
+            return None
+        return dict(self._visible_rows[row])
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._visible_rows)
+
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self.HEADERS)
+
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> object:
+        if not index.isValid() or index.row() >= len(self._visible_rows):
+            return None
+        record = self._visible_rows[index.row()]
+        if index.column() in (4, 5) and role in (Qt.ItemDataRole.ForegroundRole, Qt.ItemDataRole.FontRole):
+            kind = reminder_kind(record, self.reminder_now)
+            urgent = kind == "overdue" or record.get("promotion_recovery") is not None
+            if role == Qt.ItemDataRole.ForegroundRole and (urgent or kind == "due"):
+                return QColor("#e05260" if urgent else "#c77d16")
+            if role == Qt.ItemDataRole.FontRole and urgent:
+                font = QFont()
+                font.setBold(True)
+                return font
+        if role == Qt.ItemDataRole.UserRole:
+            return int(record["w_id"])
+        if role == Qt.ItemDataRole.ToolTipRole:
+            note = str(record.get("note") or "").strip()
+            return note or "无备注"
+        if role != Qt.ItemDataRole.DisplayRole:
+            return None
+        column = index.column()
+        if column == 0:
+            return f"W{record['w_id']}"
+        if column == 1:
+            return str(record.get("display_name") or "（未命名）")
+        if column == 2:
+            return str(record.get("captured_nickname") or "（空白已确认）")
+        if column == 3:
+            return str(record.get("douyin_id") or "—")
+        if column == 4:
+            return _watchlist_state_label(record)
+        if column == 7:
+            return str(len(record.get("review_history", ())))
+        if column == 8:
+            number = record.get("promoted_a_number")
+            return f"A{number}" if number is not None else "—"
+        if column == 6:
+            return "、".join(WATCHLIST_REASON_LABELS.get(str(reason), str(reason))
+                            for reason in record.get("reasons", ())) or "—"
+        if column == 5:
+            return (
+                f"{_watchlist_due_label(record, self.reminder_now)} · {_watchlist_date_label(record.get('next_review_at'))}"
+                if record.get("state") == "watching" else _watchlist_due_label(record)
+            )
+        return None
+
+    def headerData(
+        self,
+        section: int,
+        orientation: Qt.Orientation,
+        role: int = Qt.ItemDataRole.DisplayRole,
+    ) -> object:
+        if role == Qt.ItemDataRole.DisplayRole and orientation == Qt.Orientation.Horizontal:
+            return self.HEADERS[section]
+        return super().headerData(section, orientation, role)
+
+    def _rebuild_visible_rows(self) -> None:
+        self._visible_rows = tuple(record for record in self._rows if self._matches(record))
+
+    def _matches(self, record: dict[str, Any]) -> bool:
+        state = str(record.get("state"))
+        if self._state_filter != "all" and state != self._state_filter:
+            return False
+        if self._due_filter != "all":
+            due_label = _watchlist_due_label(record, self.reminder_now)
+            if self._due_filter == "due" and due_label not in ("已到期", "已超期"):
+                return False
+            if self._due_filter == "overdue" and due_label != "已超期":
+                return False
+            if self._due_filter == "upcoming" and due_label != "待复查":
+                return False
+        if not self._search:
+            return True
+        haystack = " ".join(
+            (
+                str(record.get("w_id", "")),
+                str(record.get("display_name", "")),
+                str(record.get("captured_nickname", "")),
+                str(record.get("douyin_id", "")),
+                str(record.get("note", "")),
+                " ".join(str(item) for item in record.get("reasons", ())),
+            )
+        ).casefold()
+        return self._search in haystack
+
+
+class WatchlistReviewDialog(QDialog):
+    """Review editor with local dates/times and read-only captured identity."""
+
+    REASONS = tuple(WATCHLIST_REASON_LABELS.items())
+
+    def __init__(self, record: dict[str, Any], *, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"复查观察记录 W{record['w_id']}")
+        self.setModal(True)
+        self._result: tuple[list[str], str, str, str] | None = None
+        root = QVBoxLayout(self)
+        root.setContentsMargins(24, 20, 24, 20)
+        root.setSpacing(16)
+        title = QLabel(f"复查记录 · W{record['w_id']}")
+        title.setObjectName("modernSectionTitle")
+        root.addWidget(title)
+        identity = QFormLayout()
+        identity.setVerticalSpacing(8)
+        for label, value in (("采集昵称", record.get("captured_nickname") or "（空白已确认）"),
+                             ("抖音号", record.get("douyin_id") or "—")):
+            text = QLabel(str(value))
+            text.setWordWrap(True)
+            text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            identity.addRow(label, text)
+        root.addLayout(identity)
+
+        reasons_box = QWidget()
+        reasons_layout = QGridLayout(reasons_box)
+        reasons_layout.setContentsMargins(0, 0, 0, 0)
+        reasons_layout.setVerticalSpacing(12)
+        self.reason_checks: dict[str, QCheckBox] = {}
+        current_reasons = set(record.get("reasons", ()))
+        for index, (value, label) in enumerate(self.REASONS):
+            checkbox = QCheckBox(label)
+            checkbox.setChecked(value in current_reasons)
+            self.reason_checks[value] = checkbox
+            reasons_layout.addWidget(checkbox, index // 3, index % 3)
+        form = QFormLayout()
+        form.setVerticalSpacing(12)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.display_name_edit = QLineEdit(str(record.get("display_name") or ""))
+        self.display_name_edit.setMaxLength(256)
+        form.addRow("观察名称", self.display_name_edit)
+        form.addRow("观察原因", reasons_box)
+        self.note_edit = QTextEdit()
+        self.note_edit.setPlainText(str(record.get("note") or ""))
+        self.note_edit.setFixedHeight(112)
+        form.addRow("备注", self.note_edit)
+        default_review = record.get("next_review_at")
+        if not isinstance(default_review, str) or not default_review:
+            default_review = (
+                datetime.now(timezone.utc) + timedelta(days=7)
+            ).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self._original_review = default_review
+        self.review_mode = QComboBox()
+        for label, value in (("保留原提醒", "keep"), ("7天后", 7), ("15天后", 15),
+                             ("30天后", 30), ("45天后", 45), ("90天后", 90),
+                             ("自定义日期和时间", "custom")):
+            self.review_mode.addItem(label, value)
+        self.review_date = QDateEdit()
+        self.review_date.setDisplayFormat("yyyy-MM-dd")
+        self.review_date.setCalendarPopup(True)
+        local_review = parse_utc(default_review).astimezone()
+        self.review_date.setDate(QDate(local_review.year, local_review.month, local_review.day))
+        self.review_date.setEnabled(False)
+        self.review_time = QTimeEdit()
+        self.review_time.setDisplayFormat("HH:mm")
+        self.review_time.setButtonSymbols(QTimeEdit.ButtonSymbols.NoButtons)
+        self.review_time.setTime(QTime(local_review.hour, local_review.minute))
+        self.review_time.setEnabled(False)
+        reminder_row = QHBoxLayout()
+        reminder_row.addWidget(self.review_mode)
+        reminder_row.addWidget(self.review_date, 1)
+        reminder_row.addWidget(self.review_time)
+        form.addRow("下次复查", reminder_row)
+        self.review_time_label = QLabel(local_review.strftime("本地时间 %Y-%m-%d %H:%M"))
+        self.review_time_label.setWordWrap(True)
+        form.addRow("", self.review_time_label)
+        self.review_mode.currentIndexChanged.connect(self._review_mode_changed)
+        self.review_date.dateChanged.connect(self._review_date_changed)
+        self.review_time.timeChanged.connect(self._review_time_changed)
+        root.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        self.save_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.cancel_button = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        self.save_button.setText("保存复查")
+        self.cancel_button.setText("取消")
+        root.addWidget(buttons)
+        from douk_manager.ui.pages.legacy_page import mark_legacy_descendants
+        self.setProperty("legacyRoot", True)
+        self.setProperty("modernUi", True)
+        mark_legacy_descendants(self)
+        self.save_button.setProperty("legacyRole", "primary")
+        self.cancel_button.setProperty("legacyRole", "secondary")
+        from douk_manager.ui.theme.theme_manager import ThemeManager
+        self._review_theme = getattr(parent, "_modern_theme", None) or ThemeManager(parent=self)
+        self._review_theme.theme_changed.connect(self._apply_review_theme)
+        self._apply_review_theme()
+        self.resize(620, 530)
+
+    def _apply_review_theme(self, *_args) -> None:
+        p = self._review_theme.palette
+        self.setObjectName("watchlistReviewDialog")
+        self.setStyleSheet(self._review_theme.stylesheet() + f"""
+QDialog#watchlistReviewDialog {{ background: {p.surface}; color: {p.text_primary}; }}
+QDialog#watchlistReviewDialog QLabel {{ color: {p.text_primary}; font-size: 13px; }}
+QDialog#watchlistReviewDialog QLabel#modernSectionTitle {{ font-size: 18px; font-weight: 700; }}
+QDialog#watchlistReviewDialog QCheckBox {{ color: {p.text_primary}; spacing: 6px; }}
+QDialog#watchlistReviewDialog QCheckBox::indicator:unchecked {{
+    width: 14px; height: 14px;
+    border: 2px solid {p.text_secondary};
+    border-radius: 3px;
+    background: {p.surface};
+}}
+QDialog#watchlistReviewDialog QCheckBox::indicator:unchecked:hover,
+QDialog#watchlistReviewDialog QCheckBox::indicator:unchecked:focus {{
+    border-color: {p.primary};
+}}
+QDialog#watchlistReviewDialog QCalendarWidget QWidget {{ background: {p.surface}; color: {p.text_primary}; }}
+""")
+
+    def _review_mode_changed(self) -> None:
+        mode = self.review_mode.currentData()
+        custom = mode == "custom"
+        self.review_date.setEnabled(custom)
+        self.review_time.setEnabled(custom)
+        if mode == "keep":
+            local = parse_utc(self._original_review).astimezone()
+            self.review_date.setDate(QDate(local.year, local.month, local.day))
+            self.review_time.setTime(QTime(local.hour, local.minute))
+        elif isinstance(mode, int):
+            local = (datetime.now(timezone.utc) + timedelta(days=mode)).astimezone()
+            self.review_date.setDate(QDate(local.year, local.month, local.day))
+            self.review_time.setTime(QTime(local.hour, local.minute))
+        self._review_date_changed()
+
+    def _review_date_changed(self) -> None:
+        mode = self.review_mode.currentData()
+        if mode == "keep":
+            local = parse_utc(self._original_review).astimezone()
+        elif isinstance(mode, int):
+            local = (datetime.now(timezone.utc) + timedelta(days=mode)).astimezone()
+        else:
+            day = self.review_date.date()
+            clock = self.review_time.time()
+            local = datetime(day.year(), day.month(), day.day(), clock.hour(), clock.minute())
+        self.review_time_label.setText(local.strftime("本地时间 %Y-%m-%d %H:%M"))
+
+    def _review_time_changed(self) -> None:
+        self._review_date_changed()
+
+    def _selected_review_time(self) -> str:
+        mode = self.review_mode.currentData()
+        if mode == "keep":
+            return self._original_review
+        if isinstance(mode, int):
+            return (datetime.now(timezone.utc) + timedelta(days=mode)).replace(microsecond=0).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+        day = self.review_date.date()
+        clock = self.review_time.time()
+        local = datetime(day.year(), day.month(), day.day(), clock.hour(), clock.minute())
+        return local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    @property
+    def result(self) -> tuple[list[str], str, str, str] | None:
+        return self._result
+
+    def _accept(self) -> None:
+        reasons = [value for value, checkbox in self.reason_checks.items() if checkbox.isChecked()]
+        note = self.note_edit.toPlainText()
+        next_review_at = self._selected_review_time()
+        if not reasons:
+            QMessageBox.warning(self, "缺少观察原因", "至少选择一个观察原因。")
+            return
+        if "other" in reasons and not note.strip():
+            QMessageBox.warning(self, "需要备注", "选择“其他”时必须填写备注。")
+            return
+        try:
+            selected_time = parse_utc(next_review_at)
+            if self.review_mode.currentData() != "keep" and selected_time <= datetime.now(timezone.utc):
+                QMessageBox.warning(self, "提醒时间已过", "请选择尚未到达的本地日期和时间。")
+                return
+        except Exception:
+            QMessageBox.warning(self, "时间格式无效", "下次复查时间必须是 UTC RFC3339 格式。")
+            return
+        display_name = self.display_name_edit.text()
+        self._result = (reasons, note, next_review_at, display_name)
+        self.accept()
+
+
 class DashboardAccountTableModel(QAbstractTableModel):
     HEADERS = ("账号", "主状态", "异常附加", "证据来源")
 
@@ -636,6 +1038,11 @@ class DashboardAccountTableModel(QAbstractTableModel):
             expected = self._filter_mode.removeprefix("status:")
             return getattr(row.status, "value", row.status) == expected
         return False
+
+    def account_number_at(self, row: int) -> int | None:
+        if row < 0 or row >= len(self._visible_rows):
+            return None
+        return self._visible_rows[row].a_number
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self._visible_rows)
@@ -933,6 +1340,9 @@ class MainWindow(QMainWindow):
         self._result_render_cursor = 0
         self._result_render_runs = 0
         self._result_render_incomplete_old_runs = 0
+        self._result_sorting_enabled_before_render = False
+        self._result_sort_column_before_render = 0
+        self._result_sort_order_before_render = Qt.SortOrder.AscendingOrder
         self._latest_log_stats_run: Any | None = None
         self._pending_auto_log_stats_run: Any | None = None
         self._log_stats_result: LogStats | None = None
@@ -947,12 +1357,19 @@ class MainWindow(QMainWindow):
         self._account_audit_decisions: dict[int, Disposition] = {}
         self._account_audit_task_id: str | None = None
         self._account_audit_refresh_after_apply = False
+        self._profile_open_task_id: str | None = None
+        self._homepage_buttons: list[QPushButton] = []
+        self._watchlist_snapshot: WatchlistSnapshot | None = None
+        self._watchlist_refresh_task_id: str | None = None
+        self._watchlist_promotion_preview: PromotionPreview | None = None
+        self._watchlist_promotion_task_id: str | None = None
         self._queue_start_waiting_for_log_stats = False
         self._log_stats_auto_enabled = self._read_log_stats_auto_enabled()
         self._collector_stop_task_id: str | None = None
         self.startup_generation = 0
         self._startup_task_id: str | None = None
         self._startup_result: StartupSafetyResult | None = None
+        self._startup_restore_recheck_source: Path | None = None
         self._close_pending = False
         self._close_notice_active = False
         self._safe_widgets: list[QWidget] = []
@@ -998,6 +1415,45 @@ class MainWindow(QMainWindow):
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self._poll_processes)
         self.poll_timer.start(500)
+        self._reminder_tick = time.monotonic()
+        self._reminder_wall = datetime.now(timezone.utc)
+        self._reminder_offset = self._reminder_wall.astimezone().utcoffset()
+        self._reminder_refresh_tick = self._reminder_tick
+        self.watchlist_reminder_timer = QTimer(self)
+        self.watchlist_reminder_timer.timeout.connect(self._tick_watchlist_reminders)
+        self.watchlist_reminder_timer.start(1000)
+
+    def _tick_watchlist_reminders(self) -> None:
+        if self.controller.startup_state is StartupState.CLOSING:
+            return
+        now, tick = datetime.now(timezone.utc), time.monotonic()
+        elapsed = tick - self._reminder_tick
+        wall_elapsed = (now - self._reminder_wall).total_seconds()
+        changed = (abs(wall_elapsed - elapsed) > 2 or elapsed > 3
+                   or now.astimezone().utcoffset() != self._reminder_offset
+                   or now.astimezone().date() != self._reminder_wall.astimezone().date())
+        self._reminder_tick, self._reminder_wall = tick, now
+        self._reminder_offset = now.astimezone().utcoffset()
+        if changed or tick - self._reminder_refresh_tick >= 60:
+            self._reminder_refresh_tick = tick
+            self._refresh_watchlist_reminders(now)
+            self.refresh_watchlist(preserve_output=True, quiet=True)
+
+    def _refresh_watchlist_reminders(self, now=None) -> None:
+        selected = self._selected_watchlist_record()
+        scroll = self.watchlist_table.verticalScrollBar().value()
+        self.watchlist_model.refresh_reminders(now)
+        if selected:
+            for row in range(self.watchlist_model.rowCount()):
+                if self.watchlist_model.record_at(row)["w_id"] == selected["w_id"]:
+                    self.watchlist_table.selectRow(row)
+                    break
+        self.watchlist_table.verticalScrollBar().setValue(scroll)
+        summary = self.watchlist_model.reminder_summary()
+        self.watchlist_reminder_label.setText(
+            f"待处理 {summary['due']} · 超期 {summary['overdue']} · "
+            f"显示 {self.watchlist_model.visible_count} / {self.watchlist_model.total_count}")
+        self._watchlist_selection_changed()
 
     def _read_log_stats_auto_enabled(self) -> bool:
         settings = getattr(self._window_state_store, "_settings", None)
@@ -1073,6 +1529,7 @@ class MainWindow(QMainWindow):
             widget.setEnabled(diagnostic_enabled)
         for widget in self._safe_widgets:
             widget.setEnabled(safe_enabled)
+        self._update_startup_restore_button()
         dashboard_enabled = state is StartupState.READY
         if hasattr(self, "dashboard_refresh_button"):
             self.dashboard_refresh_button.setEnabled(dashboard_enabled)
@@ -1124,9 +1581,202 @@ class MainWindow(QMainWindow):
             self.account_audit_clear_button.setEnabled(decision_ready)
             for button in self.account_audit_decision_buttons:
                 button.setEnabled(decision_ready)
+        self._update_watchlist_button_states()
+        self._update_profile_button_states()
+
+    def _selected_result_a_number(self) -> int | None:
+        if not hasattr(self, "result_table"):
+            return None
+        rows = self.result_table.selectionModel().selectedRows()
+        if len(rows) != 1:
+            return None
+        item = self.result_table.item(rows[0].row(), 1)
+        if item is None:
+            return None
+        value = item.text().strip()
+        if value[:1].casefold() != "a":
+            return None
+        number = value[1:].strip()
+        if not number.isdecimal():
+            return None
+        parsed = int(number)
+        return parsed if parsed >= 1 else None
+
+    def _selected_dashboard_a_number(self) -> int | None:
+        if not hasattr(self, "dashboard_account_table"):
+            return None
+        rows = self.dashboard_account_table.selectionModel().selectedRows(0)
+        if len(rows) != 1:
+            return None
+        return self._dashboard_account_model.account_number_at(rows[0].row())
+
+    def _selected_account_audit_a_number(self) -> int | None:
+        if not hasattr(self, "account_audit_table"):
+            return None
+        rows = self.account_audit_table.selectionModel().selectedRows(0)
+        if len(rows) != 1:
+            return None
+        entry = self._account_audit_model.entry_at(rows[0].row())
+        return None if entry is None else entry.a_number
+
+    def _profile_open_is_active(self) -> bool:
+        return any(
+            binding.generation_key == "profile_url_resolve"
+            for binding in self._background_bindings.values()
+        )
+
+    def _update_profile_button_states(self) -> None:
+        homepage_buttons = getattr(self, "_homepage_buttons", ())
+        if not homepage_buttons:
+            return
+        for button in homepage_buttons:
+            button.setEnabled(False)
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        if self._profile_open_is_active():
+            return
+        selections = (
+            (
+                getattr(self, "result_open_home_button", None),
+                self._selected_result_a_number(),
+            ),
+            (
+                getattr(self, "dashboard_open_home_button", None),
+                self._selected_dashboard_a_number(),
+            ),
+            (
+                getattr(self, "account_audit_open_home_button", None),
+                self._selected_account_audit_a_number(),
+            ),
+        )
+        for button, a_number in selections:
+            if button is not None and a_number is not None:
+                button.setEnabled(True)
+
+    def _profile_selection_matches(self, source: str, a_number: int) -> bool:
+        selected = {
+            "result": self._selected_result_a_number,
+            "dashboard": self._selected_dashboard_a_number,
+            "audit": self._selected_account_audit_a_number,
+        }.get(source)
+        return selected is not None and selected() == a_number
+
+    def _open_result_profile(self) -> None:
+        self._open_profile_for_selection("result", self._selected_result_a_number())
+
+    def _open_dashboard_profile(self) -> None:
+        self._open_profile_for_selection(
+            "dashboard", self._selected_dashboard_a_number()
+        )
+
+    def _open_account_audit_profile(self) -> None:
+        self._open_profile_for_selection(
+            "audit", self._selected_account_audit_a_number()
+        )
+
+    def _open_profile_for_selection(self, source: str, a_number: int | None) -> None:
+        if a_number is None:
+            QMessageBox.information(self, "打开主页", "请先选择一个账号。")
+            self._update_profile_button_states()
+            return
+        self._submit_profile_open(source, a_number)
+
+    def _submit_profile_open(self, source: str, a_number: int) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        spec = TaskSpec(
+            task_type="profile_url_resolve",
+            display_name="读取账号主页地址",
+            resource_keys=frozenset({"settings"}),
+            deduplicate_key="profile_url_resolve",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            refresh_targets=(),
+            dynamic_cancellation=True,
+        )
+        task_id = self._submit_coalesced_background(
+            spec,
+            lambda context: self.controller.resolve_profile_url(
+                a_number, context=context
+            ),
+            buttons=tuple(self._homepage_buttons),
+            on_success=lambda resolution: self._apply_profile_resolution(
+                resolution, source, a_number
+            ),
+            on_failure=lambda _payload: self._profile_resolution_failed(
+                source, a_number
+            ),
+            on_cancelled=lambda _payload: self._profile_open_cancelled(),
+            on_removed=self._profile_open_removed,
+            generation_key="profile_url_resolve",
+        )
+        if task_id is not None:
+            self._profile_open_task_id = task_id
+        self._update_profile_button_states()
+
+    def _apply_profile_resolution(
+        self,
+        resolution: object,
+        source: str,
+        a_number: int,
+    ) -> None:
+        if not self._profile_selection_matches(source, a_number):
+            return
+        if not isinstance(resolution, ProfileUrlResolution):
+            self._profile_resolution_failed(source, a_number)
+            return
+        if getattr(resolution.reference, "a_number", None) != a_number:
+            return
+        if resolution.status is ProfileUrlStatus.MISSING:
+            self._show_profile_resolution_message(a_number, "账号主页地址不存在。")
+            return
+        if resolution.status is ProfileUrlStatus.INVALID:
+            self._show_profile_resolution_message(a_number, "账号主页地址无效。")
+            return
+        if resolution.status is ProfileUrlStatus.READ_ERROR:
+            self._show_profile_resolution_message(
+                a_number, "无法读取账号主页地址，请先处理数据错误。"
+            )
+            return
+        if resolution.status is not ProfileUrlStatus.FOUND or not resolution.url:
+            self._profile_resolution_failed(source, a_number)
+            return
+        try:
+            admitted_url = strict_admit_url(resolution.url)
+        except (ProfileUrlError, TypeError):
+            self._show_profile_resolution_message(a_number, "账号主页地址无效。")
+            return
+        if not QDesktopServices.openUrl(QUrl(admitted_url)):
+            self._show_profile_resolution_message(a_number, "默认浏览器打开主页失败。")
+            return
+        self.statusBar().showMessage(f"已请求默认浏览器打开 A{a_number} 主页")
+
+    def _show_profile_resolution_message(self, a_number: int, reason: str) -> None:
+        QMessageBox.information(self, "无法打开主页", f"A{a_number}：{reason}")
+
+    def _profile_resolution_failed(self, source: str, a_number: int) -> None:
+        if not self._profile_selection_matches(source, a_number):
+            return
+        self._show_profile_resolution_message(
+            a_number, "无法读取账号主页地址，请先处理数据错误。"
+        )
+
+    def _profile_open_cancelled(self) -> None:
+        self.statusBar().showMessage("打开主页操作已取消。")
+
+    def _profile_open_removed(self) -> None:
+        self._profile_open_task_id = next(
+            (
+                task_id
+                for task_id, binding in self._background_bindings.items()
+                if binding.generation_key == "profile_url_resolve"
+            ),
+            None,
+        )
+        self._update_profile_button_states()
 
     def begin_startup_check(self) -> bool:
-        if self.controller.startup_state is StartupState.CLOSING:
+        if self._startup_check_blocked_by_closing():
             return False
         generation = max(
             self.startup_generation,
@@ -1145,6 +1795,7 @@ class MainWindow(QMainWindow):
                 paths=self.controller.paths,
                 engine=self.controller.engine,
                 backup=self.controller.backup,
+                activation_context=self.controller.watchlist_activation_context,
             )
             spec = TaskSpec(
                 task_type="startup_safety",
@@ -1162,6 +1813,12 @@ class MainWindow(QMainWindow):
             )
         except Exception as exc:
             self._startup_task_id = None
+            if self._startup_check_blocked_by_closing():
+                self.controller.logger.info(
+                    "关闭期间跳过启动安全检查排队：%s",
+                    exc,
+                )
+                return False
             self.controller.logger.exception("启动安全检查排队失败：%s", exc)
             self._apply_startup_failure(
                 generation,
@@ -1243,6 +1900,27 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             "启动安全检查通过" if result.success else "启动安全检查失败，已进入只读保护"
         )
+        restore_source = self._startup_restore_recheck_source
+        if restore_source is not None:
+            self._startup_restore_recheck_source = None
+            if result.success and self.controller.startup_state is StartupState.READY:
+                self._replace_info(
+                    self.settings_output,
+                    "Startup 观察数据恢复完成。",
+                    f"来源快照：{restore_source}",
+                    "W 高水位和请求收据已按不可回退规则合并；正式 Volume 未执行恢复。",
+                    "重新执行启动安全检查已完成，当前状态：READY；观察写入已恢复。",
+                )
+            else:
+                self._replace_info(
+                    self.settings_output,
+                    "Startup 观察数据已恢复，但重新执行启动安全检查未通过。",
+                    f"来源快照：{restore_source}",
+                    "W 高水位和请求收据已按不可回退规则合并；正式 Volume 未执行恢复。",
+                    f"当前状态：{self.controller.startup_state.value}",
+                    f"检查摘要：{result.summary}",
+                    f"技术详情：{result.details or '无额外技术详情。'}",
+                )
         QTimer.singleShot(0, self._refresh_noncritical_after_startup)
         return True
 
@@ -1260,8 +1938,17 @@ class MainWindow(QMainWindow):
             self.refresh_results()
             return
         self.refresh_tasks()
-        if hasattr(self, "result_table"):
+        result_page_is_current = (
+            not hasattr(self, "modern_overview")
+            or (
+                hasattr(self, "tabs")
+                and self.tabs.currentIndex() == getattr(self, "result_tab_index", -1)
+            )
+        )
+        if hasattr(self, "result_table") and result_page_is_current:
             self.refresh_results()
+        if hasattr(self, "watchlist_page"):
+            self.refresh_watchlist()
 
     def _refresh_results_if_startup_applied(self) -> None:
         if self.isVisible() and self.controller.startup_state is StartupState.READY:
@@ -1276,9 +1963,23 @@ class MainWindow(QMainWindow):
     def _open_manager_log(self) -> None:
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.controller.log_path)))
 
+    def _startup_check_blocked_by_closing(self) -> bool:
+        return bool(
+            getattr(self, "_close_pending", False)
+            or getattr(self.coordinator, "is_closing", False)
+            or self.controller.startup_state is StartupState.CLOSING
+        )
+
+    def _stop_startup_recheck_timer(self) -> None:
+        timer = getattr(self, "startup_recheck_timer", None)
+        if timer is not None:
+            timer.stop()
+
     def _run_startup_recheck(self) -> None:
-        if self.isVisible():
-            self.begin_startup_check()
+        if not self.isVisible() or self._startup_check_blocked_by_closing():
+            MainWindow._stop_startup_recheck_timer(self)
+            return
+        self.begin_startup_check()
 
     @Slot()
     def _on_background_tasks_idle(self) -> None:
@@ -1313,6 +2014,80 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("路径已保存，等待重新检查")
         self.startup_recheck_timer.start(0)
 
+    def _update_startup_restore_button(self) -> None:
+        button = getattr(self, "startup_snapshot_restore_button", None)
+        edit = getattr(self, "startup_snapshot_edit", None)
+        if button is None or edit is None:
+            return
+        busy = any(
+            binding.generation_key == "startup_snapshot_restore"
+            for binding in self._background_bindings.values()
+        )
+        button.setEnabled(
+            not busy
+            and self.controller.startup_state
+            in (StartupState.READY, StartupState.DEGRADED_READ_ONLY)
+            and bool(edit.text().strip())
+        )
+
+    def _browse_startup_snapshot(self) -> None:
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "选择 Startup 快照目录",
+            str(self.controller.paths.backups / "Startup"),
+        )
+        if selected:
+            self.startup_snapshot_edit.setText(selected)
+
+    def _restore_startup_snapshot(self) -> None:
+        snapshot_text = self.startup_snapshot_edit.text().strip()
+        if not snapshot_text:
+            QMessageBox.information(self, "未选择快照", "请先选择一个有效的 Startup 快照目录。")
+            return
+        snapshot = Path(snapshot_text)
+        answer = QMessageBox.question(
+            self,
+            "确认恢复 Startup 观察数据",
+            "将恢复选定快照中的三个观察 Data 文件；W 高水位和请求收据会按不可回退规则合并。\n"
+            "正式 Volume、Excel、数据库和任务模板不会由此入口恢复。\n"
+            "恢复期间观察写入会被阻止，完成后会自动重新执行启动安全检查。\n\n"
+            f"快照：{snapshot}\n\n仍要继续吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        spec = TaskSpec(
+            task_type="startup_snapshot_restore",
+            display_name="恢复 Startup 观察数据",
+            resource_keys=frozenset({"startup_safety", "watchlist", "settings", "volume"}),
+            deduplicate_key="startup_snapshot_restore",
+            cancellable=False,
+            close_policy=ClosePolicy.WAIT,
+            refresh_targets=(),
+        )
+
+        def show_success(_result: object) -> None:
+            self._startup_restore_recheck_source = snapshot
+            self._replace_info(
+                self.settings_output,
+                "Startup 观察数据恢复完成。",
+                f"来源快照：{snapshot}",
+                "W 高水位和请求收据已按不可回退规则合并；正式 Volume 未执行恢复。",
+                "当前观察写入仍处于 blocked，正在重新执行启动安全检查。",
+            )
+            self._apply_action_gate()
+            if not self._startup_check_blocked_by_closing():
+                self.startup_recheck_timer.start(0)
+
+        self._submit_background(
+            spec,
+            lambda _token: self.controller.restore_startup_snapshot(snapshot),
+            output=self.settings_output,
+            buttons=(self.startup_snapshot_restore_button,),
+            on_success=show_success,
+        )
+
     def _build_ui(self) -> None:
         tabs = QTabWidget()
         self.tabs = tabs
@@ -1325,6 +2100,9 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._batch_tab(), "批次生成")
         tabs.addTab(self._queue_tab(), "下载队列")
         tabs.addTab(self._collector_tab(), "账号采集")
+        self.watchlist_page = self._watchlist_tab()
+        tabs.addTab(self.watchlist_page, "观察名单")
+        self.watchlist_tab_index = tabs.indexOf(self.watchlist_page)
         tabs.addTab(self._post_tab(), "截图与索引")
         tabs.addTab(self._settings_tab(), "路径与安全设置")
         self.result_page = self._result_tab()
@@ -1365,6 +2143,591 @@ class MainWindow(QMainWindow):
             and self.controller.startup_state is StartupState.READY
         ):
             self.refresh_result_dashboard()
+        if (
+            index == getattr(self, "watchlist_tab_index", -1)
+            and self.controller.startup_state is StartupState.READY
+        ):
+            self.refresh_watchlist()
+
+    def _apply_watchlist_filters(self) -> None:
+        if not hasattr(self, "watchlist_model"):
+            return
+        self.watchlist_model.set_filters(
+            str(self.watchlist_state_filter.currentData() or "all"),
+            str(self.watchlist_due_filter.currentData() or "all"),
+            self.watchlist_search_edit.text(),
+        )
+        self._refresh_watchlist_reminders()
+
+    def _selected_watchlist_record(self) -> dict[str, Any] | None:
+        table = getattr(self, "watchlist_table", None)
+        model = getattr(self, "watchlist_model", None)
+        if table is None or model is None or table.selectionModel() is None:
+            return None
+        rows = table.selectionModel().selectedRows()
+        if len(rows) != 1:
+            return None
+        return model.record_at(rows[0].row())
+
+    def _watchlist_selection_changed(self) -> None:
+        record = self._selected_watchlist_record()
+        preview = getattr(self, "_watchlist_promotion_preview", None)
+        if (
+            preview is not None
+            and (
+                record is None
+                or int(record.get("w_id", -1)) != preview.w_id
+                or self._watchlist_snapshot is None
+                or self._watchlist_snapshot.revision != preview.revision
+            )
+        ):
+            self._watchlist_promotion_preview = None
+        self._update_watchlist_button_states()
+
+    def _watchlist_task_is_active(self) -> bool:
+        active_keys = {
+            "watchlist_snapshot",
+            "watchlist_profile_url",
+            "watchlist_review",
+            "watchlist_promotion_preview",
+            "watchlist_promotion",
+            "watchlist_promotion_retry",
+            "watchlist_promotion_write",
+            "watchlist_archive",
+            "watchlist_restore",
+            "watchlist_delete",
+        }
+        return any(
+            binding.generation_key in active_keys
+            for binding in getattr(self, "_background_bindings", {}).values()
+        )
+
+    def _update_watchlist_button_states(self) -> None:
+        buttons = tuple(
+            getattr(self, name, None)
+            for name in (
+                "watchlist_open_button",
+                "watchlist_review_button",
+                "watchlist_preview_button",
+                "watchlist_confirm_button",
+                "watchlist_retry_button",
+                "watchlist_archive_button",
+                "watchlist_restore_button",
+                "watchlist_delete_button",
+            )
+        )
+        buttons = tuple(button for button in buttons if button is not None)
+        if not buttons:
+            return
+        for button in buttons:
+            button.setEnabled(False)
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        if self._watchlist_task_is_active():
+            return
+        record = self._selected_watchlist_record()
+        if record is None:
+            return
+        state = str(record.get("state"))
+        if state == "watching":
+            self.watchlist_open_button.setEnabled(True)
+            self.watchlist_review_button.setEnabled(True)
+            self.watchlist_preview_button.setEnabled(True)
+            self.watchlist_archive_button.setEnabled(True)
+            recovery = record.get("promotion_recovery")
+            preview = getattr(self, "_watchlist_promotion_preview", None)
+            if (
+                isinstance(recovery, dict)
+                and isinstance(preview, PromotionPreview)
+                and preview.w_id == int(record["w_id"])
+                and preview.formal_status == "retry_required"
+            ):
+                self.watchlist_retry_button.setEnabled(True)
+            elif (
+                isinstance(preview, PromotionPreview)
+                and preview.w_id == int(record["w_id"])
+                and preview.formal_status in {"available", "formal_exists", "recovery_ready"}
+            ):
+                self.watchlist_confirm_button.setEnabled(True)
+        elif state == "archived":
+            self.watchlist_open_button.setEnabled(True)
+            self.watchlist_restore_button.setEnabled(True)
+            self.watchlist_delete_button.setEnabled(True)
+        elif state == "promoted":
+            self.watchlist_open_button.setEnabled(True)
+
+    def refresh_watchlist(self, *, preserve_output: bool = False, quiet: bool = False) -> None:
+        if self.controller.startup_state is not StartupState.READY:
+            return
+        spec = TaskSpec(
+            task_type="watchlist_snapshot",
+            display_name="刷新观察名单",
+            resource_keys=frozenset({"watchlist"}),
+            deduplicate_key="watchlist_snapshot",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            dynamic_cancellation=True,
+        )
+        task_id = self._submit_coalesced_background(
+            spec,
+            lambda context: self.controller.watchlist_snapshot(context=context),
+            output=self.watchlist_output,
+            buttons=(self.watchlist_refresh_button,),
+            on_success=lambda snapshot: self._apply_watchlist_snapshot(
+                snapshot, preserve_output=preserve_output, quiet=quiet
+            ),
+            on_failure=self._watchlist_background_failed,
+            generation_key="watchlist_snapshot",
+        )
+        if task_id is not None:
+            self._watchlist_refresh_task_id = task_id
+
+    def _apply_watchlist_snapshot(
+        self, snapshot: object, *, preserve_output: bool = False, quiet: bool = False
+    ) -> None:
+        if not isinstance(snapshot, WatchlistSnapshot):
+            self._watchlist_background_failed("观察名单刷新结果无效。")
+            return
+        if quiet and snapshot == self._watchlist_snapshot:
+            self._refresh_watchlist_reminders()
+            return
+        self._watchlist_snapshot = snapshot
+        selected = self._selected_watchlist_record()
+        scroll = self.watchlist_table.verticalScrollBar().value()
+        self.watchlist_model.set_snapshot(snapshot)
+        self._watchlist_promotion_preview = None
+        self._apply_watchlist_filters()
+        if selected:
+            for row in range(self.watchlist_model.rowCount()):
+                if self.watchlist_model.record_at(row)["w_id"] == selected["w_id"]:
+                    self.watchlist_table.selectRow(row)
+                    break
+        self.watchlist_table.verticalScrollBar().setValue(scroll)
+        self._refresh_watchlist_reminders()
+        if quiet:
+            self._update_watchlist_button_states()
+            return
+        write_info = self._append_info if preserve_output else self._replace_info
+        write_info(
+            self.watchlist_output,
+            f"观察名单已刷新：显示 {self.watchlist_model.visible_count} / {self.watchlist_model.total_count} 条。",
+            f"W revision={snapshot.revision}；next_w_id={snapshot.next_w_id}。",
+            "页面未显示完整主页 URL；转正预览与正式写入结果会在此处说明。",
+        )
+        self._update_watchlist_button_states()
+
+    def _watchlist_background_failed(self, payload: object) -> None:
+        if self.controller.startup_state is StartupState.CLOSING:
+            return
+        message = payload.message if isinstance(payload, TaskFailure) else str(payload)
+        self._append_info(self.watchlist_output, f"【失败】{message}")
+        self.statusBar().showMessage("观察名单操作失败")
+        self._update_watchlist_button_states()
+
+    def _open_watchlist_profile(self) -> None:
+        record = self._selected_watchlist_record()
+        if record is None:
+            QMessageBox.information(self, "打开主页", "请先选择一个观察记录。")
+            return
+        w_id = int(record["w_id"])
+        spec = TaskSpec(
+            task_type="watchlist_profile_url",
+            display_name="读取观察账号主页地址",
+            resource_keys=frozenset({"watchlist"}),
+            deduplicate_key="watchlist_profile_url",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            dynamic_cancellation=True,
+        )
+
+        def show_result(url: object) -> None:
+            if not isinstance(url, str):
+                self._watchlist_background_failed("观察记录主页地址结果无效。")
+                return
+            try:
+                admitted_url = strict_admit_url(url)
+            except (ProfileUrlError, TypeError):
+                self._watchlist_background_failed("观察记录主页 URL 无法通过打开安全校验。")
+                return
+            if not QDesktopServices.openUrl(QUrl(admitted_url)):
+                self._watchlist_background_failed("默认浏览器打开观察账号主页失败。")
+                return
+            self._append_info(self.watchlist_output, f"已请求默认浏览器打开 W{w_id} 主页。")
+            self.statusBar().showMessage(f"已请求默认浏览器打开 W{w_id} 主页")
+
+        self._submit_coalesced_background(
+            spec,
+            lambda context: self.controller.watchlist_profile_url(w_id, context=context),
+            output=self.watchlist_output,
+            buttons=(self.watchlist_open_button,),
+            on_success=show_result,
+            on_failure=self._watchlist_background_failed,
+            generation_key="watchlist_profile_url",
+        )
+
+    def _review_watchlist(self) -> None:
+        record = self._selected_watchlist_record()
+        if record is None:
+            QMessageBox.information(self, "复查观察记录", "请先选择一个观察中的记录。")
+            return
+        if record.get("state") != "watching":
+            QMessageBox.information(self, "复查观察记录", "只有观察中的记录可以复查或编辑。")
+            return
+        if self._watchlist_snapshot is None:
+            self.refresh_watchlist()
+            return
+        revision = self._watchlist_snapshot.revision
+        dialog = WatchlistReviewDialog(record, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted or dialog.result is None:
+            return
+        reasons, note, next_review_at, display_name = dialog.result
+        w_id = int(record["w_id"])
+        spec = TaskSpec(
+            task_type="watchlist_review",
+            display_name="保存观察复查",
+            resource_keys=frozenset({"watchlist"}),
+            deduplicate_key="watchlist_review",
+            cancellable=False,
+            close_policy=ClosePolicy.WAIT,
+        )
+        self._submit_background(
+            spec,
+            lambda _token: self.controller.review_watchlist(
+                w_id,
+                expected_revision=revision,
+                reasons=reasons,
+                note=note,
+                next_review_at=next_review_at,
+                display_name=display_name,
+            ),
+            output=self.watchlist_output,
+            buttons=(self.watchlist_review_button,),
+            on_success=self._watchlist_mutation_succeeded,
+            on_failure=self._watchlist_background_failed,
+        )
+
+    def _preview_watchlist_promotion(self) -> None:
+        record = self._selected_watchlist_record()
+        if record is None or record.get("state") != "watching":
+            QMessageBox.information(self, "预览转正", "请先选择一个观察中的记录。")
+            return
+        if self._watchlist_snapshot is None:
+            self.refresh_watchlist()
+            return
+        w_id = int(record["w_id"])
+        revision = self._watchlist_snapshot.revision
+        spec = TaskSpec(
+            task_type="watchlist_promotion_preview",
+            display_name="预览观察账号转正",
+            resource_keys=frozenset({"watchlist", "settings", "volume", "collector_data"}),
+            deduplicate_key="watchlist_promotion_preview",
+            cancellable=True,
+            close_policy=ClosePolicy.CANCEL,
+            dynamic_cancellation=True,
+        )
+        self._submit_coalesced_background(
+            spec,
+            lambda context: self.controller.preview_watchlist_promotion(
+                w_id,
+                expected_revision=revision,
+                context=context,
+            ),
+            output=self.watchlist_output,
+            buttons=(self.watchlist_preview_button,),
+            on_success=self._apply_watchlist_promotion_preview,
+            on_failure=self._watchlist_background_failed,
+            generation_key="watchlist_promotion_preview",
+        )
+
+    def _apply_watchlist_promotion_preview(self, preview: object) -> None:
+        if not isinstance(preview, PromotionPreview):
+            self._watchlist_background_failed("转正预览结果无效。")
+            return
+        self._watchlist_promotion_preview = preview
+        if preview.formal_status in {"available", "formal_exists", "recovery_ready"}:
+            if preview.formal_status == "available":
+                target = f"预览目标：A{preview.next_a_number}；mark 将使用已采集身份。"
+            else:
+                target = f"正式目标已存在：A{preview.existing_a_number}；确认后只完成 W 恢复。"
+            self._replace_info(
+                self.watchlist_output,
+                f"W{preview.w_id} 转正预览通过。",
+                target,
+                f"captured_nickname：{preview.captured_nickname or '（空白已确认）'}；抖音号：{preview.douyin_id}。",
+                "未显示完整主页 URL；确认后必须先完成正式 JSON＋Excel 写入并复读，再将 W 标为已转正。",
+            )
+        elif preview.formal_status == "retry_required":
+            self._replace_info(
+                self.watchlist_output,
+                f"W{preview.w_id} 存在未完成转正意图。",
+                "只读联合检查未发现正式目标；不会自动重试。",
+                "请确认正式 JSON 与 Excel 均未出现目标后，点击“明确重试转正”。",
+            )
+        else:
+            self._replace_info(
+                self.watchlist_output,
+                f"W{preview.w_id} 转正预览状态：{preview.formal_status}。",
+                f"消息代码：{preview.message_code}。",
+            )
+        self._update_watchlist_button_states()
+
+    def _confirm_watchlist_promotion(self) -> None:
+        record = self._selected_watchlist_record()
+        preview = self._watchlist_promotion_preview
+        if (
+            record is None
+            or not isinstance(preview, PromotionPreview)
+            or self._watchlist_snapshot is None
+            or preview.w_id != int(record["w_id"])
+            or preview.revision != self._watchlist_snapshot.revision
+            or preview.formal_status not in {"available", "formal_exists", "recovery_ready"}
+        ):
+            QMessageBox.information(self, "确认转正", "请先刷新并完成当前记录的转正预览。")
+            return
+        answer = QMessageBox.question(
+            self,
+            "确认观察账号转正",
+            f"将把 W{preview.w_id} 转为正式账号。\n"
+            "正式 settings_master.json 与录制名单.xlsx 必须一起写入并复读成功，"
+            "之后才会更新观察状态。\n\n仍要继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._submit_watchlist_promotion(
+            w_id=preview.w_id,
+            revision=preview.revision,
+            retry_attempt_id=None,
+        )
+
+    def _retry_watchlist_promotion(self) -> None:
+        record = self._selected_watchlist_record()
+        preview = self._watchlist_promotion_preview
+        if (
+            record is None
+            or not isinstance(preview, PromotionPreview)
+            or self._watchlist_snapshot is None
+            or preview.w_id != int(record["w_id"])
+            or preview.revision != self._watchlist_snapshot.revision
+            or preview.formal_status != "retry_required"
+            or not isinstance(record.get("promotion_recovery"), dict)
+        ):
+            QMessageBox.information(self, "明确重试转正", "请先刷新并确认当前记录处于可明确重试状态。")
+            return
+        answer = QMessageBox.question(
+            self,
+            "明确重试观察账号转正",
+            f"只在你已确认正式 JSON 与 Excel 均未出现 W{preview.w_id} 目标时继续。\n"
+            "本操作会重新执行一次正式双文件事务，不会自动循环重试。\n\n仍要继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._submit_watchlist_promotion(
+            w_id=preview.w_id,
+            revision=preview.revision,
+            retry_attempt_id=str(record["promotion_recovery"]["attempt_id"]),
+        )
+
+    def _submit_watchlist_promotion(
+        self,
+        *,
+        w_id: int,
+        revision: int,
+        retry_attempt_id: str | None,
+    ) -> None:
+        retrying = retry_attempt_id is not None
+        spec = TaskSpec(
+            task_type="watchlist_promotion_retry" if retrying else "watchlist_promotion",
+            display_name="明确重试观察账号转正" if retrying else "确认观察账号转正",
+            resource_keys=frozenset(
+                {"startup_safety", "watchlist", "settings", "volume", "collector_data"}
+            ),
+            deduplicate_key="watchlist_promotion_write",
+            cancellable=False,
+            close_policy=ClosePolicy.WAIT,
+            critical_write_started=True,
+        )
+        if retrying:
+            action = lambda _token: self.controller.retry_watchlist_promotion(
+                w_id,
+                expected_revision=revision,
+                attempt_id=str(retry_attempt_id),
+            )
+        else:
+            action = lambda _token: self.controller.promote_watchlist(
+                w_id,
+                expected_revision=revision,
+            )
+        self._submit_background(
+            spec,
+            action,
+            output=self.watchlist_output,
+            buttons=(self.watchlist_confirm_button, self.watchlist_retry_button),
+            on_success=self._watchlist_promotion_succeeded,
+            on_failure=self._watchlist_promotion_failed,
+        )
+
+    def _watchlist_promotion_succeeded(self, result: object) -> None:
+        if not isinstance(result, PromotionResult):
+            self._watchlist_background_failed("转正结果无效。")
+            return
+        self._watchlist_promotion_preview = None
+        self._replace_info(
+            self.watchlist_output,
+            f"W{result.w_id} 已完成转正：A{result.a_number}。",
+            "正式 JSON＋Excel 已完成事务写入并通过复读；观察记录已更新为 promoted。",
+            "正在刷新观察名单显示。",
+        )
+        self.statusBar().showMessage(f"W{result.w_id} 已转正为 A{result.a_number}")
+        self.refresh_watchlist(preserve_output=True)
+
+    def _watchlist_promotion_failed(self, payload: object) -> None:
+        self._watchlist_promotion_preview = None
+        self._watchlist_background_failed(payload)
+        if self.controller.startup_state is StartupState.READY:
+            self.refresh_watchlist(preserve_output=True)
+
+    def _watchlist_mutation_succeeded(self, snapshot: object) -> None:
+        if not isinstance(snapshot, WatchlistSnapshot):
+            self._watchlist_background_failed("观察名单写入结果无效。")
+            return
+        self._watchlist_snapshot = snapshot
+        self.watchlist_model.set_snapshot(snapshot)
+        self._watchlist_promotion_preview = None
+        self._apply_watchlist_filters()
+        self._replace_info(
+            self.watchlist_output,
+            f"观察名单写入完成；当前 revision={snapshot.revision}。",
+            f"当前记录数：{self.watchlist_model.total_count}。",
+        )
+        self._update_watchlist_button_states()
+
+    def _archive_watchlist(self) -> None:
+        record = self._selected_watchlist_record()
+        if record is None or record.get("state") != "watching":
+            QMessageBox.information(self, "归档观察账号", "请先选择一个观察中的记录。")
+            return
+        if self._watchlist_snapshot is None:
+            self.refresh_watchlist()
+            return
+        w_id = int(record["w_id"])
+        answer = QMessageBox.question(
+            self,
+            "归档观察账号",
+            f"将归档 W{w_id}，保留其高水位与历史记录。仍要继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        revision = self._watchlist_snapshot.revision
+        spec = TaskSpec(
+            task_type="watchlist_archive",
+            display_name="归档观察账号",
+            resource_keys=frozenset({"watchlist"}),
+            deduplicate_key="watchlist_archive",
+            cancellable=False,
+            close_policy=ClosePolicy.WAIT,
+        )
+        self._submit_background(
+            spec,
+            lambda _token: self.controller.archive_watchlist(
+                w_id, expected_revision=revision
+            ),
+            output=self.watchlist_output,
+            buttons=(self.watchlist_archive_button,),
+            on_success=self._watchlist_mutation_succeeded,
+            on_failure=self._watchlist_background_failed,
+        )
+
+    def _restore_watchlist(self) -> None:
+        record = self._selected_watchlist_record()
+        if record is None or record.get("state") != "archived":
+            QMessageBox.information(self, "恢复观察账号", "请先选择一个已归档的记录。")
+            return
+        if self._watchlist_snapshot is None:
+            self.refresh_watchlist()
+            return
+        default_review = (
+            datetime.now(timezone.utc) + timedelta(days=7)
+        ).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+        next_review_at, accepted = QInputDialog.getText(
+            self,
+            "恢复观察账号",
+            "下一次复查时间（UTC RFC3339）",
+            QLineEdit.EchoMode.Normal,
+            default_review,
+        )
+        if not accepted:
+            return
+        try:
+            parse_utc(next_review_at.strip())
+        except Exception:
+            QMessageBox.warning(self, "时间格式无效", "下一次复查时间必须是 UTC RFC3339 格式。")
+            return
+        w_id = int(record["w_id"])
+        revision = self._watchlist_snapshot.revision
+        spec = TaskSpec(
+            task_type="watchlist_restore",
+            display_name="恢复观察账号",
+            resource_keys=frozenset({"watchlist"}),
+            deduplicate_key="watchlist_restore",
+            cancellable=False,
+            close_policy=ClosePolicy.WAIT,
+        )
+        self._submit_background(
+            spec,
+            lambda _token: self.controller.restore_watchlist(
+                w_id,
+                expected_revision=revision,
+                next_review_at=next_review_at.strip(),
+            ),
+            output=self.watchlist_output,
+            buttons=(self.watchlist_restore_button,),
+            on_success=self._watchlist_mutation_succeeded,
+            on_failure=self._watchlist_background_failed,
+        )
+
+    def _delete_archived_watchlist(self) -> None:
+        record = self._selected_watchlist_record()
+        if record is None or record.get("state") != "archived":
+            QMessageBox.information(self, "永久删除观察账号", "请先选择一个已归档的记录。")
+            return
+        if self._watchlist_snapshot is None:
+            self.refresh_watchlist()
+            return
+        w_id = int(record["w_id"])
+        answer = QMessageBox.question(
+            self,
+            "永久删除归档观察账号",
+            f"将永久删除已归档的 W{w_id}。高水位不会回退，且此操作不可撤销。\n\n仍要继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        revision = self._watchlist_snapshot.revision
+        spec = TaskSpec(
+            task_type="watchlist_delete",
+            display_name="永久删除归档观察账号",
+            resource_keys=frozenset({"watchlist"}),
+            deduplicate_key="watchlist_delete",
+            cancellable=False,
+            close_policy=ClosePolicy.WAIT,
+        )
+        self._submit_background(
+            spec,
+            lambda _token: self.controller.delete_archived_watchlist(
+                w_id, expected_revision=revision
+            ),
+            output=self.watchlist_output,
+            buttons=(self.watchlist_delete_button,),
+            on_success=self._watchlist_mutation_succeeded,
+            on_failure=self._watchlist_background_failed,
+        )
 
     def _overview_tab(self) -> QWidget:
         page = QWidget()
@@ -1485,6 +2848,7 @@ class MainWindow(QMainWindow):
             "跳过名单，可强制包含全部账号。"
         )
         self.task_private_days = self._spin(1, 3650, 3)
+        self.task_private_days.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
         self.task_private_days.setToolTip(
             "参考期限：扫描最近 N 天内的全部可解析下载任务日志。例如 3、7、15；"
             "若之后出现明确正常结果，账号会重新纳入。"
@@ -1541,9 +2905,15 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.account_audit_refresh_button)
         controls.addWidget(QLabel("连续错误阈值"))
         self.account_audit_error_threshold = self._spin(1, 100, 5)
+        self.account_audit_error_threshold.setButtonSymbols(
+            QSpinBox.ButtonSymbols.NoButtons
+        )
         controls.addWidget(self.account_audit_error_threshold)
         controls.addWidget(QLabel("最少证据轮次"))
         self.account_audit_minimum_runs = self._spin(1, 100, 3)
+        self.account_audit_minimum_runs.setButtonSymbols(
+            QSpinBox.ButtonSymbols.NoButtons
+        )
         controls.addWidget(self.account_audit_minimum_runs)
         self.account_audit_native_logs = QCheckBox("含原生日志分析（慢）")
         self.account_audit_native_logs.setChecked(False)
@@ -1554,6 +2924,16 @@ class MainWindow(QMainWindow):
             "这不是实时联网检测；分析结果仍只是建议，不会自动修改账号状态。"
         )
         controls.addWidget(self.account_audit_native_logs)
+        self.account_audit_open_home_button = QPushButton("打开主页")
+        self.account_audit_open_home_button.setToolTip(
+            "从当前正式主档按选中 A 编号读取并打开主页。"
+        )
+        self.account_audit_open_home_button.clicked.connect(
+            self._open_account_audit_profile
+        )
+        self.account_audit_open_home_button.setEnabled(False)
+        self._homepage_buttons.append(self.account_audit_open_home_button)
+        controls.addWidget(self.account_audit_open_home_button)
         controls.addStretch()
         self.account_audit_cancel_button = QPushButton("取消当前审计操作")
         self.account_audit_cancel_button.setEnabled(False)
@@ -1633,11 +3013,18 @@ class MainWindow(QMainWindow):
         self.account_audit_table.selectionModel().selectionChanged.connect(
             self._show_account_audit_selection_details
         )
+        self.account_audit_table.selectionModel().selectionChanged.connect(
+            self._update_profile_button_states
+        )
         layout.addWidget(self.account_audit_table, 1)
 
         self.account_audit_details = QTextEdit()
         self.account_audit_details.setReadOnly(True)
-        self.account_audit_details.setMaximumHeight(105)
+        self.account_audit_details.setMinimumHeight(180)
+        self.account_audit_details.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
         self.account_audit_details.setPlaceholderText(
             "选择一行查看建议理由及连续错误轮次。"
         )
@@ -1697,6 +3084,8 @@ class MainWindow(QMainWindow):
         self.batch_start = self._spin(1, 100000, 1)
         self.batch_end = self._spin(1, 100000, 1392)
         self.batch_size = self._spin(1, 100000, 250)
+        for spin in (self.batch_start, self.batch_end, self.batch_size):
+            spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
         self.batch_earliest_mode = self._earliest_combo()
         self.batch_earliest_value = QLineEdit()
         self.batch_earliest_value.setPlaceholderText("可为所有生成任务设置同一个 earliest")
@@ -1761,6 +3150,7 @@ class MainWindow(QMainWindow):
         self.queue_move_position.setRange(1, 1)
         self.queue_move_position.setSuffix(" 位")
         self.queue_move_position.setKeyboardTracking(False)
+        self.queue_move_position.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
         position_row.addWidget(self.queue_move_position, 1)
         order_layout.addLayout(position_row)
         self.queue_move_target.currentIndexChanged.connect(
@@ -1873,12 +3263,14 @@ class MainWindow(QMainWindow):
         self.task_refresh_button = refresh
         refresh.clicked.connect(self.refresh_tasks)
         activate = QPushButton("应用为正式 setting")
+        self.queue_activate_button = activate
         activate.setToolTip("只能勾选一个模板；将模板复制为下载器唯一读取的正式 setting。")
         activate.clicked.connect(self._activate_selected_task)
         run_current = QPushButton("运行当前 setting")
         run_current.setToolTip("直接运行当前正式 setting，不重新选择模板。")
         run_current.clicked.connect(self._start_current)
         run_queue = QPushButton("按顺序运行已选")
+        self.queue_run_button = run_queue
         run_queue.setToolTip("按列表当前顺序逐个激活并运行已勾选模板。")
         run_queue.clicked.connect(self._start_queue)
         native_logs = QPushButton("打开下载器日志")
@@ -1953,6 +3345,131 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.collector_output, 1)
         return page
 
+    def _watchlist_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        intro = QLabel(
+            "观察名单保存需要后续复查的合成账号意图。页面不显示完整主页 URL；"
+            "主页打开、复查、归档和 W→A 转正都经过当前管理器安全闸门。"
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        filters = QWidget(page)
+        filter_layout = QHBoxLayout(filters)
+        filter_layout.setContentsMargins(0, 0, 0, 0)
+        filter_layout.addWidget(QLabel("状态"))
+        self.watchlist_state_filter = QComboBox()
+        for label, value in (
+            ("全部", "all"),
+            ("观察中", "watching"),
+            ("已转正", "promoted"),
+            ("已归档", "archived"),
+        ):
+            self.watchlist_state_filter.addItem(label, value)
+        self._mark_safe_widget(self.watchlist_state_filter)
+        filter_layout.addWidget(self.watchlist_state_filter)
+        filter_layout.addWidget(QLabel("复查"))
+        self.watchlist_due_filter = QComboBox()
+        for label, value in (
+            ("全部", "all"),
+            ("已到期", "due"),
+            ("已超期", "overdue"),
+            ("待复查", "upcoming"),
+        ):
+            self.watchlist_due_filter.addItem(label, value)
+        self._mark_safe_widget(self.watchlist_due_filter)
+        filter_layout.addWidget(self.watchlist_due_filter)
+        self.watchlist_search_edit = QLineEdit()
+        self.watchlist_search_edit.setPlaceholderText("搜索 W 编号、名称、采集昵称、抖音号、备注或原因")
+        self._mark_safe_widget(self.watchlist_search_edit)
+        filter_layout.addWidget(self.watchlist_search_edit, 1)
+        self.watchlist_refresh_button = self._mark_safe_widget(QPushButton("刷新观察名单"))
+        self.watchlist_refresh_button.clicked.connect(self.refresh_watchlist)
+        filter_layout.addWidget(self.watchlist_refresh_button)
+        layout.addWidget(filters)
+        self.watchlist_reminder_label = QLabel("观察提醒待加载")
+        layout.addWidget(self.watchlist_reminder_label)
+
+        self.watchlist_model = WatchlistTableModel(self)
+        self.watchlist_table = QTableView()
+        self.watchlist_table.setObjectName("watchlistTable")
+        self.watchlist_table.setModel(self.watchlist_model)
+        self.watchlist_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.watchlist_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.watchlist_table.setAlternatingRowColors(True)
+        self.watchlist_table.setSortingEnabled(False)
+        self.watchlist_table.verticalHeader().setVisible(False)
+        self.watchlist_table.horizontalHeader().setStretchLastSection(True)
+        # Qt's default scans up to 1000 rows repeatedly on stylesheet changes.
+        self.watchlist_table.horizontalHeader().setResizeContentsPrecision(0)
+        self.watchlist_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.watchlist_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
+        )
+        self.watchlist_table.horizontalHeader().setSectionResizeMode(
+            6, QHeaderView.ResizeMode.Stretch
+        )
+        self.watchlist_table.selectionModel().selectionChanged.connect(
+            lambda *_args: self._watchlist_selection_changed()
+        )
+        layout.addWidget(self.watchlist_table, 1)
+
+        actions = QWidget(page)
+        actions_layout = QHBoxLayout(actions)
+        actions_layout.setContentsMargins(0, 0, 0, 0)
+        self.watchlist_open_button = QPushButton("打开主页")
+        self.watchlist_open_button.clicked.connect(self._open_watchlist_profile)
+        self.watchlist_review_button = QPushButton("复查/编辑")
+        self.watchlist_review_button.clicked.connect(self._review_watchlist)
+        self.watchlist_preview_button = QPushButton("预览转正")
+        self.watchlist_preview_button.clicked.connect(self._preview_watchlist_promotion)
+        self.watchlist_confirm_button = QPushButton("确认转正")
+        self.watchlist_confirm_button.clicked.connect(self._confirm_watchlist_promotion)
+        self.watchlist_retry_button = QPushButton("明确重试转正")
+        self.watchlist_retry_button.clicked.connect(self._retry_watchlist_promotion)
+        self.watchlist_archive_button = QPushButton("归档")
+        self.watchlist_archive_button.clicked.connect(self._archive_watchlist)
+        self.watchlist_restore_button = QPushButton("恢复观察")
+        self.watchlist_restore_button.clicked.connect(self._restore_watchlist)
+        self.watchlist_delete_button = QPushButton("永久删除归档")
+        self.watchlist_delete_button.clicked.connect(self._delete_archived_watchlist)
+        for button in (
+            self.watchlist_open_button,
+            self.watchlist_review_button,
+            self.watchlist_preview_button,
+            self.watchlist_confirm_button,
+            self.watchlist_retry_button,
+            self.watchlist_archive_button,
+            self.watchlist_restore_button,
+            self.watchlist_delete_button,
+        ):
+            actions_layout.addWidget(button)
+        actions_layout.addStretch()
+        layout.addWidget(actions)
+
+        self.watchlist_output = QTextEdit()
+        self.watchlist_output.setReadOnly(True)
+        self.watchlist_output.setPlaceholderText(
+            "刷新、预览与写入结果会显示在这里；不会输出完整主页 URL。"
+        )
+        layout.addWidget(self.watchlist_output, 0)
+
+        self.watchlist_state_filter.currentIndexChanged.connect(
+            lambda _index: self._apply_watchlist_filters()
+        )
+        self.watchlist_due_filter.currentIndexChanged.connect(
+            lambda _index: self._apply_watchlist_filters()
+        )
+        self.watchlist_search_edit.textChanged.connect(
+            lambda _text: self._apply_watchlist_filters()
+        )
+        self._watchlist_selection_changed()
+        return page
+
     def _post_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -2007,7 +3524,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         warning = QLabel(
             "正式 Volume 始终由 main.exe 所在目录推导，不能单独选择另一份数据库或主档。"
-            "自动备份只保存 settings_master.json、settings.json 和 DouK-Downloader.db，并按类别限制保留数量；"
+            "Startup 自动快照保存三个 Volume 文件和三个观察 Data 文件，最多保留 20 份；"
             "只有手动完整备份和下载引擎更新前才复制整个 Volume。"
         )
         warning.setWordWrap(True)
@@ -2039,6 +3556,44 @@ class MainWindow(QMainWindow):
             self._mark_path_widget(button)
             grid.addWidget(button, row, 2)
         layout.addWidget(box)
+
+        startup_box = QGroupBox("Startup 观察数据恢复")
+        startup_layout = QGridLayout(startup_box)
+        startup_note = QLabel(
+            "仅恢复观察名单、高水位和控制收据；正式 Volume 的恢复仍使用独立入口。"
+            "恢复完成后会保持 blocked，并自动重新执行完整启动安全检查。"
+        )
+        startup_note.setWordWrap(True)
+        startup_layout.addWidget(startup_note, 0, 0, 1, 4)
+        self.startup_snapshot_edit = QLineEdit()
+        self.startup_snapshot_edit.setPlaceholderText(
+            "选择 Backups\\Startup\\<timestamp> 快照目录"
+        )
+        self._mark_path_widget(self.startup_snapshot_edit)
+        self.startup_snapshot_edit.textChanged.connect(
+            self._update_startup_restore_button
+        )
+        startup_layout.addWidget(QLabel("Startup 快照"), 1, 0)
+        startup_layout.addWidget(self.startup_snapshot_edit, 1, 1)
+        self.startup_snapshot_browse_button = QPushButton("选择快照目录")
+        self._mark_path_widget(self.startup_snapshot_browse_button)
+        self.startup_snapshot_browse_button.clicked.connect(
+            self._browse_startup_snapshot
+        )
+        startup_layout.addWidget(self.startup_snapshot_browse_button, 1, 2)
+        self.startup_snapshot_open_button = QPushButton("打开 Startup 目录")
+        self._mark_path_widget(self.startup_snapshot_open_button)
+        self.startup_snapshot_open_button.clicked.connect(
+            lambda: self._open_path(self.controller.paths.backups / "Startup")
+        )
+        startup_layout.addWidget(self.startup_snapshot_open_button, 1, 3)
+        self.startup_snapshot_restore_button = QPushButton("恢复观察数据")
+        self._mark_path_widget(self.startup_snapshot_restore_button)
+        self.startup_snapshot_restore_button.clicked.connect(
+            self._restore_startup_snapshot
+        )
+        startup_layout.addWidget(self.startup_snapshot_restore_button, 2, 1)
+        layout.addWidget(startup_box)
 
         task_box = QGroupBox("下载与任务后续动作默认值")
         form = QFormLayout(task_box)
@@ -2194,6 +3749,14 @@ class MainWindow(QMainWindow):
         refresh_button.setToolTip("立即重新读取 Logs\\DownloadTasks 中的最新任务结果。")
         refresh_button.clicked.connect(self.refresh_results)
         filters.addWidget(refresh_button)
+        self.result_open_home_button = QPushButton("打开主页")
+        self.result_open_home_button.setToolTip(
+            "从当前正式主档按选中 A 编号读取并打开主页。"
+        )
+        self.result_open_home_button.clicked.connect(self._open_result_profile)
+        self.result_open_home_button.setEnabled(False)
+        self._homepage_buttons.append(self.result_open_home_button)
+        filters.addWidget(self.result_open_home_button)
         layout.addLayout(filters)
         self.result_table = QTableWidget(0, 6)
         self.result_table.setHorizontalHeaderLabels(
@@ -2201,8 +3764,15 @@ class MainWindow(QMainWindow):
         )
         self.result_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.result_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.result_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.result_table.setSortingEnabled(True)
         self.result_table.horizontalHeader().setStretchLastSection(True)
         self.result_table.cellDoubleClicked.connect(self._open_result_log)
+        self.result_table.itemSelectionChanged.connect(
+            self._update_profile_button_states
+        )
         self.result_table.setToolTip("双击“来源日志”单元格可直接打开对应任务日志。")
         layout.addWidget(self.result_table, 1)
         self.result_note = QLabel()
@@ -2346,6 +3916,14 @@ class MainWindow(QMainWindow):
         self.dashboard_account_search.setPlaceholderText("A 编号，例如 55")
         self.dashboard_account_search.setClearButtonEnabled(True)
         account_filters.addWidget(self.dashboard_account_search)
+        self.dashboard_open_home_button = QPushButton("打开主页")
+        self.dashboard_open_home_button.setToolTip(
+            "从当前正式主档按选中 A 编号读取并打开主页。"
+        )
+        self.dashboard_open_home_button.clicked.connect(self._open_dashboard_profile)
+        self.dashboard_open_home_button.setEnabled(False)
+        self._homepage_buttons.append(self.dashboard_open_home_button)
+        account_filters.addWidget(self.dashboard_open_home_button)
         self.dashboard_account_summary = QLabel("显示 0 / 0；需关注 0；无法归类 未知")
         self.dashboard_account_summary.setWordWrap(True)
         account_filters.addWidget(self.dashboard_account_summary, 1)
@@ -2385,6 +3963,9 @@ class MainWindow(QMainWindow):
         )
         self.dashboard_account_search.textChanged.connect(
             self._apply_dashboard_account_filter
+        )
+        self.dashboard_account_table.selectionModel().selectionChanged.connect(
+            self._update_profile_button_states
         )
         account_layout.addWidget(self.dashboard_account_table)
         layout.addWidget(account_box)
@@ -3250,9 +4831,23 @@ class MainWindow(QMainWindow):
         try:
             task_id = self.coordinator.start(spec, generation, action)
         except TaskRejectedError as exc:
+            technical_message = str(exc)
+            if technical_message.startswith("background task resource conflict:"):
+                message = f"{spec.display_name}暂未启动：相关数据正在由其他后台任务使用，请稍后重试。"
+            elif technical_message.startswith("duplicate background task:"):
+                message = f"{spec.display_name}正在进行，无需重复启动。"
+            elif technical_message == "background task coordinator is closing":
+                message = f"{spec.display_name}未启动：程序正在关闭。"
+            else:
+                message = f"{spec.display_name}暂未启动，请稍后重试。"
+            self.controller.logger.info(
+                "后台任务未启动：task_type=%s；原因=%s",
+                spec.task_type,
+                technical_message,
+            )
             if output is not None:
-                self._append_info(output, f"【未启动】{exc}")
-            self.statusBar().showMessage(str(exc))
+                self._append_info(output, f"【未启动】{message}")
+            self.statusBar().showMessage(message)
             return None
         self._background_generations[key] = generation
         self._background_bindings[task_id] = BackgroundTaskBinding(
@@ -3749,6 +5344,8 @@ class MainWindow(QMainWindow):
             self.refresh_results()
         if "result_dashboard" in targets and hasattr(self, "dashboard_task_selector"):
             self.refresh_result_dashboard(auto_refresh=True)
+        if "watchlist" in targets and hasattr(self, "watchlist_page"):
+            self.refresh_watchlist()
         if "runtime_status" in targets:
             self._refresh_status()
 
@@ -4095,12 +5692,18 @@ class MainWindow(QMainWindow):
         self._result_render_cursor = 0
         self._result_render_runs = len(snapshot.runs)
         self._result_render_incomplete_old_runs = snapshot.incomplete_old_runs
+        header = self.result_table.horizontalHeader()
+        self._result_sorting_enabled_before_render = self.result_table.isSortingEnabled()
+        self._result_sort_column_before_render = header.sortIndicatorSection()
+        self._result_sort_order_before_render = header.sortIndicatorOrder()
+        self.result_table.setSortingEnabled(False)
         self.result_table.setUpdatesEnabled(False)
         try:
             self.result_table.clearContents()
             self.result_table.setRowCount(len(filtered))
         finally:
             self.result_table.setUpdatesEnabled(True)
+        self._update_profile_button_states()
         self.result_note.setText(f"正在显示 {len(filtered)} 条账号结果……")
         self.result_render_timer.start(0)
 
@@ -4136,6 +5739,14 @@ class MainWindow(QMainWindow):
         self.result_last_refresh.setText(
             f"最近刷新：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
+        if self._result_sorting_enabled_before_render:
+            self.result_table.setSortingEnabled(True)
+            if self._result_sort_column_before_render >= 0:
+                self.result_table.sortItems(
+                    self._result_sort_column_before_render,
+                    self._result_sort_order_before_render,
+                )
+        self._update_profile_button_states()
 
     def refresh_results(self) -> None:
         if (
@@ -4566,7 +6177,11 @@ class MainWindow(QMainWindow):
                 self, "请勾选一个任务", "设为正式 settings.json 时必须且只能勾选一个任务。"
             )
             return
-        result = self._run(lambda: self.controller.activate_task(paths[0]), self.queue_output)
+        self._set_queue_action_active(self.queue_activate_button, True)
+        try:
+            result = self._run(lambda: self.controller.activate_task(paths[0]), self.queue_output)
+        finally:
+            self._set_queue_action_active(self.queue_activate_button, False)
         if result:
             self._append_info(
                 self.queue_output,
@@ -4580,6 +6195,15 @@ class MainWindow(QMainWindow):
                     f"{len(result.vetoed_numbers)} 个账号："
                     f"{compact_numbers(result.vetoed_numbers)}。",
                 )
+
+    @staticmethod
+    def _set_queue_action_active(button: QPushButton, active: bool) -> None:
+        if bool(button.property("queueActionActive")) == active:
+            return
+        button.setProperty("queueActionActive", active)
+        button.style().unpolish(button)
+        button.style().polish(button)
+        button.repaint()
 
     def _apply_queue_options(self) -> bool:
         values = {
@@ -5752,7 +7376,8 @@ class MainWindow(QMainWindow):
             self,
             "确认完整备份 Volume",
             "此操作会复制整个正式 Volume，可能占用数 GB 空间。\n\n"
-            "日常自动备份已经保存 3 个关键文件，无需频繁执行完整备份。\n\n"
+            "日常 Startup 自动快照已经保存 3 个 Volume 文件和 3 个观察 Data 文件；"
+            "此处仍会复制整个正式 Volume。\n\n"
             "仍要继续吗？",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
@@ -6704,6 +8329,7 @@ class MainWindow(QMainWindow):
                     ).values()
                 )
             )
+            MainWindow._stop_startup_recheck_timer(self)
             self._close_pending = True
             self.coordinator.begin_closing()
             self.controller.begin_closing()
@@ -6730,6 +8356,7 @@ class MainWindow(QMainWindow):
             return
         begin_closing = getattr(self.controller, "begin_closing", None)
         if callable(begin_closing):
+            MainWindow._stop_startup_recheck_timer(self)
             self.coordinator.begin_closing()
             begin_closing()
             self._apply_action_gate()

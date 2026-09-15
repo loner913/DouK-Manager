@@ -13,7 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEventLoop, QTimer
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import QApplication, QPushButton
+from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton
 
 from douk_manager import app as app_module
 from douk_manager.background import TaskFailure, TaskRejectedError, TaskState
@@ -73,6 +73,7 @@ class StartupGuiTests(unittest.TestCase):
         return window
 
     def _dispose_window(self, window: MainWindow) -> None:
+        window.controller.begin_closing()
         window.hide()
         window.deleteLater()
         self.app.processEvents()
@@ -214,6 +215,55 @@ class StartupGuiTests(unittest.TestCase):
             self.assertEqual(window.startup_generation, 2)
             self.assertIs(window.controller.startup_state, StartupState.SAFETY_CHECKING)
             self._dispose_window(window)
+
+    def test_restore_recheck_is_suppressed_once_close_begins(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window = self._window(Path(directory))
+            try:
+                window.controller.startup_state = StartupState.DEGRADED_READ_ONLY
+                window._close_pending = True
+                window.coordinator.start = Mock(
+                    side_effect=AssertionError("close must not submit startup recheck")
+                )
+                window.startup_recheck_timer.start(60_000)
+
+                window._run_startup_recheck()
+
+                window.coordinator.start.assert_not_called()
+                self.assertIs(
+                    window.controller.startup_state,
+                    StartupState.DEGRADED_READ_ONLY,
+                )
+                self.assertFalse(window.startup_recheck_timer.isActive())
+
+                window.controller.begin_closing()
+                window._close_pending = False
+                window.coordinator._closing = True
+                window._run_startup_recheck()
+
+                window.coordinator.start.assert_not_called()
+                self.assertIs(window.controller.startup_state, StartupState.CLOSING)
+            finally:
+                self._dispose_window(window)
+
+    def test_startup_submission_race_during_close_does_not_enter_degraded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window = self._window(Path(directory))
+            try:
+                window.controller.startup_state = StartupState.DEGRADED_READ_ONLY
+
+                def reject_after_close(*_args, **_kwargs):
+                    window.controller.begin_closing()
+                    raise TaskRejectedError("background task coordinator is closing")
+
+                window.coordinator.start = Mock(side_effect=reject_after_close)
+                self.assertFalse(window.begin_startup_check())
+
+                window.coordinator.start.assert_called_once()
+                self.assertIs(window.controller.startup_state, StartupState.CLOSING)
+                self.assertNotIn("只读保护", window.startup_summary_label.text())
+            finally:
+                self._dispose_window(window)
 
     def test_background_failure_keeps_message_and_traceback_in_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -408,6 +458,9 @@ class StartupGuiTests(unittest.TestCase):
             self.assertTrue(window.startup_copy_button.isEnabled())
             self.assertTrue(window.startup_log_button.isEnabled())
             self.assertTrue(window.startup_recheck_button.isEnabled())
+            self.assertTrue(window.startup_snapshot_browse_button.isEnabled())
+            self.assertTrue(window.startup_snapshot_open_button.isEnabled())
+            self.assertFalse(window.startup_snapshot_restore_button.isEnabled())
             buttons = {button.text(): button for button in window.findChildren(QPushButton)}
             for text in (
                 "创建并设为正式 settings.json",
@@ -421,6 +474,87 @@ class StartupGuiTests(unittest.TestCase):
                 self.assertIn(text, buttons)
                 self.assertFalse(buttons[text].isEnabled(), text)
             self._dispose_window(window)
+
+    def test_startup_snapshot_restore_uses_path_repair_gate_and_waiting_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window = self._window(Path(directory))
+            try:
+                window.controller.startup_state = StartupState.DEGRADED_READ_ONLY
+                window._apply_action_gate()
+                self.assertTrue(window.startup_snapshot_browse_button.isEnabled())
+                self.assertTrue(window.startup_snapshot_open_button.isEnabled())
+                self.assertFalse(window.startup_snapshot_restore_button.isEnabled())
+
+                snapshot = (
+                    Path(directory)
+                    / "manager"
+                    / "Backups"
+                    / "Startup"
+                    / "2026-09-13_00-00-00-000000"
+                )
+                window.startup_snapshot_edit.setText(str(snapshot))
+                self.assertTrue(window.startup_snapshot_restore_button.isEnabled())
+                window.controller.restore_startup_snapshot = Mock()
+                window._submit_background = Mock(return_value="restore-task")
+
+                with patch.object(
+                    QMessageBox, "question", return_value=QMessageBox.Yes
+                ):
+                    window._restore_startup_snapshot()
+
+                window._submit_background.assert_called_once()
+                spec = window._submit_background.call_args.args[0]
+                self.assertEqual(spec.task_type, "startup_snapshot_restore")
+                self.assertFalse(spec.cancellable)
+                self.assertEqual(spec.close_policy.value, "WAIT")
+                self.assertEqual(
+                    spec.resource_keys,
+                    frozenset({"startup_safety", "watchlist", "settings", "volume"}),
+                )
+                self.assertEqual(spec.refresh_targets, ())
+                self.assertEqual(
+                    window._submit_background.call_args.kwargs["buttons"],
+                    (window.startup_snapshot_restore_button,),
+                )
+                on_success = window._submit_background.call_args.kwargs["on_success"]
+                on_success(None)
+                output = window.settings_output.toPlainText()
+                self.assertIn("Startup 观察数据恢复完成", output)
+                self.assertIn("正式 Volume 未执行恢复", output)
+                self.assertIn("blocked", output)
+                self.assertTrue(window.startup_recheck_timer.isActive())
+                window.startup_recheck_timer.stop()
+
+                window.coordinator.start = Mock(return_value="startup-task")
+                window.refresh_tasks = Mock()
+                window.refresh_results = Mock()
+                self.assertTrue(window.begin_startup_check())
+                generation = window.startup_generation
+                self.assertTrue(window.apply_startup_result(make_result(generation)))
+                output = window.settings_output.toPlainText()
+                self.assertIn("重新执行启动安全检查已完成", output)
+                self.assertIn("当前状态：READY", output)
+                self.assertNotIn("正在重新执行启动安全检查", output)
+            finally:
+                self._dispose_window(window)
+
+    def test_startup_snapshot_restore_confirmation_cancel_does_not_submit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window = self._window(Path(directory))
+            try:
+                window.controller.startup_state = StartupState.DEGRADED_READ_ONLY
+                window._apply_action_gate()
+                window.startup_snapshot_edit.setText(
+                    str(Path(directory) / "synthetic-startup")
+                )
+                window._submit_background = Mock()
+                with patch.object(
+                    QMessageBox, "question", return_value=QMessageBox.No
+                ):
+                    window._restore_startup_snapshot()
+                window._submit_background.assert_not_called()
+            finally:
+                self._dispose_window(window)
 
     def test_stale_result_is_ignored_and_recheck_increments_generation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -59,10 +59,10 @@ class DevelopCiWorkflowTests(unittest.TestCase):
         self.assertIn("steps.identity.outputs.ref", self.workflow)
         self.assertIn("steps.identity.outputs.sha", self.workflow)
         self.assertIn("retention-days: 30", self.workflow)
-        self.assertIn('"Version: 0.1.6"', self.workflow)
+        self.assertIn('"Version: 0.1.7"', self.workflow)
         self.assertRegex(
             self.workflow,
-            r"name: DouK-Manager_Windows_X64-v0\.1\.6-\$\{\{ steps\.identity\.outputs\.ref \}\}-run-\$\{\{ github\.run_number \}\}-\$\{\{ steps\.identity\.outputs\.sha \}\}",
+            r"name: DouK-Manager_Windows_X64-v0\.1\.7-\$\{\{ steps\.identity\.outputs\.ref \}\}-run-\$\{\{ github\.run_number \}\}-\$\{\{ steps\.identity\.outputs\.sha \}\}",
         )
         self.assertIn("Get-FileHash -Algorithm SHA256", self.workflow)
         self.assertIn("DouK-Manager_Windows_X64.zip.sha256", self.workflow)

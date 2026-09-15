@@ -631,6 +631,83 @@ class ControllerRuntimeSafetyTests(unittest.TestCase):
                     with self.assertRaises(ControllerError):
                         operation()
 
+    def test_restore_startup_snapshot_is_recovery_exception_and_sets_degraded_gate(self) -> None:
+        state = self._startup_state()
+        with tempfile.TemporaryDirectory() as directory:
+            controller = self._degraded_controller(Path(directory))
+            snapshot = Path(directory) / "manager" / "Backups" / "Startup" / "synthetic"
+            context = Mock()
+            controller.backup.restore_startup_snapshot = Mock()
+
+            controller.restore_startup_snapshot(snapshot, context=context)
+
+            controller.backup.restore_startup_snapshot.assert_called_once_with(snapshot)
+            context.raise_if_cancelled.assert_called()
+            self.assertIsNone(controller.startup_backup)
+            self.assertIs(controller.startup_state, state.DEGRADED_READ_ONLY)
+            self.assertIn("等待重新执行启动安全检查", controller.read_only_reason)
+            controller.engine.external_running.assert_called_once_with()
+            controller.collector.health.assert_called_once_with()
+
+            controller.startup_state = state.READY
+            controller.backup.restore_startup_snapshot.reset_mock()
+            controller.restore_startup_snapshot(snapshot)
+            controller.backup.restore_startup_snapshot.assert_called_once_with(snapshot)
+
+    def test_restore_startup_snapshot_rejects_non_recovery_states_before_service_call(self) -> None:
+        state = self._startup_state()
+        with tempfile.TemporaryDirectory() as directory:
+            controller = self._degraded_controller(Path(directory))
+            controller.backup.restore_startup_snapshot = Mock()
+            snapshot = Path(directory) / "synthetic-startup"
+
+            for blocked_state in (state.BOOTSTRAPPING, state.SAFETY_CHECKING, state.CLOSING):
+                with self.subTest(state=blocked_state):
+                    controller.startup_state = blocked_state
+                    with self.assertRaises(ControllerError):
+                        controller.restore_startup_snapshot(snapshot)
+
+            controller.backup.restore_startup_snapshot.assert_not_called()
+
+    def test_restore_startup_snapshot_preserves_closing_state_when_close_begins_during_restore(self) -> None:
+        state = self._startup_state()
+        with tempfile.TemporaryDirectory() as directory:
+            controller = self._degraded_controller(Path(directory))
+            snapshot = Path(directory) / "synthetic-startup"
+            original_reason = controller.read_only_reason
+
+            def restore_and_begin_closing(_snapshot: Path) -> None:
+                controller.startup_state = state.CLOSING
+
+            controller.backup.restore_startup_snapshot = Mock(
+                side_effect=restore_and_begin_closing
+            )
+
+            controller.restore_startup_snapshot(snapshot)
+
+            controller.backup.restore_startup_snapshot.assert_called_once_with(snapshot)
+            self.assertIsNone(controller.startup_backup)
+            self.assertIs(controller.startup_state, state.CLOSING)
+            self.assertEqual(controller.read_only_reason, original_reason)
+
+    def test_restore_startup_snapshot_rejects_active_engine_or_collector(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = Path(directory) / "synthetic-startup"
+
+            engine_controller = self._degraded_controller(Path(directory) / "engine")
+            engine_controller.backup.restore_startup_snapshot = Mock()
+            engine_controller.engine.external_running.return_value = True
+            with self.assertRaises(ControllerError):
+                engine_controller.restore_startup_snapshot(snapshot)
+            engine_controller.backup.restore_startup_snapshot.assert_not_called()
+
+            collector_controller = self._degraded_controller(Path(directory) / "collector")
+            collector_controller.backup.restore_startup_snapshot = Mock()
+            collector_controller.collector.running = True
+            with self.assertRaises(ControllerError):
+                collector_controller.restore_startup_snapshot(snapshot)
+            collector_controller.backup.restore_startup_snapshot.assert_not_called()
+
     def test_degraded_read_only_accepts_path_reconfiguration_without_ready_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2016,7 +2093,16 @@ class ControllerRuntimeSafetyTests(unittest.TestCase):
         timeout = next(
             keyword.value for keyword in lock_call.keywords if keyword.arg == "timeout"
         )
-        self.assertEqual(ast.literal_eval(timeout), 3.0)
+        self.assertIsInstance(timeout, ast.IfExp)
+        self.assertEqual(ast.unparse(timeout.test), "observing")
+        self.assertEqual(ast.literal_eval(timeout.body), 0.0)
+        self.assertEqual(ast.literal_eval(timeout.orelse), 3.0)
+        thread_timeout = next(
+            keyword.value for keyword in lock_call.keywords if keyword.arg == "thread_timeout"
+        )
+        self.assertEqual(ast.unparse(thread_timeout.test), "observing")
+        self.assertEqual(ast.literal_eval(thread_timeout.body), 0.0)
+        self.assertEqual(ast.literal_eval(thread_timeout.orelse), -1)
 
     def test_collector_post_returns_busy_without_writes_when_shared_lock_is_held(
         self,

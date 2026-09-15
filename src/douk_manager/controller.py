@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -8,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from douk_manager.config import AppConfig, ManagedPaths, application_root, update_config
 from douk_manager.core.backup import BackupService
+from douk_manager.core.collector_service import FormalCollectorService
 from douk_manager.core.account_audit import (
     AccountAuditReport,
     AccountAuditService,
@@ -32,7 +34,7 @@ from douk_manager.core.engine_update import (
     EngineUpdateService,
 )
 from douk_manager.core.json_store import read_json
-from douk_manager.core.locks import critical_section
+from douk_manager.core.locks import LockBusyError, critical_section
 from douk_manager.core.selector import compact_numbers
 from douk_manager.core.settings_tasks import (
     ActivatedTask,
@@ -41,7 +43,21 @@ from douk_manager.core.settings_tasks import (
     SettingsTaskService,
 )
 from douk_manager.core.task_order import TaskOrderService
+from douk_manager.core.profile_url import (
+    FormalAccountRef,
+    ProfileUrlResolution,
+    ProfileUrlResolver,
+    ProfileUrlError,
+    strict_admit_url,
+)
 from douk_manager.core.result_history import RecentPrivateMatch, ResultHistoryService
+from douk_manager.core.watchlist import WatchlistService, WatchlistSnapshot
+from douk_manager.core.watchlist_session import ManagerInstanceLease
+from douk_manager.core.watchlist_promotion import (
+    PromotionPreview,
+    PromotionResult,
+    WatchlistPromotionService,
+)
 from douk_manager.core.result_dashboard import (
     DashboardFileFingerprint,
     ResultDashboardService,
@@ -50,7 +66,11 @@ from douk_manager.integrations.collector import CollectorService, MigrationResul
 from douk_manager.integrations.indexer import IndexResult, IndexService
 from douk_manager.integrations.screenshots import ScreenshotPreview, ScreenshotResult, ScreenshotService
 from douk_manager.logging_setup import setup_logging
-from douk_manager.startup import StartupSafetyResult, StartupState
+from douk_manager.startup import (
+    StartupSafetyResult,
+    StartupState,
+    WatchlistActivationContext,
+)
 
 if TYPE_CHECKING:
     from douk_manager.operation import OperationContext
@@ -68,14 +88,30 @@ class ManagerController:
     def __init__(self) -> None:
         self.root = application_root()
         default_paths = ManagedPaths.from_config(AppConfig(), self.root)
+        self.watchlist_activation_context = WatchlistActivationContext.capture(
+            default_paths
+        )
         default_paths.ensure_manager_directories()
         self.config = AppConfig.load(default_paths.config_file)
         self.paths = ManagedPaths.from_config(self.config, self.root)
         self.paths.ensure_manager_directories()
         self.logger, self.log_path = setup_logging(self.paths.manager_logs)
         self.startup_backup: Path | None = None
-        self.read_only_reason = ""
-        self.startup_state = StartupState.BOOTSTRAPPING
+        self.instance_lease = ManagerInstanceLease(self.paths.instance_lock_file)
+        self.instance_session_error = ""
+        try:
+            self.instance_lease.acquire()
+        except LockBusyError as exc:
+            self.instance_session_error = (
+                "当前管理器运行目录已被另一个管理器会话占用。"
+            )
+            self.logger.warning("管理器实例锁获取失败：%s", exc)
+        self.read_only_reason = self.instance_session_error
+        self.startup_state = (
+            StartupState.DEGRADED_READ_ONLY
+            if self.instance_session_error
+            else StartupState.BOOTSTRAPPING
+        )
         self.startup_generation = 0
         self._startup_result: StartupSafetyResult | None = None
         self._last_collector_running = False
@@ -88,6 +124,10 @@ class ManagerController:
         self.tasks = SettingsTaskService(self.paths, self.backup)
         self.task_order = TaskOrderService(self.paths)
         self.results = ResultHistoryService(self.paths.download_task_logs)
+        self.profile_url_resolver = ProfileUrlResolver(
+            self.paths.master_settings,
+            lock_path=self.paths.lock_file,
+        )
         self.account_audit = AccountAuditService(
             self.results,
             paths=self.paths,
@@ -100,7 +140,18 @@ class ManagerController:
             self.backup,
             process_guard=lambda: self._require_engine_change_processes_idle("回退"),
         )
-        self.collector = CollectorService(self.config, self.paths)
+        self.collector = CollectorService(
+            self.config,
+            self.paths,
+            instance_lease=getattr(self, "instance_lease", None),
+        )
+        self.watchlist = WatchlistService(self.paths)
+        self.formal_collector = FormalCollectorService(self.paths)
+        self.watchlist_promotion = WatchlistPromotionService(
+            self.paths,
+            watchlist=self.watchlist,
+            formal=self.formal_collector,
+        )
         self.screenshots = ScreenshotService()
         self.indexer = IndexService()
 
@@ -110,6 +161,10 @@ class ManagerController:
         return getattr(self, "startup_state", StartupState.READY)
 
     def begin_startup_check(self, generation: int) -> bool:
+        if getattr(self, "instance_session_error", ""):
+            self.startup_state = StartupState.DEGRADED_READ_ONLY
+            self.read_only_reason = self.instance_session_error
+            return False
         if self._current_startup_state() in (
             StartupState.SAFETY_CHECKING,
             StartupState.CLOSING,
@@ -123,6 +178,12 @@ class ManagerController:
         self.startup_backup = None
         return True
 
+    def _manager_session_is_valid(self) -> bool:
+        lease = getattr(self, "instance_lease", None)
+        if lease is None:
+            return True
+        return lease.active and lease.manager_is_still_owner()
+
     def apply_startup_result(self, result: StartupSafetyResult) -> bool:
         if self._current_startup_state() is StartupState.CLOSING:
             return False
@@ -133,22 +194,39 @@ class ManagerController:
 
         self._startup_result = result
         self.startup_backup = result.startup_backup
+        if result.watchlist_installation_id:
+            self.config.watchlist_installation_id = result.watchlist_installation_id
         probe = result.process_probe
         if probe is not None:
             self._last_engine_running = probe.state.name != "SAFE"
-        if result.success and result.state is StartupState.READY:
+        if (
+            result.success
+            and result.state is StartupState.READY
+            and self._manager_session_is_valid()
+        ):
             self.startup_state = StartupState.READY
             self.read_only_reason = ""
         else:
             self.startup_state = StartupState.DEGRADED_READ_ONLY
             self.read_only_reason = result.summary or result.details
+            if result.success and not self._manager_session_is_valid():
+                self.read_only_reason = "当前管理器会话已失效，已保持只读保护。"
         return True
 
     def begin_closing(self) -> bool:
         if self._current_startup_state() is StartupState.CLOSING:
+            if getattr(getattr(self, "collector", None), "process", None) is None:
+                self._release_instance_session()
             return False
         self.startup_state = StartupState.CLOSING
+        if getattr(getattr(self, "collector", None), "process", None) is None:
+            self._release_instance_session()
         return True
+
+    def _release_instance_session(self) -> None:
+        lease = getattr(self, "instance_lease", None)
+        if lease is not None:
+            lease.release()
 
     def startup_error_text(self) -> str:
         result = getattr(self, "_startup_result", None)
@@ -300,11 +378,21 @@ class ManagerController:
             return self.read_only_reason
         try:
             with critical_section(self.paths.lock_file, timeout=5.0):
-                self.startup_backup = self.backup.create_critical_snapshot(
-                    "Startup",
-                    {"operation": "application_start"},
-                    keep_latest=3,
-                )
+                if self._observation_files_are_configured():
+                    watchlist = WatchlistService(self.paths)
+                    watchlist.block_writes(locked=True)
+                    self.startup_backup = self.backup.create_startup_snapshot(
+                        "Startup",
+                        {"operation": "application_start"},
+                        keep_latest=BackupService.STARTUP_KEEP_LATEST,
+                    )
+                    watchlist.mark_ready(locked=True)
+                else:
+                    self.startup_backup = self.backup.create_critical_snapshot(
+                        "Startup",
+                        {"operation": "application_start"},
+                        keep_latest=3,
+                    )
             if self.engine.recover_batch_command_if_idle():
                 self.logger.warning(
                     "检测到上次后台监听遗留 run_command=%s，已恢复为 %s。",
@@ -318,6 +406,17 @@ class ManagerController:
             self.read_only_reason = f"启动前备份失败：{exc}"
             self.logger.exception("启动前备份失败")
             return self.read_only_reason
+
+    def _observation_files_are_configured(self) -> bool:
+        return any(
+            path.exists()
+            for path in (
+                getattr(self.paths, "watchlist", None),
+                getattr(self.paths, "watchlist_w_watermark", None),
+                getattr(self.paths, "watchlist_control", None),
+            )
+            if path is not None
+        )
 
     def require_download_lifecycle_idle(self) -> None:
         if getattr(self, "_download_lifecycle_active", False):
@@ -342,6 +441,160 @@ class ManagerController:
         if self.engine.external_running():
             return
         self.require_safe_write()
+
+    def watchlist_snapshot(
+        self,
+        *,
+        context: OperationContext | None = None,
+    ) -> WatchlistSnapshot:
+        self._require_operational_ready_with_context("刷新观察名单", context=context)
+        snapshot = self.watchlist.snapshot()
+        if context is not None:
+            context.raise_if_cancelled()
+        return snapshot
+
+    def watchlist_profile_url(
+        self,
+        w_id: int,
+        *,
+        context: OperationContext | None = None,
+    ) -> str:
+        """Return one W homepage only after the strict open-entry check."""
+
+        self._require_operational_ready_with_context("读取观察账号主页地址", context=context)
+        record = next(
+            (item for item in self.watchlist.snapshot().records if item["w_id"] == w_id),
+            None,
+        )
+        if record is None:
+            raise ControllerError("观察记录不存在。")
+        try:
+            normalized = strict_admit_url(record["url"])
+        except (ProfileUrlError, TypeError) as exc:
+            raise ControllerError("观察记录主页 URL 无法通过打开安全校验。") from exc
+        if normalized != record["url"]:
+            raise ControllerError("观察记录主页 URL 未规范化，已拒绝打开。")
+        if context is not None:
+            context.raise_if_cancelled()
+        return normalized
+
+    def preview_watchlist_promotion(
+        self,
+        w_id: int,
+        *,
+        expected_revision: int | None = None,
+        context: OperationContext | None = None,
+    ) -> PromotionPreview:
+        self._require_operational_ready_with_context("预览观察账号转正", context=context)
+        result = self.watchlist_promotion.preview(
+            w_id,
+            expected_revision=expected_revision,
+        )
+        if context is not None:
+            context.raise_if_cancelled()
+        return result
+
+    def promote_watchlist(
+        self,
+        w_id: int,
+        *,
+        expected_revision: int,
+        context: OperationContext | None = None,
+    ) -> PromotionResult:
+        self._require_operational_ready_with_context("确认观察账号转正", context=context)
+        self.require_safe_write()
+        return self.watchlist_promotion.promote(
+            w_id,
+            expected_revision=expected_revision,
+            context=context,
+        )
+
+    def retry_watchlist_promotion(
+        self,
+        w_id: int,
+        *,
+        expected_revision: int,
+        attempt_id: str,
+        context: OperationContext | None = None,
+    ) -> PromotionResult:
+        self._require_operational_ready_with_context("明确重试观察账号转正", context=context)
+        self.require_safe_write()
+        return self.watchlist_promotion.retry(
+            w_id,
+            expected_revision=expected_revision,
+            attempt_id=attempt_id,
+            context=context,
+        )
+
+    def review_watchlist(
+        self,
+        w_id: int,
+        *,
+        expected_revision: int,
+        reasons: list[str],
+        note: str,
+        next_review_at: str,
+        action: str = "review",
+        display_name: str | None = None,
+        context: OperationContext | None = None,
+    ) -> WatchlistSnapshot:
+        self._require_operational_ready_with_context("保存观察复查", context=context)
+        self.require_safe_write()
+        result = self.watchlist.record_review(
+            w_id,
+            expected_revision=expected_revision,
+            reasons=reasons,
+            note=note,
+            next_review_at=next_review_at,
+            action=action,
+            display_name=display_name,
+        )
+        if context is not None:
+            context.raise_if_cancelled()
+        return result
+
+    def archive_watchlist(
+        self,
+        w_id: int,
+        *,
+        expected_revision: int,
+        context: OperationContext | None = None,
+    ) -> WatchlistSnapshot:
+        self._require_operational_ready_with_context("归档观察账号", context=context)
+        self.require_safe_write()
+        return self.watchlist.archive(w_id, expected_revision=expected_revision)
+
+    def restore_watchlist(
+        self,
+        w_id: int,
+        *,
+        expected_revision: int,
+        next_review_at: str,
+        context: OperationContext | None = None,
+    ) -> WatchlistSnapshot:
+        self._require_operational_ready_with_context("恢复观察账号", context=context)
+        self.require_safe_write()
+        return self.watchlist.restore(
+            w_id,
+            expected_revision=expected_revision,
+            next_review_at=next_review_at,
+        )
+
+    def delete_archived_watchlist(
+        self,
+        w_id: int,
+        *,
+        expected_revision: int,
+        request_id: str | None = None,
+        context: OperationContext | None = None,
+    ) -> WatchlistSnapshot:
+        self._require_operational_ready_with_context("永久删除观察账号", context=context)
+        self.require_safe_write()
+        return self.watchlist.delete_archived(
+            w_id,
+            request_id=request_id or str(uuid.uuid4()),
+            expected_revision=expected_revision,
+        )
 
     def reconfigure(self, values: dict[str, Any]) -> str:
         has_startup_state = hasattr(self, "startup_state")
@@ -379,7 +632,11 @@ class ManagerController:
         self.paths = new_paths
         self.startup_backup = None
         self._build_services()
-        self.logger.info("路径和任务设置已保存：%s", asdict(self.config))
+        logged_config = asdict(self.config)
+        logged_config["watchlist_installation_id"] = bool(
+            self.config.watchlist_installation_id
+        )
+        self.logger.info("路径和任务设置已保存：%s", logged_config)
         if has_startup_state:
             if state is StartupState.READY:
                 self.startup_state = StartupState.DEGRADED_READ_ONLY
@@ -485,6 +742,27 @@ class ManagerController:
 
     def result_rows(self, *, limit: int = 500):
         return self.results.list_account_rows(limit=limit)
+
+    def resolve_profile_url(
+        self,
+        a_number: int,
+        *,
+        context: OperationContext | None = None,
+    ) -> ProfileUrlResolution:
+        """Resolve one formal A number without exposing its URL to the UI."""
+        self._require_operational_ready_with_context(
+            "读取账号主页地址", context=context
+        )
+        resolver = getattr(self, "profile_url_resolver", None)
+        if resolver is None:
+            resolver = ProfileUrlResolver(
+                self.paths.master_settings,
+                lock_path=self.paths.lock_file,
+            )
+        result = resolver.resolve(FormalAccountRef(a_number))
+        if context is not None:
+            context.raise_if_cancelled()
+        return result
 
     def result_snapshot(
         self,
@@ -807,6 +1085,40 @@ class ManagerController:
         self.logger.info("手动完整 Volume 备份完成：%s", result)
         return result
 
+    def restore_startup_snapshot(
+        self,
+        snapshot: Path,
+        *,
+        context: OperationContext | None = None,
+    ) -> None:
+        """Restore observation data from one user-selected Startup snapshot."""
+
+        if context is not None:
+            context.raise_if_cancelled()
+        state = self._current_startup_state()
+        if state not in (StartupState.READY, StartupState.DEGRADED_READ_ONLY):
+            raise ControllerError(f"恢复 Startup 观察数据不可用：当前状态为 {state.value}。")
+        if getattr(self, "instance_session_error", "") or not self._manager_session_is_valid():
+            raise ControllerError("当前管理器会话无效，不能恢复 Startup 观察数据。")
+        self.require_download_lifecycle_idle()
+        if self.engine.external_running():
+            raise ControllerError("下载引擎正在运行，禁止恢复 Startup 观察数据。")
+        if self.collector.running or self.collector.health():
+            raise ControllerError("账号采集服务运行时不能恢复 Startup 观察数据。")
+        if context is not None:
+            context.raise_if_cancelled()
+        self.backup.restore_startup_snapshot(Path(snapshot))
+        self.startup_backup = None
+        if self._current_startup_state() is StartupState.CLOSING:
+            self.logger.info(
+                "Startup 观察数据恢复在关闭期间完成，保持 CLOSING：%s",
+                snapshot,
+            )
+            return
+        self.startup_state = StartupState.DEGRADED_READ_ONLY
+        self.read_only_reason = "Startup 观察数据已恢复，等待重新执行启动安全检查。"
+        self.logger.info("Startup 观察数据恢复完成，等待重新执行启动安全检查：%s", snapshot)
+
     def preview_engine_update(
         self,
         archive: Path,
@@ -939,7 +1251,11 @@ class ManagerController:
             "停止账号采集服务",
             managed=getattr(self.collector, "process", None) is not None,
         )
-        self.collector.stop()
+        try:
+            self.collector.stop()
+        finally:
+            if self._current_startup_state() is StartupState.CLOSING:
+                self._release_instance_session()
         self._last_collector_running = False
         self.logger.info("账号采集服务已停止")
 

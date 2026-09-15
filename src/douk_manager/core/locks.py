@@ -77,8 +77,14 @@ class ProcessFileLock:
 
 
 @contextmanager
-def critical_section(lock_path: Path, timeout: float = 10.0) -> Iterator[None]:
-    with _THREAD_LOCK:
+def critical_section(
+    lock_path: Path, timeout: float = 10.0, *, thread_timeout: float = -1
+) -> Iterator[None]:
+    if not _THREAD_LOCK.acquire(timeout=thread_timeout):
+        raise LockBusyError("DouK 操作正在进行，请稍后重试。")
+    try:
         with ProcessFileLock(lock_path, timeout):
             yield
+    finally:
+        _THREAD_LOCK.release()
 

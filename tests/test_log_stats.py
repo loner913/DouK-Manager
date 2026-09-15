@@ -838,6 +838,7 @@ class LogStatsGuiTests(unittest.TestCase):
             deadline = datetime.now().timestamp() + 4
             while window.coordinator.has_active_tasks() and datetime.now().timestamp() < deadline:
                 self.app.processEvents()
+        window.controller.begin_closing()
         window.hide()
         window.deleteLater()
         self.app.processEvents()

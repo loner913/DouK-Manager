@@ -14,12 +14,12 @@ def main(argv: list[str] | None = None) -> int:
     from PySide6.QtCore import QTimer
     from PySide6.QtWidgets import QApplication
 
-    from douk_manager.gui import MainWindow
+    from douk_manager.ui.shell.main_window import ModernMainWindow
 
     app = QApplication([sys.argv[0], *arguments])
     app.setApplicationName("DouK全流程一体化管理器")
     app.setOrganizationName("loner913")
-    window = MainWindow()
+    window = ModernMainWindow()
     window.show()
     QTimer.singleShot(0, window.begin_startup_check)
     return app.exec()

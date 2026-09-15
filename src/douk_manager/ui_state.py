@@ -59,6 +59,17 @@ class WindowStateStore:
             )
         )
 
+    def load_theme_strategy(self) -> str:
+        value = self._settings.value("ui/theme/strategy", "system")
+        return value if value in ("system", "light", "dark") else "system"
+
+    def save_theme_strategy(self, strategy: str) -> bool:
+        if strategy not in ("system", "light", "dark"):
+            return False
+        self._settings.setValue("ui/theme/strategy", strategy)
+        self._settings.sync()
+        return self._settings.status() == QSettings.Status.NoError
+
     def load(self) -> WindowGeometryState | None:
         try:
             version = _as_int(self._settings.value("state/version"))
