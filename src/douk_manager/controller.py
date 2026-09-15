@@ -66,7 +66,11 @@ from douk_manager.integrations.collector import CollectorService, MigrationResul
 from douk_manager.integrations.indexer import IndexResult, IndexService
 from douk_manager.integrations.screenshots import ScreenshotPreview, ScreenshotResult, ScreenshotService
 from douk_manager.logging_setup import setup_logging
-from douk_manager.startup import StartupSafetyResult, StartupState
+from douk_manager.startup import (
+    StartupSafetyResult,
+    StartupState,
+    WatchlistActivationContext,
+)
 
 if TYPE_CHECKING:
     from douk_manager.operation import OperationContext
@@ -84,6 +88,9 @@ class ManagerController:
     def __init__(self) -> None:
         self.root = application_root()
         default_paths = ManagedPaths.from_config(AppConfig(), self.root)
+        self.watchlist_activation_context = WatchlistActivationContext.capture(
+            default_paths
+        )
         default_paths.ensure_manager_directories()
         self.config = AppConfig.load(default_paths.config_file)
         self.paths = ManagedPaths.from_config(self.config, self.root)
@@ -187,6 +194,8 @@ class ManagerController:
 
         self._startup_result = result
         self.startup_backup = result.startup_backup
+        if result.watchlist_installation_id:
+            self.config.watchlist_installation_id = result.watchlist_installation_id
         probe = result.process_probe
         if probe is not None:
             self._last_engine_running = probe.state.name != "SAFE"
@@ -623,7 +632,11 @@ class ManagerController:
         self.paths = new_paths
         self.startup_backup = None
         self._build_services()
-        self.logger.info("路径和任务设置已保存：%s", asdict(self.config))
+        logged_config = asdict(self.config)
+        logged_config["watchlist_installation_id"] = bool(
+            self.config.watchlist_installation_id
+        )
+        self.logger.info("路径和任务设置已保存：%s", logged_config)
         if has_startup_state:
             if state is StartupState.READY:
                 self.startup_state = StartupState.DEGRADED_READ_ONLY

@@ -7,7 +7,7 @@ from unittest.mock import Mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import Qt, QDate
+from PySide6.QtCore import Qt, QDate, QTime
 from datetime import datetime, timezone
 from PySide6.QtWidgets import QApplication, QTableView, QPushButton, QTextEdit
 
@@ -50,9 +50,12 @@ class WatchlistUiModelTests(unittest.TestCase):
         self.assertEqual(dialog._selected_review_time(), record["next_review_at"])
         self.assertEqual(dialog.save_button.text(), "保存复查")
         self.assertEqual(dialog.cancel_button.property("legacyRole"), "secondary")
+        self.assertNotEqual(dialog.review_mode.findData(15), -1)
+        self.assertNotEqual(dialog.review_mode.findData(45), -1)
         dialog.review_mode.setCurrentIndex(dialog.review_mode.findData("custom"))
         dialog.review_date.setDate(QDate(2099, 2, 3))
-        expected = datetime(2099, 2, 3, 9).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        dialog.review_time.setTime(QTime(14, 35))
+        expected = datetime(2099, 2, 3, 14, 35).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         dialog._accept()
         self.assertEqual(dialog.result[2], expected)
 

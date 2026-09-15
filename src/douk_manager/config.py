@@ -52,6 +52,7 @@ class AppConfig:
     index_post_mode: str = "queue"
     cleanup_after_index: bool = True
     evidence_since: str = ""
+    watchlist_installation_id: str = ""
 
     @classmethod
     def load(cls, path: Path) -> "AppConfig":

@@ -2,7 +2,7 @@
 // @name         DouK 抖音账号采集器 v2.4.9
 // @namespace    douk-account-collector
 // @version      2.4.9
-// @description  JSON＋Excel 严格同步采集、分类统计与添加成功后的编号截图。
+// @description  JSON＋Excel 严格同步采集、观察名单、分类统计与添加成功后的编号截图。
 // @match        https://www.douyin.com/user/*
 // @grant        GM_xmlhttpRequest
 // @connect      127.0.0.1
@@ -36,6 +36,15 @@
     const CATEGORY_NAMES = ['顶级', '次顶级', '普通'];
     const PREVIEW_CONNECTION_ATTEMPTS = 3;
     const PREVIEW_RETRY_DELAYS = [450, 900];
+    const OBSERVE_ATTEMPTS = 4;
+    const OBSERVE_RETRY_DELAYS = [500, 1000, 2000];
+    const OBSERVE_REASON_LABELS = {
+        few_works: '作品太少',
+        unknown_updates: '更新未知',
+        content_pending: '内容待定',
+        suspected_private: '疑似私密',
+        other: '其他',
+    };
 
     let currentProfileKey = '';
     let lastCompletedProfileKey = '';
@@ -48,6 +57,8 @@
     let previewRequestSerial = 0;
     let isAdding = false;
     let isClassifying = false;
+    let isObserving = false;
+    let observeProfile = null;
     let currentCategoryState = null;
     let markEditedByUser = false;
     let screenshotReady = false;
@@ -688,11 +699,55 @@
                     <div class="douk-actions">
                         <button id="douk-refresh">重新识别</button>
                         <button id="douk-add" class="primary" disabled>同时添加 JSON + Excel</button>
+                        <button id="douk-observe" class="douk-observe" disabled>加入观察</button>
                         <button id="douk-screenshot" class="douk-screenshot" disabled>手动补截当前账号</button>
                     </div>
                     <div class="douk-shortcut">v${VERSION} 严格模式 · 快捷键: Alt + A</div>
                 </div>
             </div>
+            <dialog id="douk-observe-dialog" class="douk-observe-dialog">
+                <div class="douk-dialog-head">
+                    <strong>加入观察</strong>
+                    <button id="douk-observe-close" type="button" title="关闭">×</button>
+                </div>
+                <div class="douk-dialog-body">
+                    <fieldset>
+                        <legend>观察原因</legend>
+                        <div class="douk-reason-grid">
+                            ${Object.entries(OBSERVE_REASON_LABELS).map(([value, label]) => `
+                                <label><input type="checkbox" name="douk-observe-reason" value="${value}"> ${label}</label>
+                            `).join('')}
+                        </div>
+                    </fieldset>
+                    <label class="douk-field">观察名称
+                        <input id="douk-observe-name" maxlength="256" autocomplete="off">
+                    </label>
+                    <label class="douk-field">备注
+                        <textarea id="douk-observe-note" maxlength="4000" rows="3"></textarea>
+                    </label>
+                    <label class="douk-field">再次提醒
+                        <select id="douk-observe-reminder">
+                            <option value="7">7 天</option>
+                            <option value="15">15 天</option>
+                            <option value="30" selected>30 天</option>
+                            <option value="45">45 天</option>
+                            <option value="90">90 天</option>
+                            <option value="custom">自定义日期和时间</option>
+                        </select>
+                    </label>
+                    <label id="douk-observe-date-row" class="douk-field" hidden>提醒日期
+                        <input id="douk-observe-date" type="date">
+                    </label>
+                    <label id="douk-observe-time-row" class="douk-field" hidden>提醒时间
+                        <input id="douk-observe-time" type="time" step="60">
+                    </label>
+                    <div id="douk-observe-error" class="douk-dialog-message" hidden></div>
+                </div>
+                <div class="douk-dialog-actions">
+                    <button id="douk-observe-cancel" type="button">取消</button>
+                    <button id="douk-observe-submit" class="primary" type="button">确认加入观察</button>
+                </div>
+            </dialog>
             <div class="douk-resize douk-resize-n" data-resize="n"></div>
             <div class="douk-resize douk-resize-e" data-resize="e"></div>
             <div class="douk-resize douk-resize-s" data-resize="s"></div>
@@ -805,8 +860,8 @@
             #${PANEL_ID} .douk-category[data-selected="true"]{background:var(--douk-ok-bg);border-color:var(--douk-ok-border);color:var(--douk-ok-text)}
             #${PANEL_ID} .douk-category:disabled{opacity:.42;cursor:not-allowed}
             #${PANEL_ID} #douk-category-info{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border:1px solid var(--douk-border);border-radius:50%;color:var(--douk-muted);cursor:help;font-weight:700;user-select:none}
-            #${PANEL_ID} input,#${PANEL_ID} textarea{width:100%;border:1px solid var(--douk-border-2);background:var(--douk-input-bg);color:var(--douk-text);border-radius:6px;padding:7px 8px;outline:none;resize:none;font:var(--douk-font-control)/1.45 "Segoe UI","Microsoft YaHei",sans-serif}
-            #${PANEL_ID} input:focus,#${PANEL_ID} textarea:focus{border-color:#e83e63}
+            #${PANEL_ID} input,#${PANEL_ID} textarea,#${PANEL_ID} select{width:100%;border:1px solid var(--douk-border-2);background:var(--douk-input-bg);color:var(--douk-text);border-radius:6px;padding:7px 8px;outline:none;resize:none;font:var(--douk-font-control)/1.45 "Segoe UI","Microsoft YaHei",sans-serif}
+            #${PANEL_ID} input:focus,#${PANEL_ID} textarea:focus,#${PANEL_ID} select:focus{border-color:#e83e63}
             #${PANEL_ID} #douk-url{font:var(--douk-font-control)/1.45 "Segoe UI","Microsoft YaHei",sans-serif;min-height:78px}
             #${PANEL_ID} .douk-status{margin:8px 0 0;padding:9px;border-radius:7px;white-space:pre-wrap;word-break:break-word}
             #${PANEL_ID} .douk-status.wait{background:var(--douk-wait-bg);color:var(--douk-wait-text)}
@@ -824,8 +879,28 @@
             #${PANEL_ID} .douk-actions button{min-height:36px;border:1px solid var(--douk-border);background:var(--douk-surface-2);color:var(--douk-text);border-radius:6px;padding:7px 4px;cursor:pointer;white-space:normal;font:600 var(--douk-font-control)/1.2 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}
             #${PANEL_ID} .douk-actions button.primary{background:var(--douk-primary);border-color:var(--douk-primary-border);color:#fff}
             #${PANEL_ID} .douk-actions button:disabled{opacity:.45;cursor:not-allowed}
+            #${PANEL_ID} .douk-actions .douk-observe{grid-column:1 / -1}
             #${PANEL_ID} .douk-actions .douk-screenshot{grid-column:1 / -1}
             #${PANEL_ID} .douk-shortcut{text-align:right;color:var(--douk-muted);font-size:var(--douk-font-small);margin-top:7px}
+            #${PANEL_ID} .douk-observe-dialog{width:min(430px,calc(100vw - 32px));max-height:calc(100vh - 32px);padding:0;border:1px solid var(--douk-border);border-radius:8px;background:var(--douk-bg);color:var(--douk-text);box-shadow:0 18px 48px rgba(0,0,0,.48);font:var(--douk-font-base)/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}
+            #${PANEL_ID} .douk-observe-dialog[open]{display:flex;flex-direction:column}
+            #${PANEL_ID} .douk-observe-dialog::backdrop{background:rgba(0,0,0,.55)}
+            #${PANEL_ID} .douk-dialog-head{display:flex;align-items:center;gap:10px;padding:11px 14px;border-bottom:1px solid var(--douk-border);background:var(--douk-surface)}
+            #${PANEL_ID} .douk-dialog-head strong{flex:1;font-size:var(--douk-font-title)}
+            #${PANEL_ID} .douk-dialog-head button{width:28px;height:28px;padding:0;border:1px solid var(--douk-border);border-radius:5px;background:var(--douk-surface-2);color:var(--douk-text);cursor:pointer;font-size:18px;line-height:1}
+            #${PANEL_ID} .douk-dialog-body{padding:12px 14px;overflow:auto}
+            #${PANEL_ID} .douk-dialog-body fieldset{margin:0 0 10px;padding:9px 10px 10px;border:1px solid var(--douk-border);border-radius:6px}
+            #${PANEL_ID} .douk-dialog-body legend{padding:0 5px;color:var(--douk-muted)}
+            #${PANEL_ID} .douk-reason-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px 12px}
+            #${PANEL_ID} .douk-reason-grid label{display:flex;align-items:center;gap:6px;min-width:0}
+            #${PANEL_ID} .douk-reason-grid input{width:auto;margin:0;flex:none}
+            #${PANEL_ID} .douk-field{display:block;margin:9px 0;color:var(--douk-muted)}
+            #${PANEL_ID} .douk-field input,#${PANEL_ID} .douk-field textarea,#${PANEL_ID} .douk-field select{margin-top:4px}
+            #${PANEL_ID} .douk-dialog-message{margin-top:10px;padding:8px;border:1px solid var(--douk-error-border);border-radius:6px;background:var(--douk-error-bg);color:var(--douk-error-text);white-space:pre-wrap;word-break:break-word}
+            #${PANEL_ID} .douk-dialog-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:10px 14px 13px;border-top:1px solid var(--douk-border);background:var(--douk-surface)}
+            #${PANEL_ID} .douk-dialog-actions button{min-height:36px;border:1px solid var(--douk-border);border-radius:6px;background:var(--douk-surface-2);color:var(--douk-text);cursor:pointer;font:600 var(--douk-font-control)/1.2 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}
+            #${PANEL_ID} .douk-dialog-actions button.primary{background:var(--douk-primary);border-color:var(--douk-primary-border);color:#fff}
+            #${PANEL_ID} .douk-dialog-actions button:disabled{opacity:.45;cursor:not-allowed}
             #${PANEL_ID} .douk-resize{position:absolute;z-index:2}
             #${PANEL_ID}[data-minimized="true"]{min-height:0}
             #${PANEL_ID}[data-minimized="true"] .douk-resize{display:none}
@@ -867,7 +942,19 @@
         });
         panel.querySelector('#douk-refresh').addEventListener('click', () => recognizeAndPreview(true));
         panel.querySelector('#douk-add').addEventListener('click', addCurrent);
+        panel.querySelector('#douk-observe').addEventListener('click', openObserveDialog);
         panel.querySelector('#douk-screenshot').addEventListener('click', captureCurrentAccountScreenshot);
+        panel.querySelector('#douk-observe-close').addEventListener('click', closeObserveDialog);
+        panel.querySelector('#douk-observe-cancel').addEventListener('click', closeObserveDialog);
+        panel.querySelector('#douk-observe-submit').addEventListener('click', submitObservation);
+        panel.querySelector('#douk-observe-reminder').addEventListener('change', updateObserveReminderField);
+        panel.querySelector('#douk-observe-dialog').addEventListener('cancel', (event) => {
+            if (isObserving) {
+                event.preventDefault();
+                return;
+            }
+            observeProfile = null;
+        });
         panel.querySelectorAll('.douk-category').forEach((button) => {
             button.addEventListener('click', () => classifyCurrent(button.dataset.category));
         });
@@ -887,7 +974,7 @@
         el.textContent = message;
     }
 
-    function disconnectedCategoryState(message = '未连接本机服务。请在 DouK 管理器“账号采集”页启动服务，然后刷新页面或点击“重新识别”。') {
+    function disconnectedCategoryState(message = '未连接本机服务。请先启动 BAT，然后刷新页面或点击“重新识别”。') {
         return {
             available: false,
             status: 'disconnected',
@@ -918,7 +1005,7 @@
             button.textContent = `${isSelected ? '✓ ' : ''}${category}`;
             button.dataset.selected = isSelected ? 'true' : 'false';
 
-            if (isClassifying || isAdding) {
+            if (isClassifying || isAdding || isObserving) {
                 button.disabled = true;
             } else if (status === 'unclassified' && currentCategoryState.available === true) {
                 button.disabled = false;
@@ -1018,13 +1105,21 @@
     }
 
     function setAddEnabled(enabled) {
-        panelEl('#douk-add').disabled = !enabled || isAdding;
+        panelEl('#douk-add').disabled = !enabled || isAdding || isObserving;
+    }
+
+    function setObserveEnabled(enabled, title = '') {
+        const button = panelEl('#douk-observe');
+        button.disabled = !enabled || isAdding || isClassifying || isObserving || !pageIsVisible();
+        button.title = title || (enabled
+            ? '填写观察原因、名称、备注和再次提醒时间。'
+            : '当前主页资料尚未识别完整。');
     }
 
     function setScreenshotEnabled(enabled, title = '') {
         screenshotReady = Boolean(enabled);
         const button = panelEl('#douk-screenshot');
-        button.disabled = !screenshotReady || isAdding || isClassifying || !pageIsVisible();
+        button.disabled = !screenshotReady || isAdding || isClassifying || isObserving || !pageIsVisible();
         button.title = title || (screenshotReady
             ? '按当前 URL 重新核验 JSON、Excel 后补截，不覆盖已有图片。'
             : '当前账号尚未通过截图核验。');
@@ -1052,7 +1147,7 @@
     }
 
     async function captureCurrentAccountScreenshot() {
-        if (!screenshotReady || isAdding || isClassifying) return;
+        if (!screenshotReady || isAdding || isClassifying || isObserving) return;
         if (!pageIsVisible()) {
             setScreenshotEnabled(false, '后台标签页禁止截图。');
             setStatus('warning', '⚠️ 后台标签页禁止截图，请先切回当前标签页。');
@@ -1158,10 +1253,334 @@
                         reject(new Error(`服务返回内容无法解析：${error.message}`));
                     }
                 },
-                ontimeout: () => reject(connectionError('连接本机服务超时，请确认 DouK 管理器中的账号采集服务仍在运行。')),
-                onerror: () => reject(connectionError('无法访问 127.0.0.1:8765，请在 DouK 管理器“账号采集”页启动服务。')),
+                ontimeout: () => reject(connectionError('连接本机服务超时，请确认 BAT 黑框仍在运行。')),
+                onerror: () => reject(connectionError('无法访问 127.0.0.1:8765，请双击启动账号采集器.bat 并保持黑框打开。')),
             });
         });
+    }
+
+    function createRequestId() {
+        const cryptoApi = globalThis.crypto;
+        if (typeof cryptoApi?.randomUUID === 'function') return cryptoApi.randomUUID();
+        if (typeof cryptoApi?.getRandomValues !== 'function') {
+            throw new Error('浏览器无法生成安全请求编号，本次未提交。');
+        }
+        const bytes = new Uint8Array(16);
+        cryptoApi.getRandomValues(bytes);
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        const hex = Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('');
+        return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    }
+
+    function customDateToUtc(localDate, localTime, nowValue = Date.now()) {
+        const match = String(localDate || '').match(/^(\d{4})-(\d{2})-(\d{2})$/u);
+        if (!match) throw new Error('请选择有效的自定义提醒日期。');
+        const timeMatch = String(localTime || '').match(/^(\d{2}):(\d{2})$/u);
+        if (!timeMatch) throw new Error('请选择有效的自定义提醒时间。');
+        const year = Number(match[1]);
+        const month = Number(match[2]);
+        const day = Number(match[3]);
+        const hour = Number(timeMatch[1]);
+        const minute = Number(timeMatch[2]);
+        if (hour > 23 || minute > 59) throw new Error('请选择有效的自定义提醒时间。');
+        const localDateTime = new Date(year, month - 1, day, hour, minute, 0, 0);
+        if (
+            localDateTime.getFullYear() !== year
+            || localDateTime.getMonth() !== month - 1
+            || localDateTime.getDate() !== day
+            || localDateTime.getHours() !== hour
+            || localDateTime.getMinutes() !== minute
+        ) {
+            throw new Error('请选择有效的自定义提醒日期和时间。');
+        }
+        const now = nowValue instanceof Date ? nowValue : new Date(nowValue);
+        if (!Number.isFinite(now.getTime()) || localDateTime <= now) {
+            throw new Error('自定义提醒时间必须晚于当前时间。');
+        }
+        return localDateTime.toISOString().replace(/\.\d{3}Z$/u, 'Z');
+    }
+
+    function buildObservationPayload(profile, values, requestId) {
+        if (!profileIsComplete(profile)) {
+            throw new Error('当前主页资料未识别完整，不能加入观察。');
+        }
+        const reasons = Array.from(new Set((values.reasons || []).map(String)));
+        if (!reasons.length || reasons.some((reason) => !Object.hasOwn(OBSERVE_REASON_LABELS, reason))) {
+            throw new Error('请至少选择一个有效的观察原因。');
+        }
+        const note = String(values.note || '').trim();
+        if (reasons.includes('other') && !note) {
+            throw new Error('选择“其他”时必须填写备注。');
+        }
+        const reminder = String(values.reminder || '30');
+        const payload = {
+            request_id: requestId,
+            url: profile.url,
+            captured_nickname: profile.nickname,
+            display_name: String(values.displayName ?? profile.nickname).trim(),
+            douyin_id: profile.douyin_id,
+            nickname_blank: profile.nickname_blank === true,
+            reasons,
+            note,
+        };
+        if (reminder === 'custom') {
+            payload.next_review_at = customDateToUtc(values.customDate, values.customTime, values.nowValue);
+        } else {
+            const days = Number(reminder);
+            if (![7, 15, 30, 45, 90].includes(days)) {
+                throw new Error('再次提醒只能选择 7、15、30、45、90 天或自定义日期和时间。');
+            }
+            payload.review_after_days = days;
+        }
+        return payload;
+    }
+
+    function observeResponseCode(result) {
+        return cleanText(
+            result?.status
+            || result?.message_code
+            || result?.code
+            || result?.details?.message_code
+        ).toUpperCase();
+    }
+
+    function observeRetryableError(message, details = {}) {
+        const error = new Error(message);
+        error.isObserveRetryable = true;
+        Object.assign(error, details);
+        return error;
+    }
+
+    function observeApiOnce(serializedPayload) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'POST',
+                url: `${API_BASE}/watchlist/observe`,
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-DouK-Token': TOKEN,
+                },
+                data: serializedPayload,
+                timeout: 3000,
+                onload: (response) => {
+                    const httpStatus = Number(response.status) || 0;
+                    let result;
+                    try {
+                        result = JSON.parse(response.responseText);
+                    } catch (error) {
+                        if (httpStatus >= 500 && httpStatus <= 599) {
+                            reject(observeRetryableError('本机观察服务暂时返回异常内容。', { httpStatus }));
+                            return;
+                        }
+                        reject(new Error(`观察服务返回内容无法解析：${error.message}`));
+                        return;
+                    }
+                    const code = observeResponseCode(result);
+                    const doNotRetry = new Set([
+                        'READ_ONLY',
+                        'RECOVERY_REQUIRED',
+                        'SCHEMA_INVALID',
+                        'MANAGER_SESSION_REQUIRED',
+                        'CLIENT_OUTDATED',
+                        'BACKGROUND_TAB_IGNORED',
+                    ]);
+                    if (httpStatus >= 500 && httpStatus <= 599 && !doNotRetry.has(code)) {
+                        reject(observeRetryableError(
+                            cleanText(result?.message) || `本机观察服务暂时不可用（HTTP ${httpStatus}）。`,
+                            { httpStatus, result }
+                        ));
+                        return;
+                    }
+                    resolve(result);
+                },
+                ontimeout: () => reject(observeRetryableError('观察请求 3 秒内未确认结果。')),
+                onerror: () => reject(observeRetryableError('观察请求无法连接本机服务。')),
+            });
+        });
+    }
+
+    async function observeApiWithRetry(payload, options = {}) {
+        const serializedPayload = JSON.stringify(payload);
+        const request = options.request || observeApiOnce;
+        const waiter = options.waiter || wait;
+        const canContinue = options.canContinue || (() => true);
+        const onRetry = options.onRetry || (() => {});
+        let lastError = null;
+        for (let attempt = 1; attempt <= OBSERVE_ATTEMPTS; attempt += 1) {
+            if (attempt > 1 && !canContinue()) {
+                throw new Error('页面已切换或进入后台，已停止重试；此前请求结果尚未确认。');
+            }
+            try {
+                return await request(serializedPayload);
+            } catch (error) {
+                lastError = error;
+                if (!error?.isObserveRetryable || attempt >= OBSERVE_ATTEMPTS) throw error;
+                if (!canContinue()) {
+                    throw new Error('页面已切换或进入后台，已停止重试；此前请求结果尚未确认。');
+                }
+                const delay = OBSERVE_RETRY_DELAYS[attempt - 1];
+                onRetry(attempt + 1, delay);
+                await waiter(delay);
+                if (!canContinue()) {
+                    throw new Error('页面已切换或进入后台，已停止重试；此前请求结果尚未确认。');
+                }
+            }
+        }
+        throw lastError;
+    }
+
+    function formatObserveResult(result) {
+        const code = observeResponseCode(result) || 'UNKNOWN';
+        const wText = Number.isSafeInteger(result?.w_id) ? `W${result.w_id}` : '';
+        const aText = Number.isSafeInteger(result?.a_number) ? `A${result.a_number}` : '';
+        const serverMessage = cleanText(result?.message);
+        const mapping = {
+            CREATED: ['ok', `✅ 已加入观察：${wText || 'W 编号已创建'}\n状态：观察中`],
+            EXISTS: ['warning', `ℹ️ 该账号已在观察名单：${wText || '原 W 编号'}\n本次未新建记录，也未消耗新的 W 编号。`],
+            FORMAL_EXISTS: ['warning', `ℹ️ 该账号已是正式账号：${aText || '原 A 编号'}\n本次未新建观察记录。`],
+            ARCHIVED: ['warning', `⚠️ 该账号已归档：${wText || '原 W 编号'}\n本次未恢复或新建观察记录。`],
+            DELETED: ['error', `⛔ 原请求对应的观察记录已永久删除${wText ? `：${wText}` : ''}\n本次未复活记录。`],
+            INVALID: ['error', `⛔ 观察请求无效。${serverMessage ? `\n${serverMessage}` : ''}`],
+            REQUEST_INVALID: ['error', `⛔ 观察请求无效。${serverMessage ? `\n${serverMessage}` : ''}`],
+            CONFLICT: ['error', `⛔ 观察请求发生冲突。${serverMessage ? `\n${serverMessage}` : ''}`],
+            REQUEST_CONFLICT: ['error', `⛔ 观察请求编号已对应另一份内容。${serverMessage ? `\n${serverMessage}` : ''}`],
+            READ_ONLY: ['error', `⛔ 观察数据当前为只读。${serverMessage ? `\n${serverMessage}` : ''}`],
+            BUSY: ['warning', `⚠️ 观察写入正在处理中，请稍后重新检查。${serverMessage ? `\n${serverMessage}` : ''}`],
+            MANAGER_BUSY: ['warning', `⚠️ 管理器正在处理关键文件，请稍后重试。${serverMessage ? `\n${serverMessage}` : ''}`],
+            RECOVERY_REQUIRED: ['error', `⛔ 观察数据需要先恢复，本次未继续写入。${serverMessage ? `\n${serverMessage}` : ''}`],
+            SCHEMA_INVALID: ['error', `⛔ 观察数据结构无法验证，需要先恢复。${serverMessage ? `\n${serverMessage}` : ''}`],
+            MANAGER_SESSION_REQUIRED: ['error', `⛔ 当前管理器会话未授权观察写入。${serverMessage ? `\n${serverMessage}` : ''}`],
+            CLIENT_OUTDATED: ['error', `⛔ 当前标签页脚本版本已失效，请刷新页面。${serverMessage ? `\n${serverMessage}` : ''}`],
+            BACKGROUND_TAB_IGNORED: ['error', '⛔ 后台标签页请求已忽略，请切回当前标签页后重试。'],
+        };
+        const [kind, message] = mapping[code] || [
+            'error',
+            `⛔ 观察请求未得到可识别结果。\n状态：${code}${serverMessage ? `\n${serverMessage}` : ''}`,
+        ];
+        return { kind, message, code };
+    }
+
+    function setObserveDialogMessage(message = '') {
+        const element = panelEl('#douk-observe-error');
+        element.textContent = message;
+        element.hidden = !message;
+    }
+
+    function updateObserveReminderField() {
+        const custom = panelEl('#douk-observe-reminder').value === 'custom';
+        panelEl('#douk-observe-date-row').hidden = !custom;
+        panelEl('#douk-observe-time-row').hidden = !custom;
+        if (!custom) {
+            panelEl('#douk-observe-date').value = '';
+            panelEl('#douk-observe-time').value = '';
+        }
+    }
+
+    function openObserveDialog() {
+        if (isAdding || isClassifying || isObserving || !pageIsVisible()) return;
+        const profile = recognize();
+        if (!profileIsComplete(profile)) {
+            setStatus('error', '⛔ 当前主页资料未识别完整，不能加入观察。');
+            return;
+        }
+        observeProfile = { ...profile };
+        panelEl('#douk-observe-name').value = profile.nickname;
+        panelEl('#douk-observe-note').value = '';
+        panelEl('#douk-observe-reminder').value = '30';
+        panelEl('#douk-observe-date').value = '';
+        panelEl('#douk-observe-time').value = '';
+        panelEl('#douk-observe-dialog').querySelectorAll('input[name="douk-observe-reason"]').forEach((input) => {
+            input.checked = false;
+        });
+        setObserveDialogMessage();
+        updateObserveReminderField();
+        panelEl('#douk-observe-dialog').showModal();
+    }
+
+    function closeObserveDialog() {
+        if (isObserving) return;
+        const dialog = panelEl('#douk-observe-dialog');
+        if (dialog.open) dialog.close();
+        observeProfile = null;
+        setObserveDialogMessage();
+    }
+
+    async function submitObservation() {
+        if (isObserving || !observeProfile) return;
+        if (!pageIsVisible() || recognize().url !== observeProfile.url) {
+            setObserveDialogMessage('页面已切换或进入后台，请关闭窗口后重新识别。');
+            return;
+        }
+        const reasons = Array.from(
+            panelEl('#douk-observe-dialog').querySelectorAll('input[name="douk-observe-reason"]:checked'),
+            (input) => input.value
+        );
+        let payload;
+        try {
+            payload = buildObservationPayload(
+                observeProfile,
+                {
+                    reasons,
+                    displayName: panelEl('#douk-observe-name').value,
+                    note: panelEl('#douk-observe-note').value,
+                    reminder: panelEl('#douk-observe-reminder').value,
+                    customDate: panelEl('#douk-observe-date').value,
+                    customTime: panelEl('#douk-observe-time').value,
+                },
+                createRequestId()
+            );
+        } catch (error) {
+            setObserveDialogMessage(error.message);
+            return;
+        }
+
+        const fullPayload = {
+            ...payload,
+            client_version: VERSION,
+            page_visible: true,
+            tab_id: TAB_ID,
+        };
+        const addWasEnabled = !panelEl('#douk-add').disabled;
+        const screenshotTitle = panelEl('#douk-screenshot').title;
+        let closeAfter = false;
+        isObserving = true;
+        panelEl('#douk-observe-close').disabled = true;
+        panelEl('#douk-observe-cancel').disabled = true;
+        panelEl('#douk-observe-submit').disabled = true;
+        setAddEnabled(false);
+        setObserveEnabled(false, '观察请求处理中。');
+        setScreenshotEnabled(screenshotReady, '观察请求处理中。');
+        setCategoryState(currentCategoryState);
+        setObserveDialogMessage();
+        setStatus('wait', '正在提交观察请求（第 1/4 次）…');
+        try {
+            const result = await observeApiWithRetry(fullPayload, {
+                canContinue: () => pageIsVisible() && recognize().url === observeProfile?.url,
+                onRetry: (attempt, delay) => {
+                    setStatus('wait', `观察结果暂未确认，${delay / 1000} 秒后进行第 ${attempt}/4 次尝试…`);
+                },
+            });
+            const formatted = formatObserveResult(result);
+            setStatus(formatted.kind, formatted.message);
+            closeAfter = true;
+        } catch (error) {
+            const message = error?.isObserveRetryable
+                ? `${error.message}\n已完成最多 4 次尝试；结果仍未确认，请先在管理器观察名单中检查，勿立即重复提交。`
+                : error.message;
+            setObserveDialogMessage(message);
+            setStatus('error', `⛔ ${message}`);
+        } finally {
+            isObserving = false;
+            panelEl('#douk-observe-close').disabled = false;
+            panelEl('#douk-observe-cancel').disabled = false;
+            panelEl('#douk-observe-submit').disabled = false;
+            setAddEnabled(addWasEnabled);
+            setObserveEnabled(profileIsComplete(recognize()));
+            setScreenshotEnabled(screenshotReady, screenshotTitle);
+            setCategoryState(currentCategoryState);
+            if (closeAfter) closeObserveDialog();
+        }
     }
 
     function formatAddResultStatus(addData, screenshotLine, addDetails, screenshotDetails = '') {
@@ -1261,14 +1680,18 @@
         previewTimer = setTimeout(async () => {
             if (!pageIsVisible()) {
                 setAddEnabled(false);
+                setObserveEnabled(false, '后台标签页禁止观察写入。');
                 disableCategoriesForConnection('后台标签页已暂停分类操作。');
                 return;
             }
             const recognized = recognize();
+            const recognizedComplete = profileIsComplete(recognized);
+            setObserveEnabled(recognizedComplete);
             // URL 是稳定账号键；昵称/抖音号属于页面动态文本，不应用于判断是否换了账号。
             const profileKey = recognized.url;
 
             if (profileKey !== currentProfileKey) {
+                if (!isObserving && panelEl('#douk-observe-dialog').open) closeObserveDialog();
                 currentProfileKey = profileKey;
                 lastCompletedProfileKey = '';
                 markEditedByUser = false;
@@ -1294,7 +1717,7 @@
 
             // 页面可能仍在加载，所以识别不完整时不缓存完成状态。
             // 后续抖音页面出现新的外部 DOM 变化时会自动再识别；手动按钮也可强制再检测。
-            if (!profileIsComplete(recognized)) {
+            if (!recognizedComplete) {
                 const reason = recognized.douyin_id_status === 'conflict'
                     ? `页面中识别到不一致的抖音号候选值：${(recognized.douyin_id_candidates || []).join(' / ')}。`
                     : (!recognized.douyin_id
@@ -1401,7 +1824,7 @@
     }
 
     async function addCurrent() {
-        if (isAdding) return;
+        if (isAdding || isObserving) return;
         if (!pageIsVisible()) {
             setStatus('error', '⛔ 后台标签页禁止写入。请先切换到该标签页再操作。');
             return;
@@ -1414,6 +1837,7 @@
 
         isAdding = true;
         setAddEnabled(false);
+        setObserveEnabled(false, '正式添加处理中。');
         setScreenshotEnabled(false, '正在添加账号，暂不能截图…');
         setCategoryState(currentCategoryState);
         setStatus('wait', '正在重新读取 JSON 和 Excel 并执行最终检查…\n通过后才会同时写入两份文件。');
@@ -1449,18 +1873,19 @@
             );
             await captureAddedAccountScreenshot(result.data, addDetails);
         } catch (error) {
-            setStatus('error', `⛔ ${error.message}\n\n请查看 DouK 管理器的采集器日志。`);
+            setStatus('error', `⛔ ${error.message}\n\n请查看 BAT 黑框中的详细信息。`);
             if (error?.isConnectionFailure) disableCategoriesForConnection(error.message);
         } finally {
             isAdding = false;
             setCategoryState(currentCategoryState);
+            setObserveEnabled(profileIsComplete(recognize()));
             // The just-added account is now a duplicate, so do not re-enable Add on this page.
             setAddEnabled(false);
         }
     }
 
     async function classifyCurrent(category) {
-        if (isClassifying || isAdding || !CATEGORY_NAMES.includes(category)) return;
+        if (isClassifying || isAdding || isObserving || !CATEGORY_NAMES.includes(category)) return;
         if (!pageIsVisible()) {
             setStatus('error', '⛔ 后台标签页禁止分类修改。请先切换到该标签页。');
             setCategoryState({
@@ -1478,6 +1903,7 @@
         }
 
         isClassifying = true;
+        setObserveEnabled(false, '分类处理中。');
         setCategoryState(currentCategoryState);
         setStatus('wait', `正在校验 settings_master.json 中的真实 A 编号，并更新“${category}.txt”…`);
         try {
@@ -1521,10 +1947,11 @@
                 `${categoryStatus}\n\n账号状态：已收录\n分类状态：${currentClassification}\n${result.message}\n分类文件已重新排序；只有 3 个及以上连续编号才会合并为范围。`
             );
         } catch (error) {
-            setStatus('error', `⛔ ${error.message}\n\n分类 TXT 未进行自动重试。重启管理器中的采集服务后，请点击“重新识别”。`);
+            setStatus('error', `⛔ ${error.message}\n\n分类 TXT 未进行自动重试。重新启动 BAT 后，请点击“重新识别”。`);
             if (error?.isConnectionFailure) disableCategoriesForConnection(error.message);
         } finally {
             isClassifying = false;
+            setObserveEnabled(profileIsComplete(recognize()));
             setCategoryState(currentCategoryState);
         }
     }
@@ -1589,6 +2016,7 @@
             queuedPreview = false;
             queuedForcePreview = false;
             setAddEnabled(false);
+            setObserveEnabled(false, '后台标签页禁止观察写入。');
             setScreenshotEnabled(false, '后台标签页已暂停截图。');
             setCategoryState({
                 available: false,
@@ -1623,6 +2051,7 @@
         recognizeAndPreview(true);
     } else {
         setAddEnabled(false);
+        setObserveEnabled(false, '后台标签页禁止观察写入。');
         setCategoryState({
             available: false,
             status: 'unavailable',

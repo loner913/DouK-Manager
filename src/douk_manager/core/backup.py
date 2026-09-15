@@ -118,6 +118,33 @@ class BackupService:
             "database_quick_check": "ok",
         }
 
+    def has_watchlist_startup_history(self) -> bool:
+        """Return whether Startup storage contains evidence of prior W activation."""
+
+        startup_root = self.paths.backups / "Startup"
+        if not startup_root.exists():
+            return False
+        try:
+            for path in startup_root.rglob("*"):
+                if not path.is_file():
+                    continue
+                if path.name in self.STARTUP_DATA_FILES:
+                    return True
+                if path.name != "manifest.json":
+                    continue
+                try:
+                    manifest = read_json(path)
+                except (OSError, JsonFileError):
+                    continue
+                if (
+                    manifest.get("scope") == "startup"
+                    and manifest.get("schema") == self.STARTUP_MANIFEST_SCHEMA
+                ):
+                    return True
+        except OSError as exc:
+            raise BackupError("无法检查观察名单 Startup 历史。") from exc
+        return False
+
     def create_critical_snapshot(
         self,
         category: str,

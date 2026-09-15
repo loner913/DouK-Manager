@@ -5,7 +5,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from douk_manager.config import ManagedPaths
+from douk_manager.config import AppConfig, ManagedPaths
 from douk_manager.core.backup import BackupService
 from douk_manager.core.engine import (
     EngineService,
@@ -35,6 +35,30 @@ class StartupStage(Enum):
 
 
 @dataclass(frozen=True)
+class WatchlistActivationContext:
+    """Filesystem facts captured before Manager creates its runtime folders."""
+
+    config_existed_at_boot: bool
+    persistent_state_existed_at_boot: bool
+
+    @classmethod
+    def capture(cls, paths: ManagedPaths) -> "WatchlistActivationContext":
+        return cls(
+            config_existed_at_boot=paths.config_file.is_file(),
+            persistent_state_existed_at_boot=any(
+                path.exists()
+                for path in (
+                    paths.data,
+                    paths.logs,
+                    paths.backups,
+                    paths.tasks,
+                    paths.updates,
+                )
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class StartupSafetyResult:
     generation: int
     success: bool
@@ -46,6 +70,7 @@ class StartupSafetyResult:
     process_probe: ProcessProbe | None = None
     startup_backup: Path | None = None
     recovered_command: bool = False
+    watchlist_installation_id: str = ""
 
     @property
     def health_snapshot(self) -> dict[str, Any]:
@@ -67,10 +92,12 @@ class StartupSafetyService:
         paths: ManagedPaths,
         engine: EngineService,
         backup: BackupService,
+        activation_context: WatchlistActivationContext | None = None,
     ) -> None:
         self.paths = paths
         self.engine = engine
         self.backup = backup
+        self.activation_context = activation_context
 
     @staticmethod
     def _checkpoint(token: object | None) -> None:
@@ -158,6 +185,7 @@ class StartupSafetyService:
 
         self._checkpoint(token)
         startup_backup: Path | None = None
+        watchlist_installation_id = ""
         lock_entered = False
         try:
             with critical_section(self.paths.lock_file, timeout=5.0):
@@ -198,15 +226,14 @@ class StartupSafetyService:
 
                 self._checkpoint(token)
                 try:
-                    if self._observation_files_are_configured():
-                        watchlist = WatchlistService(self.paths)
-                        watchlist.block_writes(locked=True)
-                        startup_backup = self.backup.create_startup_snapshot(
-                            "Startup",
-                            {"operation": "application_start"},
-                            keep_latest=BackupService.STARTUP_KEEP_LATEST,
-                        )
-                        watchlist.mark_ready(locked=True)
+                    if (
+                        self._observation_files_are_configured()
+                        or self.activation_context is not None
+                    ):
+                        (
+                            startup_backup,
+                            watchlist_installation_id,
+                        ) = self._prepare_watchlist_startup()
                     else:
                         startup_backup = self.backup.create_critical_snapshot(
                             "Startup",
@@ -272,12 +299,56 @@ class StartupSafetyService:
             process_probe=process_probe,
             startup_backup=startup_backup,
             recovered_command=bool(recovered_command),
+            watchlist_installation_id=watchlist_installation_id,
+        )
+
+    def _prepare_watchlist_startup(self) -> tuple[Path, str]:
+        observation_paths = self._observation_paths()
+        existing_count = sum(path.exists() for path in observation_paths)
+        config = AppConfig.load(self.paths.config_file)
+        recorded_installation_id = config.watchlist_installation_id.strip()
+        watchlist = WatchlistService(self.paths)
+
+        if existing_count == 0:
+            if recorded_installation_id:
+                raise RuntimeError(
+                    "观察数据缺失，但配置已记录历史 installation_id；禁止重新初始化。"
+                )
+            if self.backup.has_watchlist_startup_history():
+                raise RuntimeError("检测到观察名单 Startup 历史；禁止从 W1 重新初始化。")
+            context = self.activation_context
+            if context is None or (
+                context.persistent_state_existed_at_boot
+                and not context.config_existed_at_boot
+            ):
+                raise RuntimeError("无法证明观察功能是首次启用，已阻止自动初始化。")
+            watchlist.initialize(initialization_evidence=True, locked=True)
+        elif existing_count != len(observation_paths):
+            raise RuntimeError("观察数据文件不完整，必须恢复后才能继续启动。")
+
+        watchlist.block_writes(locked=True)
+        _document, _watermark, control = watchlist.validate_all()
+        installation_id = str(control["installation_id"])
+        if recorded_installation_id and recorded_installation_id != installation_id:
+            raise RuntimeError("观察 installation_id 与配置历史不一致，已阻止启动。")
+
+        snapshot = self.backup.create_startup_snapshot(
+            "Startup",
+            {"operation": "application_start"},
+            keep_latest=BackupService.STARTUP_KEEP_LATEST,
+        )
+        if not recorded_installation_id:
+            config.watchlist_installation_id = installation_id
+            config.save(self.paths.config_file)
+        watchlist.mark_ready(locked=True)
+        return snapshot, installation_id
+
+    def _observation_paths(self) -> tuple[Path, Path, Path]:
+        return (
+            self.paths.watchlist,
+            self.paths.watchlist_w_watermark,
+            self.paths.watchlist_control,
         )
 
     def _observation_files_are_configured(self) -> bool:
-        paths = (
-            getattr(self.paths, "watchlist", None),
-            getattr(self.paths, "watchlist_w_watermark", None),
-            getattr(self.paths, "watchlist_control", None),
-        )
-        return any(path is not None and path.exists() for path in paths)
+        return any(path.exists() for path in self._observation_paths())

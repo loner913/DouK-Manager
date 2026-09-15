@@ -426,8 +426,13 @@ class WatchlistService:
     def is_initialized(self) -> bool:
         return all(path.is_file() for path in (self.paths.watchlist, self.paths.watermark, self.paths.control))
 
-    def initialize(self, *, initialization_evidence: bool) -> None:
-        with self._lock(False):
+    def initialize(
+        self,
+        *,
+        initialization_evidence: bool,
+        locked: bool = False,
+    ) -> None:
+        with self._lock(locked):
             if any(path.exists() for path in (self.paths.watchlist, self.paths.watermark, self.paths.control)):
                 raise WatchlistError("INITIALIZATION_CONFLICT", "观察数据已存在，禁止重新初始化。")
             if not initialization_evidence:
@@ -1203,9 +1208,9 @@ class WatchlistService:
         if review_after_days is not None and next_review_at is not None:
             raise WatchlistError("REQUEST_INVALID", "提醒时间字段不能同时提交。")
         if review_after_days is not None and (
-            not _is_int(review_after_days) or review_after_days not in {7, 30, 90}
+            not _is_int(review_after_days) or review_after_days not in {7, 15, 30, 45, 90}
         ):
-            raise WatchlistError("REQUEST_INVALID", "提醒天数只能是 7、30 或 90。")
+            raise WatchlistError("REQUEST_INVALID", "提醒天数只能是 7、15、30、45 或 90。")
         if next_review_at is not None:
             if not isinstance(next_review_at, str):
                 raise WatchlistError("REQUEST_INVALID", "自定义提醒时间无效。")

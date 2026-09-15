@@ -115,6 +115,41 @@ class BackupTests(unittest.TestCase):
                 self.assertEqual(relative["sha256"], sha256_file(copied))
             self.assertEqual(read_json(snapshot / "Data" / "watchlist_control.json")["write_gate"], "ready")
 
+    def test_watchlist_startup_history_detects_manifest_and_observation_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_test_paths(Path(directory))
+            service = BackupService(paths)
+            self.assertFalse(service.has_watchlist_startup_history())
+
+            legacy = paths.backups / "Startup" / "legacy"
+            legacy.mkdir(parents=True)
+            write_json_atomic(
+                legacy / "manifest.json",
+                {"schema": 2, "scope": "critical", "complete": True},
+            )
+            self.assertFalse(service.has_watchlist_startup_history())
+
+            write_json_atomic(
+                legacy / "manifest.json",
+                {"schema": 3, "scope": "startup", "complete": True},
+            )
+            self.assertTrue(service.has_watchlist_startup_history())
+
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_test_paths(Path(directory))
+            service = BackupService(paths)
+            artifact = (
+                paths.backups
+                / "Startup"
+                / "_quarantine"
+                / "interrupted"
+                / "Data"
+                / "watchlist_control.json"
+            )
+            artifact.parent.mkdir(parents=True)
+            artifact.write_text("{}", encoding="utf-8")
+            self.assertTrue(service.has_watchlist_startup_history())
+
     def test_startup_rotation_keeps_only_latest_valid_completed_snapshots(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             paths, watchlist = self._watchlist_service(directory)

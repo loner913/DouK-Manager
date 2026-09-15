@@ -17,6 +17,7 @@ from PySide6.QtCore import (
     QObject,
     QRect,
     QThread,
+    QTime,
     Qt,
     QTimer,
     QUrl,
@@ -55,6 +56,7 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
+    QTimeEdit,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -768,7 +770,7 @@ class WatchlistTableModel(QAbstractTableModel):
 
 
 class WatchlistReviewDialog(QDialog):
-    """Review editor with local dates and read-only captured identity."""
+    """Review editor with local dates/times and read-only captured identity."""
 
     REASONS = tuple(WATCHLIST_REASON_LABELS.items())
 
@@ -822,8 +824,9 @@ class WatchlistReviewDialog(QDialog):
             ).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
         self._original_review = default_review
         self.review_mode = QComboBox()
-        for label, value in (("保留原提醒", "keep"), ("7天后", 7), ("30天后", 30),
-                             ("90天后", 90), ("自定义日期", "custom")):
+        for label, value in (("保留原提醒", "keep"), ("7天后", 7), ("15天后", 15),
+                             ("30天后", 30), ("45天后", 45), ("90天后", 90),
+                             ("自定义日期和时间", "custom")):
             self.review_mode.addItem(label, value)
         self.review_date = QDateEdit()
         self.review_date.setDisplayFormat("yyyy-MM-dd")
@@ -831,15 +834,21 @@ class WatchlistReviewDialog(QDialog):
         local_review = parse_utc(default_review).astimezone()
         self.review_date.setDate(QDate(local_review.year, local_review.month, local_review.day))
         self.review_date.setEnabled(False)
+        self.review_time = QTimeEdit()
+        self.review_time.setDisplayFormat("HH:mm")
+        self.review_time.setTime(QTime(local_review.hour, local_review.minute))
+        self.review_time.setEnabled(False)
         reminder_row = QHBoxLayout()
         reminder_row.addWidget(self.review_mode)
         reminder_row.addWidget(self.review_date, 1)
+        reminder_row.addWidget(self.review_time)
         form.addRow("下次复查", reminder_row)
         self.review_time_label = QLabel(local_review.strftime("本地时间 %Y-%m-%d %H:%M"))
         self.review_time_label.setWordWrap(True)
         form.addRow("", self.review_time_label)
         self.review_mode.currentIndexChanged.connect(self._review_mode_changed)
         self.review_date.dateChanged.connect(self._review_date_changed)
+        self.review_time.timeChanged.connect(self._review_time_changed)
         root.addLayout(form)
 
         buttons = QDialogButtonBox(
@@ -887,26 +896,45 @@ QDialog#watchlistReviewDialog QCalendarWidget QWidget {{ background: {p.surface}
 
     def _review_mode_changed(self) -> None:
         mode = self.review_mode.currentData()
-        self.review_date.setEnabled(mode == "custom")
+        custom = mode == "custom"
+        self.review_date.setEnabled(custom)
+        self.review_time.setEnabled(custom)
         if mode == "keep":
             local = parse_utc(self._original_review).astimezone()
             self.review_date.setDate(QDate(local.year, local.month, local.day))
+            self.review_time.setTime(QTime(local.hour, local.minute))
         elif isinstance(mode, int):
-            self.review_date.setDate(QDate.currentDate().addDays(mode))
+            local = (datetime.now(timezone.utc) + timedelta(days=mode)).astimezone()
+            self.review_date.setDate(QDate(local.year, local.month, local.day))
+            self.review_time.setTime(QTime(local.hour, local.minute))
         self._review_date_changed()
 
     def _review_date_changed(self) -> None:
-        if self.review_mode.currentData() == "keep":
+        mode = self.review_mode.currentData()
+        if mode == "keep":
             local = parse_utc(self._original_review).astimezone()
-            self.review_time_label.setText(local.strftime("本地时间 %Y-%m-%d %H:%M"))
+        elif isinstance(mode, int):
+            local = (datetime.now(timezone.utc) + timedelta(days=mode)).astimezone()
         else:
-            self.review_time_label.setText(f"本地时间 {self.review_date.date().toString('yyyy-MM-dd')} 09:00")
+            day = self.review_date.date()
+            clock = self.review_time.time()
+            local = datetime(day.year(), day.month(), day.day(), clock.hour(), clock.minute())
+        self.review_time_label.setText(local.strftime("本地时间 %Y-%m-%d %H:%M"))
+
+    def _review_time_changed(self) -> None:
+        self._review_date_changed()
 
     def _selected_review_time(self) -> str:
-        if self.review_mode.currentData() == "keep":
+        mode = self.review_mode.currentData()
+        if mode == "keep":
             return self._original_review
+        if isinstance(mode, int):
+            return (datetime.now(timezone.utc) + timedelta(days=mode)).replace(microsecond=0).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
         day = self.review_date.date()
-        local = datetime(day.year(), day.month(), day.day(), 9)
+        clock = self.review_time.time()
+        local = datetime(day.year(), day.month(), day.day(), clock.hour(), clock.minute())
         return local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     @property
@@ -926,7 +954,7 @@ QDialog#watchlistReviewDialog QCalendarWidget QWidget {{ background: {p.surface}
         try:
             selected_time = parse_utc(next_review_at)
             if self.review_mode.currentData() != "keep" and selected_time <= datetime.now(timezone.utc):
-                QMessageBox.warning(self, "提醒日期已过", "请选择尚未到达的本地日期，提醒时间为当天09:00。")
+                QMessageBox.warning(self, "提醒时间已过", "请选择尚未到达的本地日期和时间。")
                 return
         except Exception:
             QMessageBox.warning(self, "时间格式无效", "下次复查时间必须是 UTC RFC3339 格式。")
@@ -1765,6 +1793,7 @@ class MainWindow(QMainWindow):
                 paths=self.controller.paths,
                 engine=self.controller.engine,
                 backup=self.controller.backup,
+                activation_context=self.controller.watchlist_activation_context,
             )
             spec = TaskSpec(
                 task_type="startup_safety",

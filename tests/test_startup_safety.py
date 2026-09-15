@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from douk_manager.config import AppConfig
 from douk_manager.core import engine as engine_module
 from douk_manager.core.backup import BackupService
 from douk_manager.core.engine import EngineService
@@ -155,19 +156,36 @@ class StartupSafetyServiceTests(unittest.TestCase):
         return startup_module, state
 
     def _service(
-        self, root: Path
+        self,
+        root: Path,
+        *,
+        activation_context: object | None = None,
     ) -> tuple[object, Mock, Mock, object, object]:
         module, probe_state = self._api()
         paths = make_test_paths(root)
         engine = Mock(spec=EngineService)
         backup = Mock(spec=BackupService)
+        backup.has_watchlist_startup_history.return_value = False
         engine.recover_batch_command_if_idle.return_value = False
         service = module.StartupSafetyService(
             paths=paths,
             engine=engine,
             backup=backup,
+            activation_context=activation_context,
         )
         return service, engine, backup, probe_state, paths
+
+    def _activation_context(
+        self,
+        *,
+        config_existed: bool,
+        persistent_state_existed: bool,
+    ) -> object:
+        module, _ = self._api()
+        return module.WatchlistActivationContext(
+            config_existed_at_boot=config_existed,
+            persistent_state_existed_at_boot=persistent_state_existed,
+        )
 
     @staticmethod
     def _probe(state: object, details: str = "synthetic process probe") -> object:
@@ -312,6 +330,10 @@ class StartupSafetyServiceTests(unittest.TestCase):
             )
             backup.create_critical_snapshot.assert_not_called()
             self.assertEqual(read_json(paths.watchlist_control)["write_gate"], "ready")
+            self.assertEqual(
+                AppConfig.load(paths.config_file).watchlist_installation_id,
+                read_json(paths.watchlist_control)["installation_id"],
+            )
 
     def test_configured_watchlist_backup_failure_leaves_gate_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -327,6 +349,256 @@ class StartupSafetyServiceTests(unittest.TestCase):
             self.assertFalse(result.success)
             self.assertEqual(result.stage, startup_module.StartupStage.BACKUP)
             self.assertEqual(read_json(paths.watchlist_control)["write_gate"], "blocked")
+
+    def test_fresh_runtime_initializes_before_first_six_file_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            context = self._activation_context(
+                config_existed=False,
+                persistent_state_existed=False,
+            )
+            service, engine, backup, probe_state, paths = self._service(
+                Path(directory),
+                activation_context=context,
+            )
+            snapshot = paths.backups / "Startup-first-activation"
+            engine.probe_external_running.return_value = self._probe(probe_state.SAFE)
+            backup.create_startup_snapshot.return_value = snapshot
+
+            result = service.run(generation=16, token=None)
+
+            self.assertTrue(result.success)
+            self.assertEqual(result.startup_backup, snapshot)
+            backup.create_startup_snapshot.assert_called_once_with(
+                "Startup",
+                {"operation": "application_start"},
+                keep_latest=BackupService.STARTUP_KEEP_LATEST,
+            )
+            backup.create_critical_snapshot.assert_not_called()
+            document = read_json(paths.watchlist)
+            watermark = read_json(paths.watchlist_w_watermark)
+            control = read_json(paths.watchlist_control)
+            self.assertEqual(document["next_w_id"], 1)
+            self.assertEqual(watermark["next_w_id"], 1)
+            self.assertEqual(control["initialization_state"], "complete")
+            self.assertEqual(control["write_gate"], "ready")
+            self.assertEqual(result.watchlist_installation_id, control["installation_id"])
+            self.assertEqual(
+                AppConfig.load(paths.config_file).watchlist_installation_id,
+                control["installation_id"],
+            )
+
+    def test_legacy_config_is_trusted_once_for_first_activation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            context = self._activation_context(
+                config_existed=True,
+                persistent_state_existed=True,
+            )
+            service, engine, backup, probe_state, paths = self._service(
+                Path(directory),
+                activation_context=context,
+            )
+            AppConfig(
+                engine_exe=str(paths.engine_exe),
+                video_root=str(paths.video_root),
+                index_root=str(paths.index_root),
+            ).save(paths.config_file)
+            engine.probe_external_running.return_value = self._probe(probe_state.SAFE)
+            backup.create_startup_snapshot.return_value = paths.backups / "legacy-upgrade"
+
+            result = service.run(generation=17, token=None)
+
+            self.assertTrue(result.success)
+            self.assertTrue(WatchlistService(paths).is_initialized())
+
+    def test_ambiguous_preexisting_runtime_does_not_initialize(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            context = self._activation_context(
+                config_existed=False,
+                persistent_state_existed=True,
+            )
+            service, engine, backup, probe_state, paths = self._service(
+                Path(directory),
+                activation_context=context,
+            )
+            engine.probe_external_running.return_value = self._probe(probe_state.SAFE)
+
+            result = service.run(generation=18, token=None)
+
+            self.assertFalse(result.success)
+            self.assertEqual(result.stage, startup_module.StartupStage.BACKUP)
+            self.assertIn("无法证明", result.details)
+            self.assertFalse(WatchlistService(paths).is_initialized())
+            backup.create_startup_snapshot.assert_not_called()
+            backup.create_critical_snapshot.assert_not_called()
+
+    def test_recorded_installation_id_prevents_reset_after_data_loss(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            context = self._activation_context(
+                config_existed=True,
+                persistent_state_existed=True,
+            )
+            service, engine, backup, probe_state, paths = self._service(
+                Path(directory),
+                activation_context=context,
+            )
+            AppConfig(
+                engine_exe=str(paths.engine_exe),
+                video_root=str(paths.video_root),
+                index_root=str(paths.index_root),
+                watchlist_installation_id="synthetic-prior-installation",
+            ).save(paths.config_file)
+            engine.probe_external_running.return_value = self._probe(probe_state.SAFE)
+
+            result = service.run(generation=19, token=None)
+
+            self.assertFalse(result.success)
+            self.assertIn("禁止重新初始化", result.details)
+            self.assertFalse(WatchlistService(paths).is_initialized())
+            backup.create_startup_snapshot.assert_not_called()
+
+    def test_startup_history_prevents_reset_when_live_observation_files_are_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            context = self._activation_context(
+                config_existed=False,
+                persistent_state_existed=False,
+            )
+            service, engine, backup, probe_state, paths = self._service(
+                Path(directory),
+                activation_context=context,
+            )
+            backup.has_watchlist_startup_history.return_value = True
+            engine.probe_external_running.return_value = self._probe(probe_state.SAFE)
+
+            result = service.run(generation=20, token=None)
+
+            self.assertFalse(result.success)
+            self.assertIn("Startup 历史", result.details)
+            self.assertFalse(WatchlistService(paths).is_initialized())
+            backup.create_startup_snapshot.assert_not_called()
+
+    def test_partial_observation_state_is_not_overwritten(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            context = self._activation_context(
+                config_existed=True,
+                persistent_state_existed=True,
+            )
+            service, engine, backup, probe_state, paths = self._service(
+                Path(directory),
+                activation_context=context,
+            )
+            original = b'{"synthetic":"partial"}\n'
+            paths.watchlist.write_bytes(original)
+            engine.probe_external_running.return_value = self._probe(probe_state.SAFE)
+
+            result = service.run(generation=21, token=None)
+
+            self.assertFalse(result.success)
+            self.assertIn("文件不完整", result.details)
+            self.assertEqual(paths.watchlist.read_bytes(), original)
+            self.assertFalse(paths.watchlist_w_watermark.exists())
+            self.assertFalse(paths.watchlist_control.exists())
+            backup.create_startup_snapshot.assert_not_called()
+
+    def test_first_snapshot_failure_keeps_complete_data_blocked_without_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            context = self._activation_context(
+                config_existed=False,
+                persistent_state_existed=False,
+            )
+            service, engine, backup, probe_state, paths = self._service(
+                Path(directory),
+                activation_context=context,
+            )
+            engine.probe_external_running.return_value = self._probe(probe_state.SAFE)
+            backup.create_startup_snapshot.side_effect = OSError("synthetic first snapshot failure")
+
+            result = service.run(generation=22, token=None)
+
+            self.assertFalse(result.success)
+            control = read_json(paths.watchlist_control)
+            self.assertEqual(control["initialization_state"], "complete")
+            self.assertEqual(control["write_gate"], "blocked")
+            self.assertEqual(
+                AppConfig.load(paths.config_file).watchlist_installation_id,
+                "",
+            )
+
+    def test_real_first_activation_snapshot_restart_and_loss_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            module, probe_state = self._api()
+            paths = make_test_paths(Path(directory))
+            engine = Mock(spec=EngineService)
+            engine.probe_external_running.return_value = self._probe(probe_state.SAFE)
+            engine.recover_batch_command_if_idle.return_value = False
+            backup = BackupService(paths)
+            fresh = self._activation_context(
+                config_existed=False,
+                persistent_state_existed=False,
+            )
+
+            first = module.StartupSafetyService(
+                paths=paths,
+                engine=engine,
+                backup=backup,
+                activation_context=fresh,
+            ).run(generation=23, token=None)
+
+            self.assertTrue(first.success)
+            first_control = read_json(first.startup_backup / "Data" / "watchlist_control.json")
+            live_control = read_json(paths.watchlist_control)
+            self.assertEqual(first_control["initialization_state"], "complete")
+            self.assertEqual(first_control["write_gate"], "blocked")
+            self.assertEqual(live_control["write_gate"], "ready")
+            installation_id = live_control["installation_id"]
+            self.assertEqual(
+                AppConfig.load(paths.config_file).watchlist_installation_id,
+                installation_id,
+            )
+
+            existing = self._activation_context(
+                config_existed=True,
+                persistent_state_existed=True,
+            )
+            second = module.StartupSafetyService(
+                paths=paths,
+                engine=engine,
+                backup=backup,
+                activation_context=existing,
+            ).run(generation=24, token=None)
+            self.assertTrue(second.success)
+            self.assertEqual(
+                read_json(paths.watchlist_control)["installation_id"],
+                installation_id,
+            )
+
+            for path in (
+                paths.watchlist,
+                paths.watchlist_w_watermark,
+                paths.watchlist_control,
+            ):
+                path.unlink()
+            snapshots_before = {
+                item.name
+                for item in (paths.backups / "Startup").iterdir()
+                if item.is_dir()
+            }
+            lost = module.StartupSafetyService(
+                paths=paths,
+                engine=engine,
+                backup=backup,
+                activation_context=existing,
+            ).run(generation=25, token=None)
+            self.assertFalse(lost.success)
+            self.assertIn("禁止重新初始化", lost.details)
+            self.assertFalse(WatchlistService(paths).is_initialized())
+            self.assertEqual(
+                snapshots_before,
+                {
+                    item.name
+                    for item in (paths.backups / "Startup").iterdir()
+                    if item.is_dir()
+                },
+            )
 
     def test_lock_recheck_stops_backup_when_process_becomes_running(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

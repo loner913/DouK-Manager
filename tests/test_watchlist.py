@@ -105,6 +105,16 @@ class WatchlistTests(unittest.TestCase):
             self.assertEqual(conflict.exception.code, "REQUEST_CONFLICT")
             self.assertEqual(read_json(paths.watchlist), before)
 
+    def test_relative_review_options_accept_fifteen_and_forty_five_days(self) -> None:
+        for days in (15, 45):
+            with self.subTest(days=days), tempfile.TemporaryDirectory() as directory:
+                paths, service = self._service(directory)
+                payload = self._payload(url=f"https://www.douyin.com/user/{days}")
+                payload["review_after_days"] = days
+                result = service.observe(payload)
+                self.assertEqual(result["status"], "CREATED")
+                self.assertEqual(read_json(paths.watchlist)["records"][0]["w_id"], 1)
+
     def test_formal_duplicate_uses_loose_compare_without_consuming_w(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             paths, service = self._service(directory)
