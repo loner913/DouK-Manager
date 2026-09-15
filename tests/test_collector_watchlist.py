@@ -11,6 +11,7 @@ import threading
 import time
 import unittest
 import uuid
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
 from urllib.request import urlopen
@@ -18,12 +19,95 @@ from urllib.request import urlopen
 from openpyxl import Workbook
 
 from douk_manager.core.watchlist import WatchlistService
+from douk_manager.core import watchlist as watchlist_module
 from douk_manager.core.watchlist_session import ManagerInstanceLease
 from douk_manager.vendor import collector_server
 from tests.helpers import make_test_paths
 
 
 class CollectorWatchlistHttpTests(unittest.TestCase):
+    def test_active_request_is_busy_and_abandoned_pending_requires_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            paths = make_test_paths(Path(directory), account_count=2)
+            service = WatchlistService(paths)
+            service.initialize(initialization_evidence=True)
+            service.mark_ready()
+            for name, value in {
+                "SETTINGS_PATH": paths.master_settings,
+                "WATCHLIST_PATH": paths.watchlist,
+                "WATCHLIST_WATERMARK_PATH": paths.watchlist_w_watermark,
+                "WATCHLIST_CONTROL_PATH": paths.watchlist_control,
+                "GLOBAL_LOCK_PATH": paths.lock_file,
+                "MANAGER_INSTANCE_LOCK_PATH": paths.instance_lock_file,
+            }.items():
+                stack.enter_context(patch.object(collector_server, name, value))
+            for name in ("manager_session_active", "manager_instance_owner_present"):
+                stack.enter_context(patch.object(collector_server, name, return_value=True))
+            server = collector_server.ThreadingHTTPServer(("127.0.0.1", 0), collector_server.Handler)
+            server_thread = threading.Thread(target=server.serve_forever)
+            server_thread.start()
+            entered, release = threading.Event(), threading.Event()
+            original = self._payload()
+            other = {**original, "request_id": str(uuid.uuid4()), "note": "other request"}
+            real_write = watchlist_module.write_json_atomic
+            failures = []
+
+            def interrupt_body(path, value):
+                if path == paths.watchlist:
+                    entered.set()
+                    if not release.wait(5):
+                        raise RuntimeError("synthetic request was not released")
+                    raise PermissionError("synthetic interrupted body")
+                real_write(path, value)
+
+            def original_request():
+                try:
+                    service.observe(original)
+                except Exception as exc:
+                    failures.append(exc)
+
+            def post(payload):
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+                try:
+                    connection.request("POST", "/watchlist/observe", json.dumps(payload), {
+                        "Content-Type": "application/json", "X-DouK-Token": collector_server.ACCESS_TOKEN,
+                    })
+                    response = connection.getresponse()
+                    return response.status, json.loads(response.read())
+                finally:
+                    connection.close()
+
+            request_thread = threading.Thread(target=original_request)
+            try:
+                with patch.object(watchlist_module, "write_json_atomic", side_effect=interrupt_body):
+                    request_thread.start()
+                    try:
+                        self.assertTrue(entered.wait(2))
+                        targets = (paths.watchlist, paths.watchlist_control, paths.watchlist_w_watermark)
+                        before = [path.read_bytes() for path in targets]
+                        status, body = post(other)
+                        self.assertEqual((status, body["code"], body["details"]["message_code"]), (409, "BUSY", "BUSY"))
+                        self.assertEqual(before, [path.read_bytes() for path in targets])
+                    finally:
+                        release.set()
+                        request_thread.join(5)
+                self.assertFalse(request_thread.is_alive())
+                self.assertEqual(len(failures), 1)
+                self.assertIsInstance(failures[0], PermissionError)
+                status, body = post(other)
+                self.assertEqual((status, body["code"]), (503, "RECOVERY_REQUIRED"))
+                self.assertEqual(before, [path.read_bytes() for path in targets])
+                status, body = post(original)
+                self.assertEqual((status, body["status"], body["w_id"]), (200, "EXISTS", 1))
+                self.assertEqual(service.snapshot().next_w_id, 2)
+            finally:
+                release.set()
+                if request_thread.ident is not None:
+                    request_thread.join(5)
+                server.shutdown()
+                server.server_close()
+                server_thread.join(5)
+
     @staticmethod
     def _payload() -> dict[str, object]:
         return {

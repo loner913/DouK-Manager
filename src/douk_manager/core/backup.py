@@ -357,6 +357,15 @@ class BackupService:
         restored_watermark = {"schema_version": WATERMARK_SCHEMA_VERSION, "next_w_id": merged_next}
         validate_control(restored_control)
 
+        deleted_w_ids = {
+            item["w_id"] for item in restored_control["request_receipts"]
+            if item["outcome"] == "deleted" and item["w_id"] is not None
+        }
+        snapshot_data["records"] = [
+            item for item in snapshot_data["records"] if item["w_id"] not in deleted_w_ids
+        ]
+        snapshot_data = validate_document(snapshot_data)
+
         protection = (
             self.paths.backups
             / "Recovery"
@@ -380,6 +389,11 @@ class BackupService:
                     backup_target = protection / PurePosixPath(relative)
                     backup_target.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(destination, backup_target)
+                if destination == self.paths.watchlist:
+                    # Never publish the unfiltered snapshot body, even temporarily.
+                    write_json_atomic(destination, snapshot_data)
+                    replaced.append((destination, backup_target))
+                    continue
                 temp = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.restore")
                 temp.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, temp)
@@ -388,7 +402,6 @@ class BackupService:
                     raise BackupError(f"Startup 恢复临时副本校验失败：{relative}")
                 os.replace(temp, destination)
                 replaced.append((destination, backup_target))
-            write_json_atomic(self.paths.watchlist, snapshot_data)
             write_json_atomic(self.paths.watchlist_w_watermark, restored_watermark)
             write_json_atomic(self.paths.watchlist_control, restored_control)
             WatchlistService(self.paths).validate_all()

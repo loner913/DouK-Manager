@@ -409,6 +409,23 @@ class WatchlistTests(unittest.TestCase):
                 service.observe(payload)
             self.assertEqual(raised.exception.code, "RECOVERY_REQUIRED")
 
+    def test_deleted_receipt_with_resurrected_body_cannot_become_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths, service = self._service(directory)
+            service.observe(self._payload())
+            old_document = read_json(paths.watchlist)
+            archived = service.archive(1, expected_revision=service.snapshot().revision)
+            service.delete_archived(
+                1, request_id=str(uuid.uuid4()), expected_revision=archived.revision
+            )
+            service.block_writes()
+            write_json_atomic(paths.watchlist, old_document)
+            self.assertTrue(service.has_unresolved_recovery())
+            with self.assertRaises(WatchlistError) as raised:
+                service.mark_ready()
+            self.assertEqual(raised.exception.code, "RECOVERY_REQUIRED")
+            self.assertEqual(read_json(paths.watchlist_control)["write_gate"], "blocked")
+
     def test_delete_pending_replay_repairs_missing_body_without_repeating_delete(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             paths, service = self._service(directory)

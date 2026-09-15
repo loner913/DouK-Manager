@@ -319,6 +319,61 @@ class BackupTests(unittest.TestCase):
             for name, value in formal_volume_before.items():
                 self.assertEqual((paths.volume / name).read_bytes(), value)
 
+    def test_restore_old_snapshot_never_revives_deleted_body(self) -> None:
+        for snapshot_state in ("watching", "archived"):
+            with self.subTest(snapshot_state=snapshot_state), tempfile.TemporaryDirectory() as directory:
+                paths, watchlist = self._watchlist_service(directory)
+                payload = {
+                    "request_id": str(uuid4()),
+                    "url": "https://www.douyin.com/user/42",
+                    "captured_nickname": "synthetic",
+                    "display_name": "synthetic",
+                    "douyin_id": "synthetic_42",
+                    "nickname_blank": False,
+                    "reasons": ["few_works"],
+                    "note": "synthetic",
+                }
+                watchlist.observe(payload)
+                if snapshot_state == "archived":
+                    watchlist.archive(1, expected_revision=watchlist.snapshot().revision)
+                backup = BackupService(paths)
+                snapshot = backup.create_startup_snapshot("Startup")
+                if snapshot_state == "watching":
+                    watchlist.archive(1, expected_revision=watchlist.snapshot().revision)
+                watchlist.delete_archived(
+                    1, request_id=str(uuid4()), expected_revision=watchlist.snapshot().revision
+                )
+                volume_before = {
+                    name: (paths.volume / name).read_bytes() for name in backup.CRITICAL_FILENAMES
+                }
+                receipts_before = read_json(paths.watchlist_control)["request_receipts"]
+                targets = (paths.watchlist, paths.watchlist_control, paths.watchlist_w_watermark)
+                before = [path.read_bytes() for path in targets]
+
+                def fail_watermark(path, value):
+                    if path == paths.watchlist_w_watermark:
+                        raise PermissionError("synthetic restore failure")
+                    write_json_atomic(path, value)
+
+                with patch("douk_manager.core.backup.write_json_atomic", side_effect=fail_watermark):
+                    with self.assertRaises(BackupError):
+                        backup.restore_startup_snapshot(snapshot)
+                self.assertEqual(before, [path.read_bytes() for path in targets])
+                for _ in range(2):
+                    backup.restore_startup_snapshot(snapshot)
+                    self.assertEqual(watchlist.snapshot().records, ())
+                    self.assertEqual(watchlist.snapshot().next_w_id, 2)
+                    control = read_json(paths.watchlist_control)
+                    self.assertEqual(control["write_gate"], "blocked")
+                    self.assertEqual(control["request_receipts"], receipts_before)
+                    self.assertFalse(watchlist.has_unresolved_recovery())
+                    watchlist.mark_ready()
+                    self.assertEqual(watchlist.observe(payload)["status"], "DELETED")
+                fresh = watchlist.observe({**payload, "request_id": str(uuid4())})
+                self.assertEqual(fresh["w_id"], 2)
+                for name, value in volume_before.items():
+                    self.assertEqual((paths.volume / name).read_bytes(), value)
+
 
 if __name__ == "__main__":
     unittest.main()

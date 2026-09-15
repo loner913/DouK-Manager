@@ -555,6 +555,8 @@ class WatchlistService:
             for item in control["request_receipts"]
             if item["outcome"] == "deleted" and item["w_id"] is not None
         }
+        if present_w_ids & deleted_w_ids:
+            return True
         for receipt in control["request_receipts"]:
             if receipt["outcome"] in {"committed", "exists"}:
                 if (

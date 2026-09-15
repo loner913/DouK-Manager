@@ -2843,7 +2843,12 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
 
-            with critical_section(GLOBAL_LOCK_PATH, timeout=3.0):
+            observing = route == "/watchlist/observe"
+            with critical_section(
+                GLOBAL_LOCK_PATH,
+                timeout=0.0 if observing else 3.0,
+                thread_timeout=0.0 if observing else -1,
+            ):
                 if route == "/preview":
                     result = preview(payload)
                 elif route == "/add":
@@ -2866,9 +2871,11 @@ class Handler(BaseHTTPRequestHandler):
                 status = 410
             self._send_json(result, status)
         except LockBusyError:
+            observing = route == "/watchlist/observe"
             error = CollectorError(
-                "MANAGER_BUSY",
+                "BUSY" if observing else "MANAGER_BUSY",
                 "DouK 管理器正在备份或修改正式配置，请稍后重试。",
+                details={"message_code": "BUSY"} if observing else None,
                 stage="precheck",
             )
             self._send_json(error.response(), 409)

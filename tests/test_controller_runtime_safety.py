@@ -2093,7 +2093,16 @@ class ControllerRuntimeSafetyTests(unittest.TestCase):
         timeout = next(
             keyword.value for keyword in lock_call.keywords if keyword.arg == "timeout"
         )
-        self.assertEqual(ast.literal_eval(timeout), 3.0)
+        self.assertIsInstance(timeout, ast.IfExp)
+        self.assertEqual(ast.unparse(timeout.test), "observing")
+        self.assertEqual(ast.literal_eval(timeout.body), 0.0)
+        self.assertEqual(ast.literal_eval(timeout.orelse), 3.0)
+        thread_timeout = next(
+            keyword.value for keyword in lock_call.keywords if keyword.arg == "thread_timeout"
+        )
+        self.assertEqual(ast.unparse(thread_timeout.test), "observing")
+        self.assertEqual(ast.literal_eval(thread_timeout.body), 0.0)
+        self.assertEqual(ast.literal_eval(thread_timeout.orelse), -1)
 
     def test_collector_post_returns_busy_without_writes_when_shared_lock_is_held(
         self,
