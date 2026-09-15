@@ -34,4 +34,4 @@ def write_task(directory: Path, name: str, ended: datetime, *, count=1200,
         at=ended - timedelta(seconds=duration), merge=True, include_date=True)
     path = directory / f"DownloadTask_{name}.log"
     path.write_text(start + "\n\n" + format_summary_for_task_log(summary, ended), encoding="utf-8")
-    return path
+    return path.resolve()
