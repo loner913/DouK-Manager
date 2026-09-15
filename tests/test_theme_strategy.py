@@ -55,3 +55,15 @@ class ThemeStrategyTests(unittest.TestCase):
             settings = QSettings(str(Path(directory) / "ui.ini"), QSettings.IniFormat)
             settings.setValue("ui/theme/strategy", "invalid")
             self.assertEqual(WindowStateStore(settings).load_theme_strategy(), "system")
+
+    def test_dark_table_corner_uses_the_scoped_header_surface(self):
+        stylesheet = ThemeManager(ThemeMode.DARK).stylesheet()
+
+        self.assertIn(
+            'QWidget[legacyRoot="true"] QTableCornerButton::section',
+            stylesheet,
+        )
+        corner_rule = stylesheet.split("QTableCornerButton::section", 1)[1].split(
+            "}", 1
+        )[0]
+        self.assertIn("background: #122235;", corner_rule)

@@ -237,10 +237,16 @@ QLabel#modernPageSubtitle {{
     color: {p.text_secondary};
     font-size: 12px;
 }}
-QLabel#modernClockDate {{ color: {p.text_primary}; font-size: 14px; font-weight: 700; }}
-QLabel#modernClockTime {{
+QLabel#modernClockDate {{
+    min-width: 126px;
     color: {p.text_primary};
-    font-size: 24px;
+    font-size: 16px;
+    font-weight: 700;
+}}
+QLabel#modernClockTime {{
+    min-width: 126px;
+    color: {p.text_primary};
+    font-size: 28px;
     font-weight: 800;
 }}
 
@@ -401,6 +407,35 @@ QLabel#modernOverviewStartupBadge[startupKind="info"] {{
     background: {selected};
     border-color: #CFE2FF;
 }}
+QFrame#modernOverviewSafetySummary {{
+    min-height: 40px;
+    max-height: 40px;
+    background: {p.surface};
+    border: 1px solid {p.border};
+    border-radius: 8px;
+}}
+QLabel#modernOverviewSafetyCaption {{
+    color: {p.text_muted};
+    background: transparent;
+    border: none;
+    font-size: 10px;
+}}
+QLabel#modernOverviewSafetyValue {{
+    color: {p.text_primary};
+    background: transparent;
+    border: none;
+    font-size: 12px;
+    font-weight: 700;
+}}
+QLabel#modernOverviewSafetyValue[startupKind="success"] {{ color: {p.success}; }}
+QLabel#modernOverviewSafetyValue[startupKind="warning"] {{ color: {p.warning}; }}
+QLabel#modernOverviewSafetyValue[startupKind="info"] {{ color: {p.primary}; }}
+QFrame#modernOverviewSafetyDivider {{
+    min-width: 1px;
+    max-width: 1px;
+    background: {p.border};
+    border: none;
+}}
 
 QPushButton[overviewAction="primary"] {{
     min-height: 40px;
@@ -530,6 +565,12 @@ QWidget[legacyRoot="true"] QHeaderView::section {{
     color: {p.text_secondary};
     font-size: 11px;
     font-weight: 600;
+}}
+QWidget[legacyRoot="true"] QTableCornerButton::section {{
+    border: none;
+    border-right: 1px solid {p.border};
+    border-bottom: 1px solid {p.border};
+    background: {subtle};
 }}
 QWidget[legacyRoot="true"] QPushButton[legacyModernized="true"] {{
     min-height: 38px;

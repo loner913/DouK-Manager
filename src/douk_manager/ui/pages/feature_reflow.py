@@ -240,17 +240,24 @@ def _reflow_audit(page: QWidget, root: QLayout, items: list[QLayoutItem]) -> Non
 
     bottom = QHBoxLayout()
     bottom.setSpacing(14)
-    bottom.addWidget(
-        _card(content, "选中账号详情", (details,)),
-        4,
+    detail_card = _card(
+        content,
+        "选中账号详情",
+        (details,),
+        match_row_height=True,
     )
+    detail_card.setObjectName("modernAuditDetailsCard")
+    bottom.addWidget(detail_card, 4)
+    decision_card = _card(
+        content,
+        "决定与应用",
+        (decisions, actions, output),
+        note="确认预览后应用决定。",
+        match_row_height=True,
+    )
+    decision_card.setObjectName("modernAuditDecisionCard")
     bottom.addWidget(
-        _card(
-            content,
-            "决定与应用",
-            (decisions, actions, output),
-            note="确认预览后应用决定。",
-        ),
+        decision_card,
         6,
     )
     root.addLayout(bottom)

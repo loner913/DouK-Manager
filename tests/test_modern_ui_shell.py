@@ -11,6 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication
 
 from douk_manager.gui import MainWindow as LegacyMainWindow
+from douk_manager.ui.pages.completed_overview import CompletedOverviewPage
 from douk_manager.ui.pages.legacy_page import ModernLegacyPage
 from douk_manager.ui.shell.main_window import ModernMainWindow
 
@@ -93,6 +94,7 @@ class ModernUiShellTests(unittest.TestCase):
             window = self._window(Path(directory))
             self.assertIsInstance(window, LegacyMainWindow)
             self.assertIsNone(window._modern_shell_install_error)
+            self.assertIsInstance(window.modern_overview, CompletedOverviewPage)
             self.assertEqual(window.tabs.count(), 11)
 
             audit_wrapper = window.tabs.widget(window.audit_tab_index)

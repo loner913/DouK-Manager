@@ -113,17 +113,61 @@ class ModernOverviewTests(unittest.TestCase):
             )
             self._dispose_window(window)
 
-    def test_overview_requests_existing_dashboard_pipeline_after_startup_ready(self) -> None:
+    def test_completed_overview_requests_its_log_projection_after_startup_ready(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             window = self._window(Path(directory))
             window.controller.startup_state = StartupState.READY
-            window.refresh_result_dashboard = Mock()
-            window._dashboard_snapshot = None
-            window.modern_overview._dashboard_refresh_requested = False
 
-            window.modern_overview.request_real_dashboard_refresh()
+            with patch.object(
+                window,
+                "_submit_coalesced_background",
+                return_value="synthetic-completed-overview",
+            ) as submit:
+                window.modern_overview.request_real_dashboard_refresh()
 
-            window.refresh_result_dashboard.assert_called_once_with(auto_refresh=True)
+            submit.assert_called_once()
+            spec = submit.call_args.args[0]
+            self.assertEqual(spec.task_type, "completed_overview")
+            self.assertEqual(spec.resource_keys, frozenset({"result_logs"}))
+            self._dispose_window(window)
+
+    def test_watchlist_reminder_is_a_prominent_primary_action(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window = self._window(Path(directory))
+            button = window.modern_overview.watchlist_reminder
+
+            self.assertEqual(button.objectName(), "modernOverviewAttentionAction")
+            self.assertEqual(button.property("overviewAction"), "primary")
+            self.assertGreaterEqual(button.minimumWidth(), 132)
+            self._dispose_window(window)
+
+    def test_safety_summary_mirrors_current_state_and_stage_near_watchlist_action(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window = self._window(Path(directory))
+            overview = window.modern_overview
+            window.controller.startup_state = StartupState.READY
+            window.startup_stage_label.setText("SNAPSHOT")
+
+            overview._refresh_startup(window)
+            overview.set_viewport_width(1200)
+
+            self.assertEqual(overview.startup_status_value.text(), "READY")
+            self.assertEqual(overview.startup_stage_value.text(), "SNAPSHOT")
+            self.assertEqual(
+                overview.startup_status_value.property("startupKind"), "success"
+            )
+            self.assertFalse(overview.startup_summary_panel.isHidden())
+            self.assertGreaterEqual(overview.startup_summary_panel.minimumWidth(), 240)
+            self.assertGreaterEqual(overview.startup_summary_panel.minimumHeight(), 40)
+            self.assertLessEqual(overview.startup_summary_panel.minimumHeight(), 44)
+            self.assertGreaterEqual(overview.clock_date.font().pixelSize(), 16)
+            self.assertGreaterEqual(overview.clock_time.font().pixelSize(), 28)
+            self.assertEqual(overview.layout.contentsMargins().top(), 6)
+
+            overview.set_viewport_width(900)
+            self.assertTrue(overview.startup_summary_panel.isHidden())
+            overview.set_viewport_width(1200)
+            self.assertFalse(overview.startup_summary_panel.isHidden())
             self._dispose_window(window)
 
     def test_isolated_preview_fixture_populates_dashboard_without_requesting_runtime_refresh(self) -> None:

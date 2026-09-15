@@ -104,12 +104,15 @@ class ModernOverviewPage(QWidget):
         host: Any,
         legacy_page: QWidget,
         parent: QWidget | None = None,
+        *,
+        completed_layout: bool = False,
     ) -> None:
         super().__init__(parent)
         self.setProperty("modernUi", True)
         self.setObjectName("modernOverviewPage")
         self._host = host
         self._preview_mock_data = os.environ.get("DOUK_MANAGER_PREVIEW_MOCK_DATA") == "1"
+        self._completed_layout = completed_layout or self._preview_mock_data
         self.legacy_page = legacy_page
         self._last_snapshot_identity: tuple[object, ...] | None = None
         self._dashboard_refresh_requested = False
@@ -136,7 +139,7 @@ class ModernOverviewPage(QWidget):
         self.layout = QVBoxLayout(self.canvas)
         self.layout.setContentsMargins(
             UiMetrics.PAGE_MARGIN,
-            20,
+            6,
             UiMetrics.PAGE_MARGIN,
             UiMetrics.PAGE_MARGIN,
         )
@@ -147,9 +150,50 @@ class ModernOverviewPage(QWidget):
         self.watchlist_reminder_text = QLabel("观察提醒待加载", self.canvas)
         self.watchlist_reminder_text.setWordWrap(True)
         reminder_row.addWidget(self.watchlist_reminder_text, 1)
+        self.startup_summary_panel = QFrame(self.canvas)
+        self.startup_summary_panel.setObjectName("modernOverviewSafetySummary")
+        self.startup_summary_panel.setMinimumSize(240, 40)
+        self.startup_summary_panel.setMaximumWidth(280)
+        self.startup_summary_panel.setSizePolicy(
+            QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed
+        )
+        safety_layout = QHBoxLayout(self.startup_summary_panel)
+        safety_layout.setContentsMargins(12, 4, 12, 4)
+        safety_layout.setSpacing(12)
+
+        status_column = QVBoxLayout()
+        status_column.setSpacing(0)
+        status_caption = QLabel("当前状态", self.startup_summary_panel)
+        status_caption.setObjectName("modernOverviewSafetyCaption")
+        self.startup_status_value = QLabel("BOOTSTRAPPING", self.startup_summary_panel)
+        self.startup_status_value.setObjectName("modernOverviewSafetyValue")
+        status_column.addWidget(status_caption)
+        status_column.addWidget(self.startup_status_value)
+        safety_layout.addLayout(status_column, 1)
+
+        divider = QFrame(self.startup_summary_panel)
+        divider.setObjectName("modernOverviewSafetyDivider")
+        divider.setFrameShape(QFrame.Shape.VLine)
+        safety_layout.addWidget(divider)
+
+        stage_column = QVBoxLayout()
+        stage_column.setSpacing(0)
+        stage_caption = QLabel("阶段", self.startup_summary_panel)
+        stage_caption.setObjectName("modernOverviewSafetyCaption")
+        self.startup_stage_value = QLabel("待检查", self.startup_summary_panel)
+        self.startup_stage_value.setObjectName("modernOverviewSafetyValue")
+        stage_column.addWidget(stage_caption)
+        stage_column.addWidget(self.startup_stage_value)
+        safety_layout.addLayout(stage_column, 1)
+        if self._preview_mock_data:
+            self.startup_summary_panel.hide()
+        reminder_row.addWidget(
+            self.startup_summary_panel, 0, Qt.AlignmentFlag.AlignVCenter
+        )
         self.watchlist_reminder = QPushButton("查看观察名单", self.canvas)
-        self.watchlist_reminder.setObjectName("modernOverviewFilter")
-        self.watchlist_reminder.setMinimumHeight(36)
+        self.watchlist_reminder.setObjectName("modernOverviewAttentionAction")
+        self.watchlist_reminder.setProperty("overviewAction", "primary")
+        self.watchlist_reminder.setMinimumWidth(132)
         self.watchlist_reminder.clicked.connect(self._open_watchlist_due)
         reminder_row.addWidget(self.watchlist_reminder)
         self.layout.addLayout(reminder_row)
@@ -269,8 +313,9 @@ class ModernOverviewPage(QWidget):
         self.trend_card.layout().addWidget(self.trend_chart, 1)
 
         self.composition_card = self._make_card(
-            "结果构成", "上次已结束任务" if self._preview_mock_data else "最近一次可用任务",
-            "" if self._preview_mock_data else "全部任务⌄"
+            "结果构成",
+            "上次已结束任务" if self._completed_layout else "最近一次可用任务",
+            "" if self._completed_layout else "全部任务⌄",
         )
         self.composition_card.setMinimumHeight(260)
         self.composition_card.setSizePolicy(
@@ -288,9 +333,9 @@ class ModernOverviewPage(QWidget):
         self.composition_card.layout().addLayout(composition_body, 1)
 
         self.throughput_card = self._make_card(
-            "处理效率" if self._preview_mock_data else "下载吞吐",
-            "上次已结束任务" if self._preview_mock_data else "最近一次任务的真实处理效率",
-            "" if self._preview_mock_data else "近 24 小时⌄"
+            "处理效率" if self._completed_layout else "下载吞吐",
+            "上次已结束任务" if self._completed_layout else "最近一次任务的真实处理效率",
+            "" if self._completed_layout else "近 24 小时⌄",
         )
         self.throughput_card.setMinimumHeight(260)
         self.throughput_card.setSizePolicy(
@@ -312,11 +357,20 @@ class ModernOverviewPage(QWidget):
         self.throughput_card.layout().addWidget(self.throughput_note)
         self.throughput_card.layout().addWidget(self.throughput_chart, 1)
         self.throughput_card.layout().addWidget(self.throughput_bar)
-        if self._preview_mock_data:
+        if self._completed_layout:
             self.throughput_chart.hide()
             self.throughput_card.layout().addSpacing(20)
             self.efficiency_fields = {}
-            for name, value in (("任务总用时", "2 小时 30 分钟"), ("实际开始", "1,200 个账号"), ("有新作品下载", "960 个账号")):
+            efficiency_values = (
+                ("任务总用时", "2 小时 30 分钟"),
+                ("实际开始", "1,200 个账号"),
+                ("有新作品下载", "960 个账号"),
+            ) if self._preview_mock_data else (
+                ("任务总用时", "—"),
+                ("实际开始", "—"),
+                ("有新作品下载", "—"),
+            )
+            for name, value in efficiency_values:
                 self.efficiency_fields[name] = self._add_summary_field(self.throughput_card.layout(), name, value)
             self.throughput_card.layout().addStretch(1)
 
@@ -330,7 +384,7 @@ class ModernOverviewPage(QWidget):
         self.task_card = self._make_card("＋ 账号任务", "快速进入原有账号任务功能")
         self.task_card.layout().setAlignment(Qt.AlignmentFlag.AlignTop)
         self.task_card.setProperty("workCard", True)
-        self.task_card.setMinimumHeight(190 if not self._preview_mock_data else 250)
+        self.task_card.setMinimumHeight(250 if self._completed_layout else 190)
         self.task_card.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
@@ -365,11 +419,13 @@ class ModernOverviewPage(QWidget):
             self.task_card.layout().addWidget(self.task_button)
 
         self.queue_card = self._make_card(
-            "上次任务摘要" if self._preview_mock_data else "下载队列",
-            "任务已结束 · 日志汇总完成" if self._preview_mock_data else "当前队列状态",
+            "上次任务摘要" if self._completed_layout else "下载队列",
+            "任务已结束 · 日志汇总完成" if self._preview_mock_data else (
+                "等待任务日志" if self._completed_layout else "当前队列状态"
+            ),
         )
         self.queue_card.setProperty("workCard", True)
-        self.queue_card.setMinimumHeight(190 if not self._preview_mock_data else 250)
+        self.queue_card.setMinimumHeight(250 if self._completed_layout else 190)
         self.queue_card.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
@@ -385,10 +441,21 @@ class ModernOverviewPage(QWidget):
         queue_note.setWordWrap(True)
         self.queue_button = self._action_button("打开下载队列", "secondary")
         self.queue_button.clicked.connect(lambda: self._navigate("下载队列"))
-        if self._preview_mock_data:
+        if self._completed_layout:
             queue_note.hide()
             self.summary_fields = {}
-            for name, value in (("账号范围", "A1–A1200"), ("开始时间", "2026-09-12 17:50"), ("结束时间", "2026-09-12 20:20"), ("执行结果", "进程正常结束 · 23 个账号处理异常")):
+            summary_values = (
+                ("账号范围", "A1–A1200"),
+                ("开始时间", "2026-09-12 17:50"),
+                ("结束时间", "2026-09-12 20:20"),
+                ("执行结果", "进程正常结束 · 23 个账号处理异常"),
+            ) if self._preview_mock_data else (
+                ("账号范围", "—"),
+                ("开始时间", "—"),
+                ("结束时间", "—"),
+                ("执行结果", "—"),
+            )
+            for name, value in summary_values:
                 self.summary_fields[name] = self._add_summary_field(self.queue_card.layout(), name, value)
             self.queue_card.layout().addStretch(1)
             self.queue_button.setText("查看任务结果")
@@ -401,12 +468,14 @@ class ModernOverviewPage(QWidget):
             self.queue_card.layout().addWidget(self.queue_button)
 
         self.attention_card = self._make_card(
-            "上次任务异常" if self._preview_mock_data else "最近异常",
-            "任务结束于 09-12 20:20" if self._preview_mock_data else "只展示已有证据",
-            "" if self._preview_mock_data else "查看更多 ›"
+            "上次任务异常" if self._completed_layout else "最近异常",
+            "任务结束于 09-12 20:20" if self._preview_mock_data else (
+                "尚无已结束任务" if self._completed_layout else "只展示已有证据"
+            ),
+            "" if self._completed_layout else "查看更多 ›",
         )
         self.attention_card.setProperty("workCard", True)
-        self.attention_card.setMinimumHeight(190 if not self._preview_mock_data else 250)
+        self.attention_card.setMinimumHeight(250 if self._completed_layout else 190)
         self.attention_card.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
@@ -415,20 +484,21 @@ class ModernOverviewPage(QWidget):
         self.attention_value.setWordWrap(True)
         self.dashboard_button = self._action_button("查看结果看板", "secondary")
         self.dashboard_button.clicked.connect(lambda: self._navigate("结果看板"))
-        if self._preview_mock_data:
+        if self._completed_layout:
             self.attention_value.hide()
             attention_rows = QVBoxLayout()
             self.attention_rows = attention_rows
             attention_rows.setSpacing(3)
             self.attention_card.layout().addLayout(attention_rows, 1)
-            for row in (
-                ("A37", "处理异常", "", "danger"),
-                ("A128", "处理异常", "", "danger"),
-                ("A406", "处理异常", "", "danger"),
-                ("A752", "完成后附加异常", "", "warning"),
-                ("A1036", "完成后附加异常", "", "warning"),
-            ):
-                self._add_preview_attention_row(attention_rows, *row)
+            if self._preview_mock_data:
+                for row in (
+                    ("A37", "处理异常", "", "danger"),
+                    ("A128", "处理异常", "", "danger"),
+                    ("A406", "处理异常", "", "danger"),
+                    ("A752", "完成后附加异常", "", "warning"),
+                    ("A1036", "完成后附加异常", "", "warning"),
+                ):
+                    self._add_preview_attention_row(attention_rows, *row)
             self.attention_card.layout().addWidget(self.dashboard_button)
         else:
             self.attention_card.layout().addWidget(self.attention_value)
@@ -793,6 +863,8 @@ class ModernOverviewPage(QWidget):
         state = host.controller.startup_state
         summary_label = getattr(host, "startup_summary_label", None)
         summary = summary_label.text().strip() if summary_label is not None else "检查中"
+        stage_label = getattr(host, "startup_stage_label", None)
+        stage = stage_label.text().strip() if stage_label is not None else "待检查"
         labels = {
             StartupState.BOOTSTRAPPING: ("正在启动", "info"),
             StartupState.SAFETY_CHECKING: ("安全检查中", "info"),
@@ -803,6 +875,11 @@ class ModernOverviewPage(QWidget):
         text, kind = labels.get(state, ("状态未知", "info"))
         self.startup_badge.setText(text)
         self.startup_badge.setProperty("startupKind", kind)
+        self.startup_status_value.setText(getattr(state, "value", str(state)))
+        self.startup_status_value.setProperty("startupKind", kind)
+        self.startup_status_value.setToolTip(summary or text)
+        self.startup_stage_value.setText(stage or "待检查")
+        self.startup_stage_value.setToolTip(summary or text)
         if state is StartupState.DEGRADED_READ_ONLY:
             tooltip = "当前处于只读保护：写操作已禁用。这是受支持的安全运行模式。"
             if summary:
@@ -812,6 +889,8 @@ class ModernOverviewPage(QWidget):
             self.startup_badge.setToolTip(summary or text)
         self.startup_badge.style().unpolish(self.startup_badge)
         self.startup_badge.style().polish(self.startup_badge)
+        self.startup_status_value.style().unpolish(self.startup_status_value)
+        self.startup_status_value.style().polish(self.startup_status_value)
 
     def _refresh_runtime(self, host: Any) -> None:
         if getattr(host, "queue_active", False):
@@ -971,6 +1050,9 @@ class ModernOverviewPage(QWidget):
         self._relayout_work(width)
         self.clock_date.setVisible(width >= 720)
         self.clock_time.setVisible(width >= 720)
+        self.startup_summary_panel.setVisible(
+            width >= 980 and not self._preview_mock_data
+        )
 
     def _relayout_metrics(self, columns: int) -> None:
         for card in self.metrics.values():

@@ -9,7 +9,13 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt, QDate, QTime
 from datetime import datetime, timezone
-from PySide6.QtWidgets import QApplication, QTableView, QPushButton, QTextEdit
+from PySide6.QtWidgets import (
+    QAbstractSpinBox,
+    QApplication,
+    QPushButton,
+    QTableView,
+    QTextEdit,
+)
 
 from douk_manager.core.watchlist import WatchlistSnapshot
 from douk_manager.core.watchlist_promotion import PromotionResult
@@ -50,6 +56,11 @@ class WatchlistUiModelTests(unittest.TestCase):
         self.assertEqual(dialog._selected_review_time(), record["next_review_at"])
         self.assertEqual(dialog.save_button.text(), "保存复查")
         self.assertEqual(dialog.cancel_button.property("legacyRole"), "secondary")
+        self.assertEqual(
+            dialog.review_time.buttonSymbols(),
+            QAbstractSpinBox.ButtonSymbols.NoButtons,
+        )
+        self.assertFalse(dialog.review_time.lineEdit().isReadOnly())
         self.assertNotEqual(dialog.review_mode.findData(15), -1)
         self.assertNotEqual(dialog.review_mode.findData(45), -1)
         dialog.review_mode.setCurrentIndex(dialog.review_mode.findData("custom"))

@@ -17,6 +17,7 @@ from PySide6.QtWidgets import QApplication, QComboBox, QGroupBox, QLabel, QHBoxL
 from douk_manager.gui import MainWindow as LegacyMainWindow
 
 from ..pages.legacy_page import ModernLegacyPage
+from ..pages.completed_overview import CompletedOverviewPage
 from ..pages.overview_page import ModernOverviewPage
 from ..theme.readability import feature_readability_stylesheet
 from ..theme.theme_manager import ThemeManager, ThemeMode
@@ -165,11 +166,13 @@ class ModernMainWindow(LegacyMainWindow):
             try:
                 overview_page, overview_label = original_pages[0]
                 legacy_tabs.removeTab(0)
-                if os.environ.get("DOUK_MANAGER_PREVIEW_LOG_DATA") == "1":
-                    from ..pages.completed_overview import CompletedOverviewPage
-                    modern_overview = CompletedOverviewPage(self, overview_page)
-                else:
+                if (
+                    os.environ.get("DOUK_MANAGER_PREVIEW_MOCK_DATA") == "1"
+                    and os.environ.get("DOUK_MANAGER_PREVIEW_LOG_DATA") != "1"
+                ):
                     modern_overview = ModernOverviewPage(self, overview_page)
+                else:
+                    modern_overview = CompletedOverviewPage(self, overview_page)
                 legacy_tabs.insertTab(0, modern_overview, overview_label)
 
                 for index in range(1, len(original_pages)):

@@ -8,7 +8,13 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QFrame, QLabel, QSizePolicy
+from PySide6.QtWidgets import (
+    QAbstractSpinBox,
+    QApplication,
+    QFrame,
+    QLabel,
+    QSizePolicy,
+)
 
 from douk_manager.ui.pages.legacy_page import ModernLegacyPage
 from douk_manager.ui.shell.main_window import ModernMainWindow
@@ -131,6 +137,51 @@ class ModernFeatureReflowTests(unittest.TestCase):
                 QSizePolicy.Policy.Expanding,
             )
             self._dispose_window(window)
+
+    def test_reviewed_numeric_fields_hide_mouse_stepper_buttons(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window = self._window(Path(directory))
+            try:
+                for spin in (
+                    window.task_private_days,
+                    window.account_audit_error_threshold,
+                    window.account_audit_minimum_runs,
+                    window.queue_move_position,
+                ):
+                    self.assertEqual(
+                        spin.buttonSymbols(),
+                        QAbstractSpinBox.ButtonSymbols.NoButtons,
+                    )
+                    self.assertFalse(spin.lineEdit().isReadOnly())
+            finally:
+                self._dispose_window(window)
+
+    def test_account_audit_details_card_matches_decision_card_height(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            window = self._window(Path(directory))
+            try:
+                card = window.modern_feature_pages["账号审计"].findChild(
+                    QFrame, "modernAuditDetailsCard"
+                )
+
+                self.assertIsNotNone(card)
+                decision_card = window.modern_feature_pages["账号审计"].findChild(
+                    QFrame, "modernAuditDecisionCard"
+                )
+                self.assertIsNotNone(decision_card)
+                self.assertEqual(
+                    card.sizePolicy().verticalPolicy(),
+                    QSizePolicy.Policy.Expanding,
+                )
+                self.assertEqual(
+                    decision_card.sizePolicy().verticalPolicy(),
+                    QSizePolicy.Policy.Expanding,
+                )
+                self.assertGreaterEqual(window.account_audit_details.minimumHeight(), 180)
+                self.assertEqual(card.geometry().top(), decision_card.geometry().top())
+                self.assertEqual(card.geometry().bottom(), decision_card.geometry().bottom())
+            finally:
+                self._dispose_window(window)
 
     def test_vertical_output_uses_available_height_even_when_empty(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

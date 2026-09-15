@@ -1,8 +1,6 @@
-"""Isolated log-backed preview using the accepted overview composition."""
+"""Log-backed overview using the accepted completed-task composition."""
 
 from datetime import date
-from pathlib import Path
-import os
 
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import QLabel, QPushButton, QStyle, QComboBox, QHBoxLayout, QVBoxLayout, QGridLayout, QWidget
@@ -17,18 +15,14 @@ from .overview_page import ModernOverviewPage, _STATUS_LABELS, _status_name
 
 class CompletedOverviewPage(ModernOverviewPage):
     def __init__(self, host, legacy_page, parent=None):
-        preview_root = Path(__file__).resolve().parents[5] / "ui-modernization-preview-runtime"
-        if (os.environ.get("DOUK_MANAGER_PREVIEW_MOCK_DATA") != "1"
-                or not host.controller.paths.root.resolve().is_relative_to(preview_root)
-                or not host.controller.result_dashboard.log_directory.resolve().is_relative_to(preview_root)):
-            raise ValueError("Log preview requires an isolated preview home")
         self._completed = None
+        self._initial_refresh_requested = False
         self._summary_waiting = set()
         self._summary_failed = False
         self._attention_page = 0
         self._all_attention_rows = ()
         self._result_caption = "尚无可用任务结果"
-        super().__init__(host, legacy_page, parent)
+        super().__init__(host, legacy_page, parent, completed_layout=True)
         self.refresh_button = QPushButton(self.canvas)
         self.refresh_button.setObjectName("modernOverviewFilter")
         self.refresh_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
@@ -114,7 +108,6 @@ class CompletedOverviewPage(ModernOverviewPage):
         self._apply_empty()
         host.coordinator.task_settled.connect(self._summary_settled)
         host.coordinator.task_removed.connect(self._summary_removed)
-        QTimer.singleShot(0, self.request_real_dashboard_refresh)
 
     def _summary_settled(self, task_id, generation, outcome, _payload):
         binding = self._host._background_bindings.get(task_id)
@@ -130,13 +123,20 @@ class CompletedOverviewPage(ModernOverviewPage):
 
     def refresh_from_host(self):
         # The inherited 350ms timer mirrors status only; disk reads are event driven.
+        self.refresh_watchlist_reminder()
         self._refresh_startup(self._host)
+        if (
+            self._host.controller.startup_state is StartupState.READY
+            and not self._initial_refresh_requested
+        ):
+            self._initial_refresh_requested = True
+            QTimer.singleShot(0, self.request_real_dashboard_refresh)
 
     def _refresh_preview(self):
         pass
 
     def request_real_dashboard_refresh(self):
-        if self._host.controller.startup_state is StartupState.CLOSING:
+        if self._host.controller.startup_state is not StartupState.READY:
             return
         self.subtitle.setText(self._result_caption + " · 正在刷新")
         service = self._host.controller.result_dashboard

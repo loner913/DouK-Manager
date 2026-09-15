@@ -6,10 +6,11 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from PySide6.QtCore import QCoreApplication, QEvent
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QCoreApplication, QEvent, Qt
+from PySide6.QtWidgets import QApplication, QLabel
 from douk_manager.background import TaskSpec
 from douk_manager.config import AppConfig
+from douk_manager.startup import StartupState
 from douk_manager.ui.shell.main_window import ModernMainWindow
 from test_completed_overview_data import write_task
 
@@ -36,15 +37,37 @@ class CompletedOverviewGuiTests(unittest.TestCase):
             task = write_task(logs, "one", end)
             config = AppConfig(engine_exe=str(home/'Engine/main.exe'), video_root=str(home/'Video'),
                                index_root=str(home/'Index'), old_screenshot_dir=str(home/'Screenshots'))
-            env = {"DOUK_MANAGER_HOME":str(home), "DOUK_MANAGER_UI_STATE_PATH":str(home/'state.ini'),
-                   "DOUK_MANAGER_PREVIEW_MOCK_DATA":"1", "DOUK_MANAGER_PREVIEW_LOG_DATA":"1"}
+            env = {
+                "DOUK_MANAGER_HOME": str(home),
+                "DOUK_MANAGER_UI_STATE_PATH": str(home / "state.ini"),
+                "DOUK_MANAGER_PREVIEW_MOCK_DATA": "0",
+                "DOUK_MANAGER_PREVIEW_LOG_DATA": "0",
+            }
             with patch.dict(os.environ, env), patch.object(AppConfig, "load", return_value=config):
                 window = ModernMainWindow()
                 window.show()
                 try:
+                    window.controller.startup_state = StartupState.READY
+                    window.modern_overview.refresh_from_host()
                     self.settle(window)
                     page = window.modern_overview
                     self.assertIsNone(window._modern_shell_install_error)
+                    self.assertEqual(
+                        page.queue_card.findChild(QLabel, "modernSectionTitle").text(),
+                        "上次任务摘要",
+                    )
+                    self.assertEqual(
+                        page.attention_card.findChild(QLabel, "modernSectionTitle").text(),
+                        "上次任务异常",
+                    )
+                    self.assertTrue(
+                        page.composition_legend.alignment()
+                        & Qt.AlignmentFlag.AlignTop
+                    )
+                    self.assertLessEqual(
+                        page.composition_legend.geometry().top(),
+                        page.donut_chart.geometry().top(),
+                    )
                     self.assertEqual(page.throughput_value.text(), "8.0 账号/分钟")
                     self.assertIn("98.1%", page.composition_legend.text())
                     for color in page.donut_chart._COLOURS[:6]:

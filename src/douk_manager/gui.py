@@ -51,6 +51,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QTableView,
     QTableWidget,
@@ -836,6 +837,7 @@ class WatchlistReviewDialog(QDialog):
         self.review_date.setEnabled(False)
         self.review_time = QTimeEdit()
         self.review_time.setDisplayFormat("HH:mm")
+        self.review_time.setButtonSymbols(QTimeEdit.ButtonSymbols.NoButtons)
         self.review_time.setTime(QTime(local_review.hour, local_review.minute))
         self.review_time.setEnabled(False)
         reminder_row = QHBoxLayout()
@@ -2839,6 +2841,7 @@ class MainWindow(QMainWindow):
             "跳过名单，可强制包含全部账号。"
         )
         self.task_private_days = self._spin(1, 3650, 3)
+        self.task_private_days.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
         self.task_private_days.setToolTip(
             "参考期限：扫描最近 N 天内的全部可解析下载任务日志。例如 3、7、15；"
             "若之后出现明确正常结果，账号会重新纳入。"
@@ -2895,9 +2898,15 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.account_audit_refresh_button)
         controls.addWidget(QLabel("连续错误阈值"))
         self.account_audit_error_threshold = self._spin(1, 100, 5)
+        self.account_audit_error_threshold.setButtonSymbols(
+            QSpinBox.ButtonSymbols.NoButtons
+        )
         controls.addWidget(self.account_audit_error_threshold)
         controls.addWidget(QLabel("最少证据轮次"))
         self.account_audit_minimum_runs = self._spin(1, 100, 3)
+        self.account_audit_minimum_runs.setButtonSymbols(
+            QSpinBox.ButtonSymbols.NoButtons
+        )
         controls.addWidget(self.account_audit_minimum_runs)
         self.account_audit_native_logs = QCheckBox("含原生日志分析（慢）")
         self.account_audit_native_logs.setChecked(False)
@@ -3004,7 +3013,11 @@ class MainWindow(QMainWindow):
 
         self.account_audit_details = QTextEdit()
         self.account_audit_details.setReadOnly(True)
-        self.account_audit_details.setMaximumHeight(105)
+        self.account_audit_details.setMinimumHeight(180)
+        self.account_audit_details.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
         self.account_audit_details.setPlaceholderText(
             "选择一行查看建议理由及连续错误轮次。"
         )
@@ -3130,6 +3143,7 @@ class MainWindow(QMainWindow):
         self.queue_move_position.setRange(1, 1)
         self.queue_move_position.setSuffix(" 位")
         self.queue_move_position.setKeyboardTracking(False)
+        self.queue_move_position.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
         position_row.addWidget(self.queue_move_position, 1)
         order_layout.addLayout(position_row)
         self.queue_move_target.currentIndexChanged.connect(
