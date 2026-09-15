@@ -135,7 +135,7 @@ settings_master.json
 
 ### 设计目的
 
-浅色、深色和跟随系统只改变显示，不改变账号、任务、下载配置或后台状态。窗口布局支持普通、最大化和高 DPI 缩放，左侧导航在紧凑宽度会折叠。
+浅色、深色和跟随系统只改变显示，不改变账号、任务、下载配置或后台状态。窗口布局支持普通、最大化和高 DPI 缩放，左侧导航在紧凑宽度会折叠。当前自用部署基线固定为 27 英寸 2560×1440 显示器和 Windows 100% 缩放；多缩放实机发布验收已取消，但程序原有响应式和高 DPI 兼容能力继续保留。
 
 ### 操作步骤
 
@@ -589,10 +589,10 @@ settings_master.json
 | 下载结果与 A 主页 | 7、11 | `test_v014_core.py`、`test_homepage.py`、`test_profile_url.py` | UI-D09、HOME-D01 至 D04 | 主页按钮独立于日志双击 |
 | 结果看板与日志诊断 | 11、15 | `test_result_dashboard.py`、`test_result_dashboard_gui.py`、`test_log_stats.py` | UI-D10 | 只读统计；导出写 Diagnostics |
 | W 主页 | 8、11 | `test_homepage.py`、`test_watchlist_ui.py` | HOME-D05 | 有效观察数据存在时可用 |
-| 主题与窗口 | 5 | `test_theme_strategy.py`、`test_stabilization_gui.py` | THEME-D01 至 D05 | DPI D05 仍需 100/125/150/200% 实机记录 |
+| 主题与窗口 | 5 | `test_theme_strategy.py`、`test_stabilization_gui.py` | THEME-D01 至 D04；D05 `CANCELLED` | 固定 27 英寸 2560×1440、100% 自用环境；多缩放实机矩阵不再是发布门禁 |
 | 11 页统一导航与布局 | 3 至 15 | `test_modern_ui_shell.py`、`test_modern_feature_reflow.py` | UI-D01 至 UI-D11 | 按各页独立结论 |
 | 安装包版本身份 | 2 | `test_version_identity.py`、`test_develop_ci_workflow.py` | 版本最终整体验收 | 当前仍标 0.1.6，未收口 |
 
 ### 维护规则
 
-按钮名称、持久化文件、备份范围、失败状态或恢复步骤发生变化时，代码和本手册必须同步更新。自动测试通过只能证明代码检查，不替代普通 Windows 前台验收；单页 PASS 也不能代表最终发布完成。最终 V0.1.7 必须在版本元数据修正、THEME-D05 实机缩放、全程序逐页逐功能排查及其问题处理、完整回归和整体验收全部完成后再进入发布流程。
+按钮名称、持久化文件、备份范围、失败状态或恢复步骤发生变化时，代码和本手册必须同步更新。自动测试通过只能证明代码检查，不替代普通 Windows 前台验收；单页 PASS 也不能代表最终发布完成。最终 V0.1.7 必须在版本元数据修正、固定部署环境的窗口验收、全程序逐页逐功能排查及其问题处理、完整回归和整体验收全部完成后再进入发布流程。
